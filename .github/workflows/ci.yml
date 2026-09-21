@@ -1,0 +1,20 @@
+name: ci
+
+# 迭代 0 的证据边界：本工作流在 Linux 上执行静态检查、构建以及自动化单元/集成/e2e
+# 测试，但不验证 systemd、Nginx、数据库实例或真实目标主机——这些内容在真实 Linux
+# 主机上验证之前始终标记为「未验证」（见 docs/plans/2026-09-21-iteration-0.md）。
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify formatting, vet, tests and cross builds
+        run: make ci

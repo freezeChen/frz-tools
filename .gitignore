@@ -1,0 +1,15 @@
+# 构建产物
+/bin/
+/dist/
+
+# 本地开发状态
+opsd-dev/
+*.db
+*.db-wal
+*.db-shm
+*.sock
+
+# 编辑器与操作系统
+.DS_Store
+.idea/
+.vscode/
