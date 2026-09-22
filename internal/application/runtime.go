@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"time"
 
-	"frz-tools/internal/idgen"
+	"github.com/freezeChen/frz-tools/internal/idgen"
 )
 
 // Options 是 Runtime 的构造参数。端口都以字段提供，便于测试替换。

@@ -1,4 +1,4 @@
-module frz-tools
+module github.com/freezeChen/frz-tools
 
 go 1.27.1
 

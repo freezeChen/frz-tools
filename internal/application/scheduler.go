@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/domain"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 // fallbackPoll 是没有任何启用计划时的兜底唤醒周期。正常情况下调度器按最近的

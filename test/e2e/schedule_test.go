@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	v1 "frz-tools/api/v1"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
 )
 
 func decodeSchedule(t *testing.T, raw string) v1.Schedule {

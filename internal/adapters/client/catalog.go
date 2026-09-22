@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"strconv"
 
-	v1 "frz-tools/api/v1"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
 )
 
 func (c *Client) CreateApplication(ctx context.Context, name string, labels map[string]string) (*v1.Application, error) {

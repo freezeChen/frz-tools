@@ -5,7 +5,7 @@ import (
 	"io"
 	"time"
 
-	"frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 // Repository 是持久化端口，由 SQLite 适配器实现。

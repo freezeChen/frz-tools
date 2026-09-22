@@ -28,7 +28,8 @@
    - 真实主机层：reboot 后的 unit 持久化、SELinux/AppArmor、sudoers/PAM 实际策略，
      仍挂起并显式标注「未验证」。
    1a 中依赖文件模式语义的验收项由 Linux 容器层覆盖，见第 11、12 节。
-3. **Go module path**：继续使用 `frz-tools`，正式远程仓库确定后一次性全局替换 import 前缀。
+3. **Go module path**：2026-09-22 远程仓库确定后固定为 `github.com/freezeChen/frz-tools`
+   （此前为临时的 `frz-tools`），import 前缀已整体替换。
 
 ## 2. 范围
 
@@ -383,7 +384,6 @@ Linux 权限语义。这些条目必须通过 `make verify-linux` 在 Linux 容�
 
 以下事项不阻塞 1a，但需要持续跟踪：
 
-- 正式远程仓库对应的 module path（当前 `frz-tools` 是临时的）。
 - 认证与多用户隔离：1a 的 API 仍然无鉴权，与迭代 0 一致，多人环境不可用。
 - **Linux 容器验证 harness 的搭建时机**：已完成，位于 `test/linux/`（`make verify-linux`），
   先用迭代 0 的代码验证通过（22 项断言全绿），并已接入 CI 独立 job。1a 的制品存储与

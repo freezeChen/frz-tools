@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/adapters/blob"
-	"frz-tools/internal/adapters/executor"
-	"frz-tools/internal/adapters/sqlite"
-	"frz-tools/internal/application"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/blob"
+	"github.com/freezeChen/frz-tools/internal/adapters/executor"
+	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
+	"github.com/freezeChen/frz-tools/internal/application"
 )
 
 func newArtifactServer(t *testing.T, policy application.ArtifactPolicy) (*httptest.Server, *sqlite.Store) {

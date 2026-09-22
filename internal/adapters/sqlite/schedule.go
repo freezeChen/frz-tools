@@ -6,8 +6,8 @@ import (
 	"errors"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/domain"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 const scheduleColumns = `id, name, enabled, kind, cron, interval_seconds, timezone, resource,

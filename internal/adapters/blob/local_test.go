@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/application"
-	"frz-tools/internal/application/storagecontract"
-	"frz-tools/internal/domain"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/application"
+	"github.com/freezeChen/frz-tools/internal/application/storagecontract"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 func newTestStore(t *testing.T) *Local {

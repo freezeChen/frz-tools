@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"frz-tools/internal/adapters/config"
+	"github.com/freezeChen/frz-tools/internal/adapters/config"
 
 	"github.com/spf13/cobra"
 )

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/adapters/sqlite"
-	"frz-tools/internal/domain"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 // fakeClock 让调度测试不必真的等待：调度器与计划服务都通过它取当前时间。

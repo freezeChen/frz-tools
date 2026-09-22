@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/domain"
-	"frz-tools/internal/idgen"
-	"frz-tools/migrations"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/idgen"
+	"github.com/freezeChen/frz-tools/migrations"
 )
 
 func newTestStore(t *testing.T) *Store {

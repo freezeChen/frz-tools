@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"frz-tools/migrations"
+	"github.com/freezeChen/frz-tools/migrations"
 )
 
 const schemaMigrationsDDL = `

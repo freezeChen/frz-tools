@@ -14,10 +14,10 @@ import (
 	"syscall"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/adapters/sqlite"
-	"frz-tools/internal/application"
-	"frz-tools/internal/domain"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
+	"github.com/freezeChen/frz-tools/internal/application"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 const maxRequestBytes = 1 << 20

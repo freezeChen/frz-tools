@@ -3,8 +3,8 @@ package config
 import (
 	"testing"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/domain"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 const baseConfig = `apiVersion: ops.frz.io/v1alpha1

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/domain"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 // BuildCommandSpec 解析并校验指定 kind 的操作 spec。

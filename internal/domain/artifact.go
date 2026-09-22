@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	v1 "frz-tools/api/v1"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
 )
 
 const digestAlgorithm = "sha256"

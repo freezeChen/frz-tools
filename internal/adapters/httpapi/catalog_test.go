@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	v1 "frz-tools/api/v1"
-	"frz-tools/internal/adapters/blob"
-	"frz-tools/internal/adapters/executor"
-	"frz-tools/internal/adapters/sqlite"
-	"frz-tools/internal/application"
-	"frz-tools/internal/domain"
-	"frz-tools/internal/idgen"
+	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/blob"
+	"github.com/freezeChen/frz-tools/internal/adapters/executor"
+	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
+	"github.com/freezeChen/frz-tools/internal/application"
+	"github.com/freezeChen/frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/idgen"
 )
 
 // newCatalogServer 装配齐全三种服务，覆盖应用与发布的完整链路。
