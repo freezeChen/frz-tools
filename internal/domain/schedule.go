@@ -38,11 +38,12 @@ func (p MissedRunPolicy) Valid() bool {
 	return false
 }
 
+// ScheduleRunResult 是一次触发的最终结果。刻意没有 "skipped"：没有代码路径会产生它，
+// 留着只会让人以为存在「跳过但不算错过」这种语义。真需要时再加迁移。
 type ScheduleRunResult string
 
 const (
 	RunDispatched ScheduleRunResult = "dispatched"
-	RunSkipped    ScheduleRunResult = "skipped"
 	RunMissed     ScheduleRunResult = "missed"
 	RunFailed     ScheduleRunResult = "failed"
 )

@@ -216,6 +216,66 @@ func TestMissedRunPolicies(t *testing.T) {
 	}
 }
 
+// 重启后重算触发时间不得重复执行同一时刻：用同一个数据库新建一个调度器实例，
+// 等价于 opsd 重启后再跑一次补偿。
+func TestRestartDoesNotDispatchSameMomentTwice(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC))
+	rt, store := newTestRuntimeWith(t, Options{Now: clock.Now})
+	ctx := context.Background()
+
+	schedule := createIntervalSchedule(t, rt, "restart", time.Minute, domain.MissedRunOnce)
+	clock.Advance(time.Minute)
+
+	if err := rt.Scheduler.Tick(ctx); err != nil {
+		t.Fatalf("first tick: %v", err)
+	}
+
+	// 模拟重启：同一个 store，全新的 Runtime 与调度器。
+	restarted := NewRuntime(Options{
+		Repo:            store,
+		Executor:        &fakeExec{},
+		AllowExecutable: allowAll,
+		Defaults:        Defaults{Timeout: 5 * time.Second, MaxOutputBytes: 4096},
+		Workers:         1,
+		Idle:            20 * time.Millisecond,
+		Logger:          discardLogger(),
+		Now:             clock.Now,
+	})
+	// 把 next_run_at 拉回过去，制造「重启时发现该时刻已过期」的情形。
+	past := clock.Now()
+	if err := store.UpdateScheduleProgress(ctx, schedule.ID, domain.ScheduleProgress{
+		NextRunAt: &past,
+	}, clock.Now()); err != nil {
+		t.Fatalf("rewind next_run_at: %v", err)
+	}
+
+	if err := restarted.Scheduler.Tick(ctx); err != nil {
+		t.Fatalf("tick after restart: %v", err)
+	}
+
+	runs, err := restarted.Schedules.Runs(ctx, schedule.ID, 20)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	dispatched := 0
+	for _, run := range runs {
+		if run.Result == domain.RunDispatched {
+			dispatched++
+		}
+	}
+	if dispatched != 1 {
+		t.Fatalf("重启前后同一时刻只应派发一次，got %d（%+v）", dispatched, runs)
+	}
+
+	pending, err := store.CountByStatus(ctx, domain.StatusPending)
+	if err != nil {
+		t.Fatalf("count pending: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("重启不应产生第二条 Operation，got %d", pending)
+	}
+}
+
 // 「正常到点」与「停机积压」的分界必须有测试钉住：只有恰好一个到期时刻、
 // 且延迟在宽限窗口内，才算正常到点；否则按错过策略处理。
 func TestMisfireBoundary(t *testing.T) {

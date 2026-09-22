@@ -27,7 +27,7 @@ CREATE TABLE schedule_runs (
     started_at    TEXT NOT NULL,
     finished_at   TEXT,
     result        TEXT NOT NULL
-        CHECK (result IN ('dispatched', 'skipped', 'missed', 'failed')),
+        CHECK (result IN ('dispatched', 'missed', 'failed')),
     operation_id  TEXT REFERENCES operations (id),
     error_code    TEXT,
     error_message TEXT

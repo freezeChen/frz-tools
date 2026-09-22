@@ -73,7 +73,7 @@ resource 锁、Operation 状态机、审计与日志——**不自己执行任�
 | `scheduleId` | 归属计划 |
 | `scheduledFor` | 该次触发对应的计划时刻（不是实际执行时刻） |
 | `startedAt` / `finishedAt` | 实际开始与结束 |
-| `result` | `dispatched` / `skipped` / `missed` / `failed` |
+| `result` | `dispatched` / `missed` / `failed` |
 | `operationId` | 产生的 Operation；未触发时为空 |
 | `errorCode` / `errorMessage` | 失败原因 |
 
@@ -160,7 +160,7 @@ CREATE TABLE schedule_runs (
     started_at    TEXT NOT NULL,
     finished_at   TEXT,
     result        TEXT NOT NULL
-        CHECK (result IN ('dispatched', 'skipped', 'missed', 'failed')),
+        CHECK (result IN ('dispatched', 'missed', 'failed')),
     operation_id  TEXT REFERENCES operations (id),
     error_code    TEXT,
     error_message TEXT
@@ -268,8 +268,77 @@ opsctl schedule delete <id-or-name>
 ## 14. 未验证内容
 
 - 真实时区数据库（`tzdata`）在目标镜像/主机中的可用性：容器内 `time.LoadLocation`
-  需要 `tzdata`，精简镜像可能缺失。1b 无法在 macOS 上验证 Linux 容器内的时区行为，
-  需要扩展 `make verify-linux`，在 `Dockerfile.systemd` 中显式装 `tzdata` 并断言
-  `Asia/Shanghai` 可解析。
+  需要 `tzdata`，精简镜像可能缺失。**已由 `make verify-linux` 覆盖**（`Dockerfile.systemd`
+  显式安装 `tzdata`，并断言容器内可解析 `Asia/Shanghai`、带时区的计划按计划时区解释）。
 - 真实 Linux 主机上跨重启、跨夏令时的长期运行稳定性（需要长时间观察）。
 - 多 `opsd` 实例同时调度的场景（不在本迭代范围）。
+
+## 15. 实现记录 2026-09-22
+
+### 已实现范围
+
+第 2 节列出的 1b 范围全部落地：`Schedule`/`ScheduleRun` 领域模型与校验、cron（5 字段）
+与固定间隔两种触发器、时区、两种错过执行策略与误触发宽限窗口、migration `0003`、
+原子派发、调度循环、API 端点、CLI 子命令与测试。
+
+### 对本文档的补充与偏离
+
+1. **移除 `runAll`、新增误触发宽限窗口**（第 13 节第 4 条、第 5 节）：两处都是被测试
+   直接暴露出来的设计缺陷，不是实现取舍。
+2. **移除 `skipped` 结果**：`runAll` 去掉后没有任何代码路径会产生它，保留在枚举里
+   会让人以为存在「跳过但不算错过」的语义。SQL 的 `CHECK` 与领域常量已同步收窄。
+3. **启用/停用使用两条显式路由**：原设计用 `POST /schedules/{id}/{action}` 通配，
+   它会连 `/schedules/{id}/runs` 一起吞掉，并把未知动作当成停用处理。
+4. **计划名称唯一冲突返回 `SCHEDULE_INVALID`**，不新增错误码；理由与 1a 的重名应用一致。
+5. **重新启用不补偿**：`enable` 时把 `nextRunAt` 从当前时刻重新计算，否则一启用就会
+   补跑一堆停用期间积累的过期任务。
+6. **截断后不追赶**：错过时刻超过 1000 个时只处理到上限，并把 `nextRunAt` 从 `now`
+   之后重新开始，而不是继续追赶积压。
+
+### 实现过程中被测试暴露的问题
+
+- **`skip` 吞掉准点触发**：调度器无法区分「刚到期」与「停机积压」，导致 `skip` 策略把
+  自己的正常触发也记为 `missed`。修复方式是引入误触发宽限窗口。
+- **`runAll` 无法兑现**：见第 13 节第 4 条。
+- **harness 假阳性**：`$(test -f /usr/share/zoneinfo/...)` 在本机执行，macOS 上有 zoneinfo
+  于是「tzdata 已安装」假通过，而容器里其实根本没有该文件——后面的创建失败才是真的。
+  整条命令必须经由 `q` 进容器执行，已在 `AGENTS.md` 与代码注释中记录。
+
+## 16. 验证记录 2026-09-22
+
+- 执行者：Command Code agent
+- 变更范围：迭代 1b 全部交付内容
+- 环境：macOS (darwin/arm64)，Go 1.27.1；Linux 容器证据来自 Docker 29.4 / OrbStack
+- 规模：9 个测试包，237 个顶层用例 + 76 个子用例；Linux 容器 harness 40 项断言
+
+### 命令与结果
+
+| 命令 | 结果 | 证据类型 |
+| --- | --- | --- |
+| `make fmt` | PASS | 静态 |
+| `go vet ./...` | PASS | 静态 |
+| `go test ./... -count=1` | PASS（9 个包；e2e 含真实触发） | 单元 + 集成 + e2e |
+| `go test -race ./...` | PASS | 单元 + 集成 + e2e |
+| `make cross`（linux/amd64、linux/arm64） | PASS | 交叉编译 |
+| `make verify-linux` | PASS（40 项断言） | **Linux 容器** |
+
+### 逐条验收标准的证据
+
+| # | 验收标准 | 证据 |
+| --- | --- | --- |
+| 1 | cron 与间隔计划到点各触发一次且只触发一次 | e2e `TestScheduleActuallyFiresAndRunsCommand`（真实进程 + 真实时钟，验证 Operation 被创建、执行成功、日志可见）；`TestTickDispatchesDueScheduleOnce` 断言重复 Tick 不产生第二条记录 |
+| 2 | `opsd` 重启后不为已记录的时刻重复触发 | `TestRestartDoesNotDispatchSameMomentTwice`（同一数据库、全新调度器实例）；`TestDispatchScheduledRunCreatesOperationOnce`（唯一约束）；`(schedule_id, scheduled_for)` 唯一索引 |
+| 3 | 两种错过执行策略行为符合定义，且准点触发不被 skip 丢掉 | `TestMissedRunPolicies`（5 个积压时刻下 skip=0/5、runOnce=1/4）；`TestMisfireBoundary` 三个子用例钉住准点、单个迟到、积压的分界 |
+| 4 | 同一时刻同一计划只能产生一条 `ScheduleRun` | `TestDispatchScheduledRunCreatesOperationOnce`、`TestRecordMissedRunIsIdempotentPerMoment`（单元 + 集成） |
+| 5 | 计划 spec 非法在创建时即失败 | `TestCreateScheduleValidatesSpec`（单元）、`TestCreateScheduleRejectsInvalidInput/spec_非法`（集成）、`TestScheduleRejectsInvalidCron`（e2e 退出码 16） |
+| 6 | 资源被占用时记为 failed/`LOCK_BUSY`，既有 Operation 不受影响 | `TestTickRecordsLockBusyWithoutQueueing`（单元）、`TestDispatchScheduledRunRecordsLockBusy`（集成） |
+| 7 | 时区与夏令时切换不漏跑、不重复 | `TestCronTimezoneChangesFiringInstant`、`TestCronAcrossDaylightSavingBoundary`（单元）；`make verify-linux` 断言容器内时区可解析且按计划时区解释（**Linux 容器**） |
+| 8 | `make ci` 与 `make verify-linux` 全绿 | 见上表 |
+| 9 | 迭代 0 与 1a 的回归用例全部继续通过 | 9 个包全绿，迭代 0/1a 的 e2e 与单元用例未做任何放宽 |
+
+### 说明
+
+- 验收标准 1 的 e2e 用例必然要等到下一个整分钟（cron 粒度决定，平均约 30 秒、最多约 60 秒），
+  因此 `go test -short` 会跳过它；默认的 `make test` / `make ci` 会执行。
+- 「多 `opsd` 实例同时调度」仍未验证：本迭代只保证单实例内的不重复触发，
+  多实例并发调度属于迭代 5 的范围。
