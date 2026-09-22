@@ -36,6 +36,17 @@ type Repository interface {
 	CreateRelease(ctx context.Context, release *domain.Release) (*domain.Release, error)
 	GetRelease(ctx context.Context, id string) (*domain.Release, error)
 	ListReleases(ctx context.Context, applicationID string, limit int) ([]domain.Release, error)
+
+	CreateSchedule(ctx context.Context, schedule *domain.Schedule) error
+	GetSchedule(ctx context.Context, ref string) (*domain.Schedule, error)
+	ListSchedules(ctx context.Context, limit int) ([]domain.Schedule, error)
+	ListEnabledSchedules(ctx context.Context) ([]domain.Schedule, error)
+	SetScheduleEnabled(ctx context.Context, id string, enabled bool, now time.Time) (*domain.Schedule, error)
+	UpdateScheduleProgress(ctx context.Context, id string, progress domain.ScheduleProgress, now time.Time) error
+	DeleteSchedule(ctx context.Context, id string) error
+	DispatchScheduledRun(ctx context.Context, in domain.ScheduledDispatch) (domain.ScheduleRun, bool, error)
+	RecordMissedRun(ctx context.Context, scheduleID, runID string, scheduledFor, now time.Time) (bool, error)
+	ListScheduleRuns(ctx context.Context, scheduleID string, limit int) ([]domain.ScheduleRun, error)
 }
 
 // Executor 是进程执行端口，由本机执行器适配器实现。

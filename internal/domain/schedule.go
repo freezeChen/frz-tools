@@ -189,15 +189,23 @@ type intervalEvaluator struct {
 // 否则一次执行耗时较长就会把后续计划时间不断推后。
 func (e *intervalEvaluator) Next(after time.Time) time.Time { return after.Add(e.interval) }
 
-// DueMoments 返回 (after, until] 区间内所有应当触发的计划时刻，按时间升序。
+// DueMoments 返回区间 [first, until] 内所有应当触发的计划时刻，按时间升序。
+//
+// first 是已经确定应当触发的时刻（来自计划的 next_run_at），因此包含在结果里——
+// 调用方负责先判断它是否已到期；若 first 晚于 until，说明还没到期，返回空。
 //
 // 返回的第二个值表示是否因为超出上限而被截断：停机很久时每分钟的计划会积累出
 // 几万个时刻，调用方必须知道结果不完整，而不是以为「就这么多」。
-func DueMoments(eval Evaluator, after, until time.Time, limit int) (moments []time.Time, truncated bool) {
+func DueMoments(eval Evaluator, first, until time.Time, limit int) (moments []time.Time, truncated bool) {
+	if first.After(until) {
+		return nil, false
+	}
 	if limit <= 0 {
 		limit = maxScheduledMoments
 	}
-	cursor := after
+
+	moments = []time.Time{first}
+	cursor := first
 	for len(moments) < limit {
 		next := eval.Next(cursor)
 		if next.IsZero() || next.After(until) {
@@ -211,4 +219,37 @@ func DueMoments(eval Evaluator, after, until time.Time, limit int) (moments []ti
 		cursor = next
 	}
 	return moments, true
+}
+
+// ScheduleRun 是一次触发的记录。ScheduledFor 是「计划时刻」而不是实际执行时刻，
+// 它与 ScheduleID 一起构成唯一键，用来保证同一时刻不会被触发两次。
+type ScheduleRun struct {
+	ID           string
+	ScheduleID   string
+	ScheduledFor time.Time
+	StartedAt    time.Time
+	FinishedAt   *time.Time
+	Result       ScheduleRunResult
+	OperationID  string
+	ErrorCode    string
+	ErrorMessage string
+}
+
+// ScheduledDispatch 描述「某个计划时刻该触发了」这件事。存储层在同一事务内决定
+// 最终结果：资源空闲则记为 dispatched 并创建 Operation，资源被占则记为 failed
+// 并带上 LOCK_BUSY，不会排队等待。
+type ScheduledDispatch struct {
+	ScheduleID   string
+	ScheduledFor time.Time
+	RunID        string
+	Operation    *Operation
+	Now          time.Time
+}
+
+// ScheduleProgress 是计划在完成一轮处理后要写回的状态。
+// NextRunAt 为 nil 表示没有下一次（例如计划已被停用）。
+type ScheduleProgress struct {
+	NextRunAt  *time.Time
+	LastRunAt  *time.Time
+	LastResult string
 }

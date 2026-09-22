@@ -132,14 +132,18 @@ func TestDueMomentsEnumeratesAndReportsTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluator: %v", err)
 	}
-	from := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	first := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 
-	moments, truncated := DueMoments(eval, from, from.Add(3*time.Hour), 0)
+	// first 本身已经到期，因此也被包含在内：0、1、2、3 点共 4 次。
+	moments, truncated := DueMoments(eval, first, first.Add(3*time.Hour), 0)
 	if truncated {
 		t.Fatal("三个小时内不应触发截断")
 	}
-	if len(moments) != 3 {
-		t.Fatalf("want 3 moments, got %d", len(moments))
+	if len(moments) != 4 {
+		t.Fatalf("want 4 moments, got %d: %v", len(moments), moments)
+	}
+	if !moments[0].Equal(first) {
+		t.Fatalf("first 必须包含在结果里，got %s", moments[0])
 	}
 	for i := 1; i < len(moments); i++ {
 		if !moments[i].After(moments[i-1]) {
@@ -148,19 +152,22 @@ func TestDueMomentsEnumeratesAndReportsTruncation(t *testing.T) {
 	}
 
 	// 上限必须被如实报告，否则停机很久后调用方会以为「只有这么多」。
-	_, truncated = DueMoments(eval, from, from.Add(100*time.Hour), 5)
+	_, truncated = DueMoments(eval, first, first.Add(100*time.Hour), 5)
 	if !truncated {
 		t.Fatal("超过上限时必须报告截断")
 	}
 }
 
+// 尚未到期的计划不产生任何时刻：调用方先比较 next_run_at 与当前时间。
 func TestDueMomentsReturnsNothingWhenNotDue(t *testing.T) {
 	eval, err := NewEvaluator(cronSchedule("0 2 * * *", "UTC"))
 	if err != nil {
 		t.Fatalf("evaluator: %v", err)
 	}
-	from := time.Date(2026, 3, 1, 3, 0, 0, 0, time.UTC)
-	moments, truncated := DueMoments(eval, from, from.Add(time.Hour), 0)
+	now := time.Date(2026, 3, 1, 3, 0, 0, 0, time.UTC)
+	nextRunAt := time.Date(2026, 3, 2, 2, 0, 0, 0, time.UTC)
+
+	moments, truncated := DueMoments(eval, nextRunAt, now, 0)
 	if len(moments) != 0 || truncated {
 		t.Fatalf("未到期时不应产生时刻: %v truncated=%v", moments, truncated)
 	}

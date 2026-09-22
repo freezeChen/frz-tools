@@ -16,6 +16,11 @@ const (
 	EventArtifactCreated   = "artifact.created"
 	EventArtifactDeleted   = "artifact.deleted"
 	EventArtifactCollected = "artifact.collected"
+
+	EventScheduleCreated  = "schedule.created"
+	EventScheduleEnabled  = "schedule.enabled"
+	EventScheduleDisabled = "schedule.disabled"
+	EventScheduleDeleted  = "schedule.deleted"
 )
 
 type AuditEvent struct {
