@@ -67,6 +67,9 @@ make ci            # fmt + vet + test + test-race + cross，提交前必须通�
 输出的字段名保持英文（与 `api/v1` 逐字段对应）。本地化实现见 `internal/cliutil`。
 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行。
+仓库位于 <https://github.com/freezeChen/frz-tools>，module path 为
+`github.com/freezeChen/frz-tools`；CI 于 2026-09-22 起真实执行，`test` 与 `linux-verify`
+两个 job 在干净的 ubuntu-latest runner 上均通过（Linux 容器断言 40 项全绿）。
 修改了权限、属组、socket 或 systemd 相关逻辑后必须单独跑它。
 
 本地运行：

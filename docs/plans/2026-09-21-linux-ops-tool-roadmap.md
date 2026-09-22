@@ -280,3 +280,23 @@
   该机做任何改动。**`legacy` 档的验证主机目前仍未落实**，在拿到之前该档一律标注**未验证**，
   不得声称「已支持」。
 
+### 2026-09-22 远程仓库落地，CI 首次真实执行
+
+- **变更内容**：远程仓库确定为 `https://github.com/freezeChen/frz-tools.git`（public）。
+  module path 由临时的 `frz-tools` 固定为 `github.com/freezeChen/frz-tools`，
+  59 个文件、145 处 import 前缀整体替换。项目名仍为 `frz-tools`，
+  按项目名生成的字符串（systemd 单元描述、e2e 临时目录前缀、`frz-ops` 用户与镜像名）
+  刻意不动。
+- **CI 首次真实执行**：本地已有 20 个提交，此前**从未推送过**，`.github/workflows/ci.yml`
+  里的 `linux-verify` job 一次都没跑过。推送后两个 job 均成功：
+  - `test`：fmt + vet + test + test-race + cross 全部通过；
+  - `linux-verify`：在干净的 ubuntu-latest runner 上 **40 项断言全绿**，
+    已核对日志确认断言真的执行（含容器内 systemd 作为 PID 1、tzdata 可用、
+    带时区的计划按计划时区解释、`0600` 凭据可解析而 `0644` 被拒绝），不是被跳过。
+- **意义**：此前「Linux 容器」类证据只在本地 macOS 的 Docker 上产生；
+  现在它在干净 runner 上可复现，该证据类型的可信度提高一档。
+  但这仍不是「Linux 主机」证据：GitHub runner 也是 cgroup v2 的虚拟环境，
+  真实 reboot 后的 unit 持久化、SELinux/AppArmor、sudoers/PAM 依然挂起。
+- **推送方式**：GitHub 已不支持 HTTPS 密码认证，`gh` 配置的是 SSH，
+  因此 origin 使用 `git@github.com:freezeChen/frz-tools.git`。
+
