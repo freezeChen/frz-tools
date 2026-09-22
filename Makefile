@@ -1,5 +1,5 @@
 GO ?= go
-BIN_DIR ?= bin
+BIN_DIR ?= output
 PKGS := ./...
 
 .PHONY: all fmt vet test test-race build cross verify-linux ci clean

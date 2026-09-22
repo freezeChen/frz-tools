@@ -47,7 +47,7 @@ func newArtifactPutCommand(opts *rootOptions) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			file, err := os.Open(args[0])
 			if err != nil {
-				return domain.NewError(v1.CodeInvalidRequest, "cannot read %q: %v", args[0], err)
+				return domain.NewError(v1.CodeInvalidRequest, "无法读取 %q: %v", args[0], err)
 			}
 			defer file.Close()
 

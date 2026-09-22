@@ -204,7 +204,7 @@ func parseLabels(raw []string) (map[string]string, error) {
 	for _, item := range raw {
 		key, value, found := strings.Cut(item, "=")
 		if !found || strings.TrimSpace(key) == "" {
-			return nil, domain.NewError(v1.CodeInvalidRequest, "标签 %q 必须是 key=value 形式", item)
+			return nil, domain.NewError(v1.CodeInvalidRequest, "--label 的 %q 必须是 key=value 形式", item)
 		}
 		labels[key] = value
 	}

@@ -56,11 +56,14 @@ make fmt           # 格式检查
 make vet           # 静态检查
 make test          # 单元 + 集成 + e2e
 make test-race     # 竞态检测
-make build         # 构建两个二进制到 bin/
-make cross         # 交叉编译 linux/amd64 与 linux/arm64
+make build         # 构建两个二进制到 output/
+make cross         # 交叉编译 linux/amd64 与 linux/arm64 到 output/
 make verify-linux  # Linux 容器验证：文件模式、属组、Unix Socket ACL、systemd（需要 docker）
 make ci            # fmt + vet + test + test-race + cross，提交前必须通过
 ```
+
+两个二进制的命令帮助、旗标说明与提示信息一律使用中文；命令名、旗标名、`--json`
+输出的字段名保持英文（与 `api/v1` 逐字段对应）。本地化实现见 `internal/cliutil`。
 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行。
 修改了权限、属组、socket 或 systemd 相关逻辑后必须单独跑它。

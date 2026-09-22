@@ -1,6 +1,9 @@
 # 构建产物
 /bin/
 /dist/
+/output/
+cmd/opsd/opsd
+cmd/opsctl/opsctl
 
 # 本地开发状态
 opsd-dev/

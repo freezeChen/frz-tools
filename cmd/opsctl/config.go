@@ -11,13 +11,13 @@ import (
 func newConfigCommand(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "config",
-		Short: "Work with opsd configuration files",
+		Short: "操作 opsd 的配置文件",
 	}
 
 	var file string
 	validate := &cobra.Command{
 		Use:   "validate --file <path>",
-		Short: "Validate an opsd configuration file without contacting opsd",
+		Short: "校验一个 opsd 配置文件，不连接 opsd",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Load(file)
@@ -34,11 +34,11 @@ func newConfigCommand(opts *rootOptions) *cobra.Command {
 					"workers":    cfg.Runtime.Workers,
 				})
 			}
-			fmt.Printf("%s is valid\n", file)
+			fmt.Printf("%s 校验通过\n", file)
 			return nil
 		},
 	}
-	validate.Flags().StringVar(&file, "file", "", "path to the opsd configuration file (required)")
+	validate.Flags().StringVar(&file, "file", "", "opsd 配置文件路径（必填）")
 	_ = validate.MarkFlagRequired("file")
 
 	cmd.AddCommand(validate)

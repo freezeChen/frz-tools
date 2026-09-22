@@ -10,7 +10,7 @@ import (
 func newHealthCommand(opts *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "health",
-		Short: "Check whether opsd and its database are reachable",
+		Short: "检查 opsd 及其数据库是否可达",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			health, err := opts.client().Health(cmd.Context())

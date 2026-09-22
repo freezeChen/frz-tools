@@ -15,7 +15,7 @@ import (
 func newOperationCommand(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "operation",
-		Short: "Submit, inspect, cancel, retry and read logs of operations",
+		Short: "提交、查询、取消、重试操作并查看日志",
 	}
 	cmd.AddCommand(
 		newSubmitCommand(opts),
@@ -38,14 +38,14 @@ func newSubmitCommand(opts *rootOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "submit --kind <kind> --resource <name> [--dry-run] -- <argv...>",
-		Short: "Submit an operation for execution by opsd",
+		Short: "提交一个操作交由 opsd 执行",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.ArgsLenAtDash() == -1 {
-				return domain.NewError(v1.CodeInvalidRequest, "pass the command argv after --, for example: -- /usr/bin/true")
+				return domain.NewError(v1.CodeInvalidRequest, "请把命令 argv 写在 -- 之后，例如：-- /usr/bin/true")
 			}
 			if len(args) == 0 {
-				return domain.NewError(v1.CodeInvalidRequest, "argv after -- must not be empty")
+				return domain.NewError(v1.CodeInvalidRequest, "-- 之后的 argv 不能为空")
 			}
 
 			secretEnvironment, err := parseSecretRefs(secrets)
@@ -75,17 +75,17 @@ func newSubmitCommand(opts *rootOptions) *cobra.Command {
 				return opts.printJSON(operation)
 			}
 			if !created {
-				fmt.Println("reused existing operation for this idempotency key")
+				fmt.Println("该幂等键对应的请求已存在，复用既有操作")
 			}
 			printOperation(operation)
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&kind, "kind", v1.KindExecutorCommand, "operation kind")
-	cmd.Flags().StringVar(&resource, "resource", "", "resource to lock for the duration of the operation (required)")
-	cmd.Flags().StringVar(&idemKey, "idempotency-key", "", "idempotency key; repeating it with the same request reuses the operation")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "validate and record the plan without executing anything")
+	cmd.Flags().StringVar(&kind, "kind", v1.KindExecutorCommand, "操作类型")
+	cmd.Flags().StringVar(&resource, "resource", "", "操作期间持有的资源锁，相同资源会串行执行（必填）")
+	cmd.Flags().StringVar(&idemKey, "idempotency-key", "", "幂等键；相同请求再次提交会复用同一个操作")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "只校验并记录计划，不执行任何东西")
 	cmd.Flags().StringArrayVar(&secrets, "secret-env", nil,
 		"把凭据注入命令环境，格式 VAR=kind:name（kind 为 env 或 file）；明文不会进入请求体或日志")
 	_ = cmd.MarkFlagRequired("resource")
@@ -118,7 +118,7 @@ func parseSecretRefs(raw []string) (map[string]v1.SecretRef, error) {
 func newGetCommand(opts *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "get <operation-id>",
-		Short: "Show one operation",
+		Short: "查看单个操作",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			operation, err := opts.client().GetOperation(cmd.Context(), args[0])
@@ -137,7 +137,7 @@ func newGetCommand(opts *rootOptions) *cobra.Command {
 func newCancelCommand(opts *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "cancel <operation-id>",
-		Short: "Cancel a pending or running operation",
+		Short: "取消一个待执行或运行中的操作",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			operation, err := opts.client().CancelOperation(cmd.Context(), args[0])
@@ -156,7 +156,7 @@ func newCancelCommand(opts *rootOptions) *cobra.Command {
 func newRetryCommand(opts *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "retry <operation-id>",
-		Short: "Retry a failed or cancelled operation as a new operation",
+		Short: "把失败或已取消的操作重新建一个操作执行",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			operation, err := opts.client().RetryOperation(cmd.Context(), args[0])
@@ -181,11 +181,11 @@ func newLogsCommand(opts *rootOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "logs <operation-id>",
-		Short: "Print the structured log of an operation",
+		Short: "打印操作的结构化日志",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if follow {
-				return domain.NewError(v1.CodeInvalidRequest, "--follow is not implemented in this iteration; poll with --cursor instead")
+				return domain.NewError(v1.CodeInvalidRequest, "--follow 流式日志本迭代未实现，请改用 --cursor 轮询")
 			}
 			response, err := opts.client().Logs(cmd.Context(), args[0], cursor, limit)
 			if err != nil {
@@ -205,9 +205,9 @@ func newLogsCommand(opts *rootOptions) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().Int64Var(&cursor, "cursor", 0, "return entries with an id greater than this cursor")
-	cmd.Flags().IntVar(&limit, "limit", 0, "maximum number of entries to return")
-	cmd.Flags().BoolVar(&follow, "follow", false, "reserved for streaming; not implemented yet")
+	cmd.Flags().Int64Var(&cursor, "cursor", 0, "只返回 id 大于该游标的日志条目")
+	cmd.Flags().IntVar(&limit, "limit", 0, "返回条数上限")
+	cmd.Flags().BoolVar(&follow, "follow", false, "流式输出，本迭代保留参数但尚未实现")
 
 	return cmd
 }

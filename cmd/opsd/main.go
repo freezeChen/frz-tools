@@ -19,6 +19,7 @@ import (
 	"frz-tools/internal/adapters/secret"
 	"frz-tools/internal/adapters/sqlite"
 	"frz-tools/internal/application"
+	"frz-tools/internal/cliutil"
 	"frz-tools/internal/domain"
 
 	"github.com/spf13/cobra"
@@ -27,13 +28,15 @@ import (
 func main() {
 	root := &cobra.Command{
 		Use:           "opsd",
-		Short:         "opsd runs privileged Linux operations requested through opsctl",
+		Short:         "opsd 是目标主机上的守护进程，负责执行需要权限的操作",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE:          run,
 	}
-	root.Flags().String("config", "/etc/opsd/config.yaml", "path to the opsd configuration file")
-	root.Flags().String("log-level", "info", "log level: debug, info, warn, error")
+	root.Flags().String("config", "/etc/opsd/config.yaml", "opsd 配置文件路径")
+	root.Flags().String("log-level", "info", "日志级别：debug、info、warn、error")
+	cliutil.LocalizeUsage(root)
+	cliutil.LocalizeHelpFlag(root)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "opsd:", domain.MessageOf(err))
@@ -62,7 +65,7 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	store, err := sqlite.Open(cfg.Database.Path)
 	if err != nil {
-		return domain.NewError(v1.CodeConfigInvalid, "cannot open database: %v", err)
+		return domain.NewError(v1.CodeConfigInvalid, "无法打开数据库: %v", err)
 	}
 	defer store.Close()
 
@@ -70,12 +73,12 @@ func run(cmd *cobra.Command, _ []string) error {
 	defer stop()
 
 	if err := store.Migrate(ctx); err != nil {
-		return domain.NewError(v1.CodeInternal, "migration failed: %v", err)
+		return domain.NewError(v1.CodeInternal, "执行数据库迁移失败: %v", err)
 	}
 
 	recovered, err := application.Recover(ctx, store, logger, time.Now().UTC())
 	if err != nil {
-		return domain.NewError(v1.CodeInternal, "startup recovery failed: %v", err)
+		return domain.NewError(v1.CodeInternal, "启动时的恢复流程失败: %v", err)
 	}
 	logger.Info("opsd starting",
 		"apiVersion", v1.APIVersion,
@@ -114,7 +117,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	}
 	listener, err := httpapi.ListenUnix(cfg.Socket.Path, mode)
 	if err != nil {
-		return domain.NewError(v1.CodeInternal, "cannot listen on %s: %v", cfg.Socket.Path, err)
+		return domain.NewError(v1.CodeInternal, "无法监听 %s: %v", cfg.Socket.Path, err)
 	}
 	defer func() {
 		listener.Close()
@@ -132,7 +135,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	})
 
 	if err := server.Serve(ctx, listener, cfg.ShutdownGrace()); err != nil {
-		return domain.NewError(v1.CodeInternal, "http server failed: %v", err)
+		return domain.NewError(v1.CodeInternal, "HTTP 服务启动失败: %v", err)
 	}
 	logger.Info("opsd stopped")
 	return nil
@@ -187,7 +190,7 @@ func prepareDirectories(cfg *config.Config) error {
 		cfg.Runtime.LogDirectory,
 	} {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return domain.NewError(v1.CodeConfigInvalid, "cannot create directory %q: %v", dir, err)
+			return domain.NewError(v1.CodeConfigInvalid, "无法创建目录 %q: %v", dir, err)
 		}
 	}
 	return nil
@@ -205,7 +208,7 @@ func newLogger(cfg *config.Config, level string) (*slog.Logger, func(), error) {
 		logPath := filepath.Join(cfg.Runtime.LogDirectory, "opsd.log")
 		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
-			return nil, nil, domain.NewError(v1.CodeConfigInvalid, "cannot open log file %q: %v", logPath, err)
+			return nil, nil, domain.NewError(v1.CodeConfigInvalid, "无法打开日志文件 %q: %v", logPath, err)
 		}
 		writer = io.MultiWriter(os.Stdout, file)
 		closeLog = func() { file.Close() }
@@ -226,6 +229,6 @@ func parseLevel(level string) (slog.Level, error) {
 	case "error":
 		return slog.LevelError, nil
 	default:
-		return 0, domain.NewError(v1.CodeConfigInvalid, "unknown log level %q", level)
+		return 0, domain.NewError(v1.CodeConfigInvalid, "未知的日志级别 %q", level)
 	}
 }
