@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,22 +22,30 @@ import (
 
 const maxRequestBytes = 1 << 20
 
-type Server struct {
-	service   *application.Service
-	store     *sqlite.Store
-	workers   int
-	startedAt time.Time
-	logger    *slog.Logger
+// Dependencies 把 API 需要的端口显式列出，避免处理器直接依赖具体实现。
+type Dependencies struct {
+	Service   *application.Service
+	Artifacts *application.ArtifactService
+	Catalogs  *application.CatalogService
+	Store     *sqlite.Store
+	Workers   int
+	Logger    *slog.Logger
 }
 
-func NewServer(service *application.Service, store *sqlite.Store, workers int, logger *slog.Logger) *Server {
-	return &Server{
-		service:   service,
-		store:     store,
-		workers:   workers,
-		startedAt: time.Now().UTC(),
-		logger:    logger,
+type Server struct {
+	deps      Dependencies
+	startedAt time.Time
+}
+
+func NewServer(deps Dependencies) *Server {
+	return &Server{deps: deps, startedAt: time.Now().UTC()}
+}
+
+func (s *Server) logger() *slog.Logger {
+	if s.deps.Logger == nil {
+		return slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	return s.deps.Logger
 }
 
 func (s *Server) Handler() http.Handler {
@@ -47,9 +56,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/operations/{id}/cancel", s.handleCancelOperation)
 	mux.HandleFunc("POST /api/v1/operations/{id}/retry", s.handleRetryOperation)
 	mux.HandleFunc("GET /api/v1/operations/{id}/logs", s.handleOperationLogs)
+
+	mux.HandleFunc("POST /api/v1/artifacts", s.handleUploadArtifact)
+	mux.HandleFunc("GET /api/v1/artifacts", s.handleListArtifacts)
+	mux.HandleFunc("POST /api/v1/artifacts/gc", s.handleCollectArtifacts)
+	mux.HandleFunc("GET /api/v1/artifacts/{id}", s.handleGetArtifact)
+	mux.HandleFunc("POST /api/v1/artifacts/{id}/verify", s.handleVerifyArtifact)
+	mux.HandleFunc("DELETE /api/v1/artifacts/{id}", s.handleDeleteArtifact)
+
+	mux.HandleFunc("POST /api/v1/applications", s.handleCreateApplication)
+	mux.HandleFunc("GET /api/v1/applications", s.handleListApplications)
+	mux.HandleFunc("GET /api/v1/applications/{id}", s.handleGetApplication)
+	mux.HandleFunc("GET /api/v1/applications/{id}/releases", s.handleListApplicationReleases)
+	mux.HandleFunc("POST /api/v1/releases", s.handleCreateRelease)
+	mux.HandleFunc("GET /api/v1/releases/{id}", s.handleGetRelease)
+
 	mux.HandleFunc("/", s.handleNotFound)
 
-	return recoverPanic(s.logger, logRequests(s.logger, mux))
+	logger := s.logger()
+	return recoverPanic(logger, logRequests(logger, mux))
 }
 
 // Serve 在 ln 上运行 HTTP 服务，直到 ctx 被取消，然后在 grace 内优雅关闭。
@@ -66,7 +91,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, grace time.Duration
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace)
 		defer cancel()
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			s.logger.Error("graceful shutdown failed", "error", err)
+			s.logger().Error("graceful shutdown failed", "error", err)
 		}
 	}()
 
@@ -119,16 +144,16 @@ func isAddrInUse(err error) bool {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Ping(r.Context()); err != nil {
-		s.logger.Error("health check failed", "error", err)
-		writeError(w, s.logger, domain.NewError(v1.CodeInternal, "database unreachable"))
+	if err := s.deps.Store.Ping(r.Context()); err != nil {
+		s.logger().Error("health check failed", "error", err)
+		writeError(w, s.logger(), domain.NewError(v1.CodeInternal, "database unreachable"))
 		return
 	}
 	writeJSON(w, http.StatusOK, v1.HealthResponse{
 		APIVersion: v1.APIVersion,
 		Daemon:     "ok",
 		Database:   "ok",
-		Workers:    s.workers,
+		Workers:    s.deps.Workers,
 		UptimeMS:   time.Since(s.startedAt).Milliseconds(),
 	})
 }
@@ -136,16 +161,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateOperation(w http.ResponseWriter, r *http.Request) {
 	var req v1.CreateOperationRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 	if req.IdempotencyKey == "" {
 		req.IdempotencyKey = r.Header.Get("Idempotency-Key")
 	}
 
-	op, created, err := s.service.Create(r.Context(), req)
+	op, created, err := s.deps.Service.Create(r.Context(), req)
 	if err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 
@@ -157,27 +182,27 @@ func (s *Server) handleCreateOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := s.service.Get(r.Context(), r.PathValue("id"))
+	op, err := s.deps.Service.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, v1.OperationResponse{APIVersion: v1.APIVersion, Operation: operationDTO(op)})
 }
 
 func (s *Server) handleCancelOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := s.service.Cancel(r.Context(), r.PathValue("id"))
+	op, err := s.deps.Service.Cancel(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, v1.OperationResponse{APIVersion: v1.APIVersion, Operation: operationDTO(op)})
 }
 
 func (s *Server) handleRetryOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := s.service.Retry(r.Context(), r.PathValue("id"))
+	op, err := s.deps.Service.Retry(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, v1.OperationResponse{APIVersion: v1.APIVersion, Operation: operationDTO(op)})
@@ -186,18 +211,18 @@ func (s *Server) handleRetryOperation(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleOperationLogs(w http.ResponseWriter, r *http.Request) {
 	cursor, err := intQuery(r, "cursor", 0)
 	if err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 	limit, err := intQuery(r, "limit", 0)
 	if err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 
-	entries, err := s.service.Logs(r.Context(), r.PathValue("id"), int64(cursor), limit)
+	entries, err := s.deps.Service.Logs(r.Context(), r.PathValue("id"), int64(cursor), limit)
 	if err != nil {
-		writeError(w, s.logger, err)
+		writeError(w, s.logger(), err)
 		return
 	}
 
@@ -225,7 +250,7 @@ func (s *Server) handleOperationLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	writeError(w, s.logger, domain.NewError(v1.CodeOperationNotFound, "no route matches %s %s", r.Method, r.URL.Path))
+	writeError(w, s.logger(), domain.NewError(v1.CodeOperationNotFound, "no route matches %s %s", r.Method, r.URL.Path))
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {

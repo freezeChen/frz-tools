@@ -80,6 +80,7 @@ type CommandSpec struct {
 	Argv                []string
 	WorkingDirectory    string
 	Environment         map[string]string
+	SecretEnv           map[string]SecretRef
 	Timeout             time.Duration
 	MaxOutputBytes      int64
 	SensitiveEnvKeys    []string

@@ -21,13 +21,20 @@ type CreateOperationRequest struct {
 }
 
 type ExecutorCommandSpec struct {
-	Argv                []string          `json:"argv"`
-	WorkingDirectory    string            `json:"workingDirectory,omitempty"`
-	Environment         map[string]string `json:"environment,omitempty"`
-	TimeoutSeconds      int               `json:"timeoutSeconds,omitempty"`
-	MaxOutputBytes      int64             `json:"maxOutputBytes,omitempty"`
-	SensitiveEnvKeys    []string          `json:"sensitiveEnvKeys,omitempty"`
-	SensitiveArgIndexes []int             `json:"sensitiveArgIndexes,omitempty"`
+	Argv                []string             `json:"argv"`
+	WorkingDirectory    string               `json:"workingDirectory,omitempty"`
+	Environment         map[string]string    `json:"environment,omitempty"`
+	SecretEnvironment   map[string]SecretRef `json:"secretEnvironment,omitempty"`
+	TimeoutSeconds      int                  `json:"timeoutSeconds,omitempty"`
+	MaxOutputBytes      int64                `json:"maxOutputBytes,omitempty"`
+	SensitiveEnvKeys    []string             `json:"sensitiveEnvKeys,omitempty"`
+	SensitiveArgIndexes []int                `json:"sensitiveArgIndexes,omitempty"`
+}
+
+// SecretRef 只描述凭据的来源。明文在使用时刻解析，不进入请求体、数据库或日志。
+type SecretRef struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
 }
 
 type Operation struct {

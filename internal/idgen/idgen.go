@@ -16,3 +16,9 @@ func New(prefix string) string {
 }
 
 func NewOperationID() string { return New("op") }
+
+func NewArtifactID() string { return New("art") }
+
+func NewApplicationID() string { return New("app") }
+
+func NewReleaseID() string { return New("rel") }

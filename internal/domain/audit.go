@@ -12,6 +12,10 @@ const (
 	EventDaemonRecovered    = "daemon.recovered"
 	EventLockAcquired       = "lock.acquired"
 	EventLockReleased       = "lock.released"
+
+	EventArtifactCreated   = "artifact.created"
+	EventArtifactDeleted   = "artifact.deleted"
+	EventArtifactCollected = "artifact.collected"
 )
 
 type AuditEvent struct {

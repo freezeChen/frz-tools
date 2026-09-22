@@ -9,7 +9,6 @@ import (
 
 	v1 "frz-tools/api/v1"
 	"frz-tools/internal/domain"
-	"frz-tools/internal/idgen"
 )
 
 type cancelRegistry struct {
@@ -55,13 +54,13 @@ type Service struct {
 	logger   *slog.Logger
 }
 
-func newService(repo Repository, defaults Defaults, allow func(string) bool, cancels *cancelRegistry, logger *slog.Logger) *Service {
+func newService(repo Repository, defaults Defaults, allow func(string) bool, cancels *cancelRegistry, newID func() string, logger *slog.Logger) *Service {
 	return &Service{
 		repo:     repo,
 		defaults: defaults,
 		allow:    allow,
 		cancels:  cancels,
-		newID:    idgen.NewOperationID,
+		newID:    newID,
 		now:      func() time.Time { return time.Now().UTC() },
 		logger:   logger,
 	}

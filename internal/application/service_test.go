@@ -47,6 +47,10 @@ func discardLogger() *slog.Logger {
 func allowAll(string) bool { return true }
 
 func newTestRuntime(t *testing.T, exec Executor, allow func(string) bool) (*Runtime, *sqlite.Store) {
+	return newTestRuntimeWith(t, Options{Executor: exec, AllowExecutable: allow})
+}
+
+func newTestRuntimeWith(t *testing.T, opts Options) (*Runtime, *sqlite.Store) {
 	t.Helper()
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "opsd.db"))
 	if err != nil {
@@ -57,9 +61,27 @@ func newTestRuntime(t *testing.T, exec Executor, allow func(string) bool) (*Runt
 		t.Fatalf("migrate: %v", err)
 	}
 
-	defaults := Defaults{Timeout: 5 * time.Second, MaxOutputBytes: 4096, SensitiveEnvKeys: []string{"TOKEN"}}
-	rt := NewRuntime(store, exec, allow, defaults, 1, 20*time.Millisecond, discardLogger())
-	return rt, store
+	opts.Repo = store
+	if opts.Executor == nil {
+		opts.Executor = &fakeExec{}
+	}
+	if opts.AllowExecutable == nil {
+		opts.AllowExecutable = allowAll
+	}
+	if opts.Defaults.Timeout == 0 {
+		opts.Defaults = Defaults{Timeout: 5 * time.Second, MaxOutputBytes: 4096, SensitiveEnvKeys: []string{"TOKEN"}}
+	}
+	if opts.Workers == 0 {
+		opts.Workers = 1
+	}
+	if opts.Idle == 0 {
+		opts.Idle = 20 * time.Millisecond
+	}
+	if opts.Logger == nil {
+		opts.Logger = discardLogger()
+	}
+
+	return NewRuntime(opts), store
 }
 
 func submitRequest(resource string) v1.CreateOperationRequest {

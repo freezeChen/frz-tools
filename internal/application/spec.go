@@ -49,10 +49,27 @@ func BuildCommandSpec(kind string, raw json.RawMessage, defaults Defaults) (doma
 		}
 	}
 
+	secretEnv := make(map[string]domain.SecretRef, len(parsed.SecretEnvironment))
+	for name, ref := range parsed.SecretEnvironment {
+		if strings.TrimSpace(name) == "" {
+			return domain.CommandSpec{}, domain.NewError(v1.CodeInvalidRequest, "spec.secretEnvironment contains an empty variable name")
+		}
+		if _, clash := parsed.Environment[name]; clash {
+			return domain.CommandSpec{}, domain.NewError(v1.CodeInvalidRequest,
+				"spec.secretEnvironment[%q] also appears in spec.environment", name)
+		}
+		secretRef := domain.SecretRef{Kind: domain.SecretKind(ref.Kind), Name: ref.Name}
+		if err := secretRef.Validate(); err != nil {
+			return domain.CommandSpec{}, err
+		}
+		secretEnv[name] = secretRef
+	}
+
 	return domain.CommandSpec{
 		Argv:                parsed.Argv,
 		WorkingDirectory:    parsed.WorkingDirectory,
 		Environment:         parsed.Environment,
+		SecretEnv:           secretEnv,
 		Timeout:             timeSeconds(parsed.TimeoutSeconds),
 		MaxOutputBytes:      parsed.MaxOutputBytes,
 		SensitiveEnvKeys:    parsed.SensitiveEnvKeys,

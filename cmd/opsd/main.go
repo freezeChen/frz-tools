@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,9 +12,11 @@ import (
 	"time"
 
 	v1 "frz-tools/api/v1"
+	"frz-tools/internal/adapters/blob"
 	"frz-tools/internal/adapters/config"
 	"frz-tools/internal/adapters/executor"
 	"frz-tools/internal/adapters/httpapi"
+	"frz-tools/internal/adapters/secret"
 	"frz-tools/internal/adapters/sqlite"
 	"frz-tools/internal/application"
 	"frz-tools/internal/domain"
@@ -83,11 +86,27 @@ func run(cmd *cobra.Command, _ []string) error {
 	)
 
 	exec := executor.New(cfg.ExecutableAllowed, cfg.DefaultTimeout(), cfg.Execution.MaxOutputBytes, cfg.SensitiveEnvKeys())
-	runtime := application.NewRuntime(store, exec, cfg.ExecutableAllowed, application.Defaults{
-		Timeout:          cfg.DefaultTimeout(),
-		MaxOutputBytes:   cfg.Execution.MaxOutputBytes,
-		SensitiveEnvKeys: cfg.SensitiveEnvKeys(),
-	}, cfg.Runtime.Workers, 0, logger)
+
+	artifactStore, artifactPolicy, err := openArtifactStore(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+
+	runtime := application.NewRuntime(application.Options{
+		Repo:            store,
+		Executor:        exec,
+		Secrets:         secret.NewResolver(cfg.AllowedSecretDirectories()),
+		Store:           artifactStore,
+		AllowExecutable: cfg.ExecutableAllowed,
+		Defaults: application.Defaults{
+			Timeout:          cfg.DefaultTimeout(),
+			MaxOutputBytes:   cfg.Execution.MaxOutputBytes,
+			SensitiveEnvKeys: cfg.SensitiveEnvKeys(),
+		},
+		ArtifactPolicy: artifactPolicy,
+		Workers:        cfg.Runtime.Workers,
+		Logger:         logger,
+	})
 
 	mode, err := cfg.SocketFileMode()
 	if err != nil {
@@ -103,13 +122,61 @@ func run(cmd *cobra.Command, _ []string) error {
 	}()
 
 	runtime.Pool.Start(ctx)
-	server := httpapi.NewServer(runtime.Service, store, runtime.Pool.Workers(), logger)
+	server := httpapi.NewServer(httpapi.Dependencies{
+		Service:   runtime.Service,
+		Artifacts: runtime.Artifacts,
+		Catalogs:  runtime.Catalogs,
+		Store:     store,
+		Workers:   runtime.Pool.Workers(),
+		Logger:    logger,
+	})
 
 	if err := server.Serve(ctx, listener, cfg.ShutdownGrace()); err != nil {
 		return domain.NewError(v1.CodeInternal, "http server failed: %v", err)
 	}
 	logger.Info("opsd stopped")
 	return nil
+}
+
+func openArtifactStore(ctx context.Context, cfg *config.Config, logger *slog.Logger) (application.StorageBackend, application.ArtifactPolicy, error) {
+	if !cfg.ArtifactStoreEnabled() {
+		logger.Info("artifact store is disabled", "reason", "artifactStore.root is not configured")
+		return nil, application.ArtifactPolicy{}, nil
+	}
+
+	fileMode, err := cfg.ArtifactFileMode()
+	if err != nil {
+		return nil, application.ArtifactPolicy{}, domain.NewError(v1.CodeConfigInvalid, "%v", err)
+	}
+	dirMode, err := cfg.ArtifactDirMode()
+	if err != nil {
+		return nil, application.ArtifactPolicy{}, domain.NewError(v1.CodeConfigInvalid, "%v", err)
+	}
+
+	local, err := blob.NewLocal(cfg.ArtifactStore.Root, fileMode, dirMode)
+	if err != nil {
+		return nil, application.ArtifactPolicy{}, err
+	}
+
+	removed, err := local.CleanupTemp(ctx)
+	if err != nil {
+		return nil, application.ArtifactPolicy{}, err
+	}
+	if removed > 0 {
+		logger.Warn("removed stale artifact uploads left by a previous run", "count", removed)
+	}
+
+	logger.Info("artifact store ready",
+		"root", cfg.ArtifactStore.Root,
+		"fileMode", fmt.Sprintf("%04o", fileMode),
+		"maxUploadBytes", cfg.ArtifactStore.MaxUploadBytes,
+		"quotaBytes", cfg.ArtifactStore.QuotaBytes,
+	)
+
+	return local, application.ArtifactPolicy{
+		MaxUploadBytes: cfg.ArtifactStore.MaxUploadBytes,
+		QuotaBytes:     cfg.ArtifactStore.QuotaBytes,
+	}, nil
 }
 
 func prepareDirectories(cfg *config.Config) error {

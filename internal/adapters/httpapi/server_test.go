@@ -37,9 +37,22 @@ func newTestServer(t *testing.T) (*httptest.Server, *sqlite.Store) {
 	exec := executor.New(allow, 5*time.Second, 4096, nil)
 	defaults := application.Defaults{Timeout: 5 * time.Second, MaxOutputBytes: 4096}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	runtime := application.NewRuntime(store, exec, allow, defaults, 1, 10*time.Millisecond, logger)
+	runtime := application.NewRuntime(application.Options{
+		Repo:            store,
+		Executor:        exec,
+		AllowExecutable: allow,
+		Defaults:        defaults,
+		Workers:         1,
+		Idle:            10 * time.Millisecond,
+		Logger:          logger,
+	})
 
-	server := httptest.NewServer(NewServer(runtime.Service, store, 1, logger).Handler())
+	server := httptest.NewServer(NewServer(Dependencies{
+		Service: runtime.Service,
+		Store:   store,
+		Workers: 1,
+		Logger:  logger,
+	}).Handler())
 	t.Cleanup(server.Close)
 	return server, store
 }

@@ -44,6 +44,9 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(
 		newHealthCommand(opts),
 		newOperationCommand(opts),
+		newArtifactCommand(opts),
+		newAppCommand(opts),
+		newReleaseCommand(opts),
 		newConfigCommand(opts),
 	)
 	return root

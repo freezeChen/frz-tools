@@ -1,6 +1,7 @@
 # Taste
 - Wants everything written in Chinese: replies, documentation, code comments, and commit messages (「语言都用中文」). Confidence: 0.9
 - Wants code comments kept to the necessary minimum — only non-obvious "why" and constraint explanations; drop comments that merely restate the code. Confidence: 0.7
+- Explicitly asks that subsequent code include 合理的中文注释 (reasonable Chinese comments) — code must not be left uncommented; add meaningful Chinese comments where they aid understanding. Confidence: 0.65
 - Wants durable conventions (like the Chinese-language rule) written into the repo's AGENTS.md so they're explicit, reusable by the team and other agents. Confidence: 0.75
 - Prompts are terse — often just a topic label (「迭代1」) — and expects the agent to ask clarifying questions and align scope before producing large deliverables. Confidence: 0.55
 - Prefers incremental delivery: split an oversized stage into milestones and freeze only the first slice, rather than freezing a large design in one go. Confidence: 0.6

@@ -17,6 +17,7 @@ const defaultIdlePoll = 250 * time.Millisecond
 type Pool struct {
 	repo     Repository
 	exec     Executor
+	resolver SecretResolver
 	defaults Defaults
 	cancels  *cancelRegistry
 	workers  int
@@ -26,13 +27,14 @@ type Pool struct {
 	now      func() time.Time
 }
 
-func newPool(repo Repository, exec Executor, defaults Defaults, cancels *cancelRegistry, workers int, logger *slog.Logger) *Pool {
+func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, workers int, logger *slog.Logger) *Pool {
 	if workers < 1 {
 		workers = 1
 	}
 	return &Pool{
 		repo:     repo,
 		exec:     exec,
+		resolver: resolver,
 		defaults: defaults,
 		cancels:  cancels,
 		workers:  workers,
@@ -97,6 +99,7 @@ func (p *Pool) ProcessNext(ctx context.Context) (bool, error) {
 }
 
 func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
+	// 终态写入不能因为取消或关停而丢失，因此用不受取消影响的 context 落库。
 	persistCtx := context.WithoutCancel(ctx)
 	logger := p.logger.With("operationId", op.ID, "resource", op.Resource)
 
@@ -110,15 +113,24 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 	spec, err := BuildCommandSpec(op.Kind, op.Spec, p.defaults)
 	if err != nil {
 		code := string(domain.CodeOf(err))
-		p.appendLog(persistCtx, op, "error", domain.PhaseValidate, "operation rejected: "+domain.MessageOf(err),
+		p.appendLog(persistCtx, op, nil, "error", domain.PhaseValidate, "operation rejected: "+domain.MessageOf(err),
 			map[string]string{"errorCode": code})
 		p.finish(persistCtx, op, domain.StatusFailed, nil, code, domain.MessageOf(err))
 		return
 	}
 	spec.DryRun = op.DryRun
 
+	redactor, err := p.resolveSecrets(execCtx, &spec)
+	if err != nil {
+		code := string(domain.CodeOf(err))
+		p.appendLog(persistCtx, op, redactor, "error", domain.PhaseValidate,
+			"cannot resolve secret: "+domain.MessageOf(err), map[string]string{"errorCode": code})
+		p.finish(persistCtx, op, domain.StatusFailed, nil, code, domain.MessageOf(err))
+		return
+	}
+
 	sensitiveEnvKeys := append(append([]string(nil), p.defaults.SensitiveEnvKeys...), spec.SensitiveEnvKeys...)
-	p.appendLog(persistCtx, op, "info", domain.PhaseExecute, "executing command", map[string]string{
+	p.appendLog(persistCtx, op, redactor, "info", domain.PhaseExecute, "executing command", map[string]string{
 		"argv":             strings.Join(domain.RedactArgv(spec.Argv, spec.SensitiveArgIndexes), " "),
 		"workingDirectory": spec.WorkingDirectory,
 		"dryRun":           strconv.FormatBool(op.DryRun),
@@ -149,7 +161,7 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 	}
 
 	if result.Stdout != "" {
-		p.appendLog(persistCtx, op, "info", domain.PhaseExecute, "command stdout",
+		p.appendLog(persistCtx, op, redactor, "info", domain.PhaseExecute, "command stdout",
 			map[string]string{"stdout": result.Stdout})
 	}
 	if result.Stderr != "" {
@@ -157,7 +169,7 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 		if status != domain.StatusSucceeded {
 			level = "error"
 		}
-		p.appendLog(persistCtx, op, level, domain.PhaseExecute, "command stderr",
+		p.appendLog(persistCtx, op, redactor, level, domain.PhaseExecute, "command stderr",
 			map[string]string{"stderr": result.Stderr})
 	}
 
@@ -176,19 +188,62 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 	if status != domain.StatusSucceeded {
 		level = "error"
 	}
-	p.appendLog(persistCtx, op, level, domain.PhaseFinalize, "operation finished", summary)
+	p.appendLog(persistCtx, op, nil, level, domain.PhaseFinalize, "operation finished", summary)
 
 	p.finish(persistCtx, op, status, exitCode, errorCode, errorMessage)
 	logger.Info("operation finished", "status", string(status), "errorCode", errorCode)
 }
 
-func (p *Pool) appendLog(ctx context.Context, op *domain.Operation, level, phase, message string, fields map[string]string) {
+// resolveSecrets 在使用时刻把 SecretRef 解析成明文并合并进命令环境。返回值是
+// 按值脱敏用的 Redactor——只有按值替换才能拦住出现在 stdout、stderr 或错误信息
+// 里的凭据。
+func (p *Pool) resolveSecrets(ctx context.Context, spec *domain.CommandSpec) (*domain.Redactor, error) {
+	values := make([]string, 0, len(spec.SecretEnv))
+	if len(spec.SecretEnv) == 0 {
+		return p.redactorFor(spec, values), nil
+	}
+
+	if p.resolver == nil {
+		return nil, domain.NewError(v1.CodeSecretUnresolved, "spec.secretEnvironment is not supported by this daemon")
+	}
+
+	environment := make(map[string]string, len(spec.Environment)+len(spec.SecretEnv))
+	for key, value := range spec.Environment {
+		environment[key] = value
+	}
+	for name, ref := range spec.SecretEnv {
+		value, err := p.resolver.Resolve(ctx, ref)
+		if err != nil {
+			// 解析失败时不得把已解析出的其他凭据写进日志，因此这里只返回错误。
+			return domain.NewRedactor(values...), err
+		}
+		environment[name] = value
+		values = append(values, value)
+	}
+	spec.Environment = environment
+	spec.SecretEnv = nil
+
+	return p.redactorFor(spec, values), nil
+}
+
+// redactorFor 同时覆盖两种脱敏来源：显式标记为敏感的变量值，以及解析出的凭据值。
+func (p *Pool) redactorFor(spec *domain.CommandSpec, secretValues []string) *domain.Redactor {
+	values := append([]string(nil), secretValues...)
+	for _, key := range append(append([]string(nil), p.defaults.SensitiveEnvKeys...), spec.SensitiveEnvKeys...) {
+		if value, ok := spec.Environment[key]; ok {
+			values = append(values, value)
+		}
+	}
+	return domain.NewRedactor(values...)
+}
+
+func (p *Pool) appendLog(ctx context.Context, op *domain.Operation, redactor *domain.Redactor, level, phase, message string, fields map[string]string) {
 	if err := p.repo.AppendLog(ctx, domain.LogEntry{
 		OperationID: op.ID,
 		Level:       level,
 		Phase:       phase,
 		Message:     message,
-		Fields:      fields,
+		Fields:      redactor.RedactFields(fields),
 		Time:        p.now(),
 	}); err != nil {
 		p.logger.Error("failed to append operation log", "operationId", op.ID, "error", err)
