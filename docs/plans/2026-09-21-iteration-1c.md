@@ -85,9 +85,12 @@ exec:
   environment:
     GOMEMLIMIT: 40MiB
   secretEnvironment:
-    DB_PASSWORD:
+    DB_PASSWORD:                # kind: env → 环境变量里就是凭据值，必须是单行
+      kind: env
+      name: billing_db_password
+    TLS_KEY:                    # kind: file → 多行内容落到 0600 文件，变量里是该文件路径
       kind: file
-      name: /etc/opsd/apps/billing-api/db_password
+      name: /etc/opsd/secrets/billing-tls.key
   ports: [8080]
 health:
   readiness:
@@ -110,6 +113,8 @@ systemd:
 - `runtime` 取值限定 `go`/`java`；`unpack.strategy` 限定 `none`/`tar`/`tar-gz`/`zip`。
 - `health.readiness.type=http` 时 `target` 必须能解析为 URL；`tcp` 时能解析为 host:port。
 - `secretEnvironment` 复用 1a 的 `SecretRef` 校验，且不得与 `environment` 撞键。
+  `kind` 决定交付方式（见第 6 节）：`env` 的值必须单行，`file` 的路径由 opsd 生成、
+  环境变量里传该路径。
 - `unitName` 必须以 `.service` 结尾，且只允许 `[A-Za-z0-9_.@-]`。
 
 `mediaType → 解包方式` 约定：`application/x-tar`→`tar`、`application/gzip`
@@ -144,7 +149,7 @@ User=<runUser>
 Group=<runUser>
 WorkingDirectory=<exec.workingDirectory>
 EnvironmentFile=-/etc/opsd/apps/<application>.env
-LoadCredential=<name>:/etc/opsd/apps/<application>.credentials/<name>
+EnvironmentFile=/etc/opsd/apps/<application>.secrets.env
 ExecStart=<argv，按 systemd 规则转义>
 Restart=<restartPolicy>
 RestartSec=5
@@ -162,6 +167,39 @@ StandardError=append:<logs.directory>/current.log
 WantedBy=multi-user.target
 ```
 
+两个 `EnvironmentFile` 的 `-` 前缀是**有意区别对待**的：非敏感环境文件缺失可以继续（应用
+可能不需要额外环境变量），**敏感环境文件缺失必须让 unit 启动失败**，否则应用会在缺凭据的
+状态下起来。已决定不用 `LoadCredential=`，全部走环境文件（理由见第 15 节）。
+
+### 环境文件的值转义（已实测，不能自己发明）
+
+systemd 会处理环境文件里的反斜杠转义。实测（systemd 255）确认：**双引号内的 `\\` 收敛为一个
+`\`，`\"` 收敛为 `"`，其余 `\x` 原样保留；`$` 不做展开；单引号不特殊。** 因此 `opsd` 写值时必须：
+
+> 整体用双引号包裹，把 `\` 替换为 `\\`、`"` 替换为 `\"`，其余字节原样输出。
+
+不这样做，含反斜杠或双引号的凭据会被**静默改写**——密码里的 `\` 会消失，排查成本极高。
+该函数必须有逐字节往返的单元测试（见第 12 节）。
+
+### 环境文件装不下换行（已实测，决定了凭据交付方式）
+
+实测：`ESCAPED="line1\nline2"` 得到的值是**字面量 `\n`**（反斜杠加 n），不是换行；
+用行尾反斜杠续行则会把换行**直接吃掉**（`first\` + 换行 + `second` → `firstsecond`）。
+**结论：`EnvironmentFile` 无法承载含真实换行的值。**
+
+因此 `exec.secretEnvironment` 按 `SecretRef.kind` 分流，语义在 manifest 里显式声明、不隐藏：
+
+| kind | 交付方式 | 环境变量里的内容 |
+| --- | --- | --- |
+| `env` | 写入 `<application>.secrets.env` | 凭据值本身（**必须是单行**） |
+| `file` | 内容落地为 `/etc/opsd/apps/<application>.secrets/<name>`（`0600`，属主 `runUser`） | **该文件的路径** |
+
+- `kind: env` 的值若含换行，在服务启动时以 `SECRET_UNRESOLVED` 失败，错误信息指向具体的
+  manifest 字段。多行凭据（PEM 私钥、JSON 服务账号）必须声明为 `kind: file`。
+- `kind: file` 传路径而不是内容，是与 1a 执行器的一处**有意差异**：执行器跑短命令，内容进
+  环境变量没问题；长驻服务的凭据可能多行，只能走文件。manifest 里已经写了 `kind`，
+  作者在声明时就知道拿到的会是路径。
+
 ### systemd 版本兼容档（已承诺支持 ≥ 219）
 
 上面的模板是「新档」。已决定支持 systemd ≥ 219（CentOS 7 起），而模板里有多条指令在
@@ -177,7 +215,7 @@ WantedBy=multi-user.target
 | `ProtectSystem=strict` | 232 | **取值不被接受，unit 加载失败**；219 只能用 `yes`/`full` |
 | `ReadWritePaths=` | 231 | 旧档须退回 `ReadWriteDirectories=`，否则**指令被忽略**（与 `ProtectSystem=yes` 组合会导致应用写不了自己的工作目录） |
 | `StandardOutput=append:` | 240 | **取值不被接受**；旧档只能用 `file:`（每次启动截断）或 `journal` |
-| `LoadCredential=` | 247 | **指令未知**；见第 15 节的凭据收敛方式 |
+| `ProtectSystem=strict` 之外的加固指令 | — | 见上，`legacy` 档须整体降级 |
 
 因此适配器必须：
 
@@ -210,25 +248,22 @@ WantedBy=multi-user.target
 - **用户**：`useradd --system --no-create-home --home-dir <workingDirectory> --shell /usr/sbin/nologin <runUser>`。
   已存在时只校验，不改已有用户的属性。
 - **目录**：`workingDirectory`、`logs.directory`、解包目录全部 `0750`，属主为 `runUser:runUser`。
-- **环境文件**：`/etc/opsd/apps/<application>.env`，`0600`，只写 `exec.environment` 里的**非敏感**值。
-- **凭据文件**：`/etc/opsd/apps/<application>.credentials/<name>`，`0700` 目录、`0600` 文件，
-  属主为 `runUser`，内容是 `SecretRef` 解析出的值。**如何交给进程由 systemd 版本决定**：
-
-  - `strict` 档（≥ 247）：`LoadCredential=<name>:<path>`，进程内读 `$CREDENTIALS_DIRECTORY/<name>`；
-  - `legacy` 档（219～246）：没有 `LoadCredential=`，只能走 `EnvironmentFile=` 或
-    `Environment=`，此时凭据以**普通环境变量**出现在进程环境里。
-
-  这个分档意味着「同一份应用在不同主机上读凭据的方式不同」，因此第 15 节把
-  「是否统一走 `EnvironmentFile=`」列为进入实现前必须收敛的取舍。
+- **环境文件（非敏感）**：`/etc/opsd/apps/<application>.env`，`0600`，属主为 `runUser`，
+  只写 `exec.environment` 里的**非敏感**值。
+- **环境文件（敏感）**：`/etc/opsd/apps/<application>.secrets.env`，`0600`，属主为 `runUser`，
+  写 `kind: env` 的 `secretEnvironment` 项。它与非敏感文件分开，是因为两者的处理规则不同：
+  非敏感文件可以安全地展示与比对，敏感文件必须永不落日志、永不进审计、永不回显。
+- **凭据目录（`kind: file`）**：`/etc/opsd/apps/<application>.secrets/`，`0700`，属主为 `runUser`；
+  内部每个 secret 一个 `0600` 文件，内容为 `SecretRef` 解析出的值；环境变量里传**路径**（见第 6 节）。
 
 **已确认的设计取舍（2026-09-22）**：为了让托管在 systemd 下的进程拿到凭据，明文必须以某种
-形式到达进程，**已允许写到磁盘**。这里选择写入 `0600` 凭据文件而非写进 unit 的
+形式到达进程，**已允许写到磁盘**。选择写 `0600` 文件 + `EnvironmentFile=`，而不是写进 unit 的
 `Environment=`——unit 的权限更难管、更容易被 `systemctl show` 或日志带出。它不违反 1a 的
 「不落库、不进日志、不进审计」，但**确实把明文落到了磁盘**，因此：
 
-- 凭据目录必须 `0700`，文件 `0600`，属主为运行用户；
-- `opsd` 自身与日志、审计、错误信息中仍按值脱敏；
-- 必须在 Linux 容器中验证权限强制效果，并在第 15 节标注真实主机未验证。
+- 敏感环境文件与凭据文件必须 `0600`、凭据目录 `0700`，属主为运行用户；
+- `opsd` 自身与日志、审计、错误信息中仍按值脱敏；写文件与渲染 unit 的过程不得打印值；
+- 必须在 Linux 容器中验证权限强制效果，并在第 14 节标注真实主机未验证。
 
 ## 8. 持久化（migration `0004`）
 
@@ -301,6 +336,9 @@ opsctl env list
 
 退出码 `17`/`18`/`19`/`21` 与迭代 0、1a 已占用的 `1~14`、`20` 不冲突。
 
+`SECRET_UNRESOLVED`（1a 已有，400 / 9）在 1c 中新增一种触发场景：`kind: env` 的凭据解析出
+含换行的值，无法通过环境文件交付（见第 6 节）。不新增错误码。
+
 ## 11. 兼容性与迁移影响
 
 - migration `0004` 只 `CREATE TABLE`，不动既有表。
@@ -314,7 +352,13 @@ opsctl env list
 
 - manifest 严格解码与每条校验规则。
 - `ExecStart` 转义规则的边界用例（空参数、引号、反斜杠、中括号、等号）。
-- unit 模板渲染：字段齐全、`ReadWritePaths` 包含全部声明路径。
+- **环境文件值转义**：逐字节往返——含 `\`、`"`、字面 `\n`、制表符、`$`、单引号、首尾空格的值
+  必须原样还原。并有一个反向断言：不转义时 systemd 会改写的那些字节，恰好是被转义的那些。
+- **换行拒绝**：`kind: env` 的 secret 解析出含换行的值时，必须报 `SECRET_UNRESOLVED` 且
+  错误信息指向具体 manifest 字段；`kind: file` 的多行值必须能正常落盘。
+- unit 模板渲染：两个档位各渲染一次；`strict` 档字段齐全、`ReadWritePaths` 包含全部声明路径；
+  `legacy` 档**不含** `ProtectSystem=strict`、`ReadWritePaths=`、`StandardOutput=append:`，
+  且含 `ReadWriteDirectories=`。
 - 环境文件与凭据文件内容生成、按值脱敏不写入日志。
 - `mediaType` → 解包策略映射与 `MANIFEST_CONFLICT`。
 
@@ -325,12 +369,14 @@ opsctl env list
 
 ### Linux 容器（扩展 `make verify-linux`）
 
-- systemd 适配器 `Prepare` 后：用户存在、目录 `0750`、环境文件 `0600`、
-  凭据目录 `0700`/文件 `0600`、unit 文件 `0644`。
+- systemd 适配器 `Prepare` 后：用户存在、目录 `0750`、非敏感环境文件 `0600`、
+  敏感环境文件 `0600`、凭据目录 `0700`/文件 `0600`、unit 文件 `0644`。
 - `Start` → `Status=active` → `Health.Ready` → `Stop` → `Status=inactive`。
-- 凭据通过 `LoadCredential` 可被服务进程读到（用一个打印 `$CREDENTIALS_DIRECTORY` 内容
-  是否存在的探针 unit 验证，不打印内容本身）。
+- 凭据确实到达进程：用一个只打印「变量是否存在」与「长度是否为预期值」的探针 unit 验证，
+  **不打印值本身**；并验证含反斜杠与双引号的值被原样收到（这是转义正确性的端到端证据）。
+- `kind: file` 的凭据文件可被运行用户读到、且内容与源一致。
 - `ProtectSystem=strict` 下进程写入未声明路径必须失败。
+- **敏感环境文件缺失时 unit 必须启动失败**（对应 `EnvironmentFile` 不加 `-` 的设计）。
 
 ### 回归
 
@@ -341,13 +387,17 @@ opsctl env list
 1. manifest 非法在提交时即失败，错误码 `MANIFEST_INVALID`，且无任何副作用。
 2. `Prepare` 可重复执行，结果一致（幂等）。
 3. `Start` → `Health.Ready` → `Stop` → `Status=inactive` 全链路通过。
-4. 用户、目录、环境文件、凭据、unit 的文件与属组全部符合第 6、7 节，
+4. 用户、目录、两个环境文件、凭据、unit 的文件与属组全部符合第 6、7 节，
    证据类型为 **Linux 容器**。
 5. `ExecStart` 转义在边界用例下正确。
-6. 制品下载端点可用，且下载内容与记录的摘要一致。
-7. `runtime.*` 操作可在 `opsctl operation get/logs/cancel/retry` 中被查询与操作。
-8. `make ci` 与 `make verify-linux` 全绿。
-9. 迭代 0、1a 的回归用例全部继续通过。
+6. 环境文件的值转义逐字节往返正确：含 `\`、`"`、字面 `\n`、制表符、`$`、单引号、首尾空格的
+   凭据，服务进程收到的字节与源完全一致（**Linux 容器**端到端验证，不是只有单测）。
+7. `kind: env` 的多行凭据被拒绝且错误信息指向具体字段；`kind: file` 的多行凭据可正常交付。
+8. 两个 unit 档位各自渲染正确；`legacy` 档在拿到老版本主机验证之前标注**未验证**。
+9. 制品下载端点可用，且下载内容与记录的摘要一致。
+10. `runtime.*` 操作可在 `opsctl operation get/logs/cancel/retry` 中被查询与操作。
+11. `make ci` 与 `make verify-linux` 全绿。
+12. 迭代 0、1a、1b 的回归用例全部继续通过。
 
 ## 14. 未验证内容
 
@@ -357,9 +407,9 @@ opsctl env list
 - `tzdata` 缺失对时区解析的影响（与 1b 共用，容器镜像需显式安装并断言）。
 - **老发行版（systemd 219～246）上的实际行为**：已承诺支持 systemd ≥ 219，但现有
   `test/linux/` harness 用的是 Ubuntu 24.04（systemd 255），**证明不了 219 上的任何事**。
-  要给出该范围的证据，需要第二个 harness 镜像（CentOS 7，systemd 219；注意 CentOS 7
-  已于 2024-06 停止维护）、或一台 Linux 主机。在此之前，「支持 systemd ≥ 219」
-  必须标注为**未验证**，且 unit 模板的降级路径只有静态检查支撑。
+  容器路已验证走不通：CentOS 7 镜像只有 amd64 清单，且 systemd 219 需要 cgroup v1，
+  而当前 Docker Desktop 是 cgroup v2。**已确认由用户提供老版本主机验证**（安排见第 15 节）；
+  在拿到主机之前，`legacy` 档必须标注为**未验证**，其降级路径只有单元测试与静态检查支撑。
 - 远程主机、mTLS、批量（迭代 5）。
 
 ## 15. 未决事项（进入实现前必须冻结）
@@ -375,21 +425,34 @@ opsctl env list
 4. 制品解包的目标目录布局与权限（本文件只声明了 `stripComponents` 与目录，未定义目录结构）。
 5. `Host`/`Environment` 是否需要与应用建立关联（当前刻意不关联）。
 6. **目标 systemd 版本范围（已决定，2026-09-22）**：支持 **systemd ≥ 219**
-   （覆盖 CentOS 7 / Ubuntu 18.04 起的发行版）。这带来三项必须落实的兼容工作，见第 4 节。
+   （覆盖 CentOS 7 / Ubuntu 18.04 起的发行版）。这带来必须落实的兼容工作，见第 6 节。
 
-### 待确认：决定 1 与决定 6 之间存在冲突
+### 已收敛：决定 1 与决定 6 的冲突（2026-09-22）
 
-`LoadCredential=` 需要 **systemd ≥ 247**，而 219 不支持。因此「用 `LoadCredential=` 交付凭据」
-无法覆盖已承诺的版本范围，必须二选一收敛（**需要用户拍板**）：
+`LoadCredential=` 需要 **systemd ≥ 247**，与「支持 ≥ 219」不相容。**已决定采用收敛方式一：
+所有版本统一走 `EnvironmentFile=`，完全不使用 `LoadCredential=`。**
 
-- **收敛方式一：统一走 `EnvironmentFile=`**。所有发行版都用 `0600` 环境文件，
-  由 systemd 在启动时读入进程环境。一套路径、一个应用契约（应用只认环境变量）。
-  代价：放弃 `LoadCredential` 的额外隔离，凭据以环境变量形式出现在
-  `/proc/<pid>/environ`（仅同用户与 root 可读）。
-- **收敛方式二：双路径 + 应用自行兼容**。≥ 247 用 `LoadCredential=`（应用读
-  `$CREDENTIALS_DIRECTORY/<NAME>`），< 247 用 `EnvironmentFile=`（应用读 `$<NAME>`）。
-  代价：**同一份应用二进制在不同主机上的读取方式不同**，应用必须同时处理两种，
-  且这种差异只在老发行版上才暴露出来。
+- 一套 unit 模板（除加固指令档位外）、一个应用契约：应用只认环境变量。
+- 代价：凭据以环境变量形式出现，同用户与 root 可读 `/proc/<pid>/environ`。可接受——
+  root 本来就能读 `0600` 凭据文件，而绕过 opsd 直接读进程内存不在本工具的威胁模型内。
+- 收益：不必让应用契约随宿主机变化。方式二（≥ 247 走 `LoadCredential`、旧版走环境变量）
+  会把复杂度推到应用侧，且只在旧主机上暴露，是本迭代最难排查的一种故障。
+- 由此确定：凭据不必再分成「每个 secret 一个文件」，而是收敛为
+  `/etc/opsd/apps/<application>.secrets.env`（`0600`）与 `kind: file` 的落盘目录
+  `/etc/opsd/apps/<application>.secrets/`（`0700`）。见第 6 节与第 7 节。
 
-倾向收敛方式一：本迭代已经为了版本范围放弃了 `LoadCredential`，再让应用契约随宿主机变化，
-是把复杂度转移到了最难排查的地方（应用侧、且只在旧主机上出现）。
+### 老发行版的验证安排（2026-09-22）
+
+`legacy` 档（systemd 219～239）在当前环境无法验证，原因已查明且不可回避：
+
+- CentOS 7 的镜像**只有 amd64 清单**，Apple Silicon 上只能靠 qemu 模拟，容器内的 systemd 不稳；
+- 更关键的是 **systemd 219 需要 cgroup v1**（对 cgroup v2 统一层级的支持到 226 才开始、
+  233 才实用），而当前的 Docker Desktop 用的是 cgroup v2，systemd 219 起不来。
+
+**用户已确认可以提供老版本主机（CentOS 7 / Ubuntu 18.04，或 amd64 + cgroup v1 的 runner）
+用于验证。** 因此安排为：
+
+1. 1c 先实现两档 unit 模板，`legacy` 档的单元测试与静态检查必须齐全；
+2. `legacy` 档在拿到主机前，一律标注为**未验证**，不得声称「已支持」；
+3. 拿到主机后，用第 12 节列出的 Linux 容器断言清单在本机重跑，证据类型记作
+   **Linux 主机**（不是 Linux 容器），并单独记录 systemd 版本与发行版。
