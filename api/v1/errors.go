@@ -14,16 +14,35 @@ const (
 	CodeDaemonRestarted     ErrorCode = "DAEMON_RESTARTED"
 	CodePermissionDenied    ErrorCode = "PERMISSION_DENIED"
 	CodeInternal            ErrorCode = "INTERNAL"
+
+	CodeArtifactNotFound     ErrorCode = "ARTIFACT_NOT_FOUND"
+	CodeArtifactChecksum     ErrorCode = "ARTIFACT_CHECKSUM_MISMATCH"
+	CodeArtifactInUse        ErrorCode = "ARTIFACT_IN_USE"
+	CodeUploadTooLarge       ErrorCode = "UPLOAD_TOO_LARGE"
+	CodeStorageQuotaExceeded ErrorCode = "STORAGE_QUOTA_EXCEEDED"
+	CodeSecretUnresolved     ErrorCode = "SECRET_UNRESOLVED"
+	CodeApplicationNotFound  ErrorCode = "APPLICATION_NOT_FOUND"
+	CodeReleaseNotFound      ErrorCode = "RELEASE_NOT_FOUND"
+	CodeReleaseConflict      ErrorCode = "RELEASE_CONFLICT"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
-	CodeConfigInvalid:       400,
-	CodeInvalidRequest:      400,
-	CodeOperationNotFound:   404,
-	CodeIdempotencyConflict: 409,
-	CodeLockBusy:            409,
-	CodePermissionDenied:    403,
-	CodeInternal:            500,
+	CodeConfigInvalid:        400,
+	CodeInvalidRequest:       400,
+	CodeOperationNotFound:    404,
+	CodeIdempotencyConflict:  409,
+	CodeLockBusy:             409,
+	CodePermissionDenied:     403,
+	CodeInternal:             500,
+	CodeArtifactNotFound:     404,
+	CodeArtifactChecksum:     409,
+	CodeArtifactInUse:        409,
+	CodeUploadTooLarge:       413,
+	CodeStorageQuotaExceeded: 507,
+	CodeSecretUnresolved:     400,
+	CodeApplicationNotFound:  404,
+	CodeReleaseNotFound:      404,
+	CodeReleaseConflict:      409,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -37,17 +56,26 @@ func HTTPStatus(code ErrorCode) int {
 }
 
 var exitCodeByCode = map[ErrorCode]int{
-	CodeInternal:            1,
-	CodeConfigInvalid:       2,
-	CodeInvalidRequest:      2,
-	CodeOperationNotFound:   2,
-	CodeIdempotencyConflict: 3,
-	CodeLockBusy:            4,
-	CodeExecTimeout:         10,
-	CodeExecCancelled:       11,
-	CodeExecExitNonZero:     12,
-	CodeDaemonRestarted:     13,
-	CodePermissionDenied:    20,
+	CodeInternal:             1,
+	CodeConfigInvalid:        2,
+	CodeInvalidRequest:       2,
+	CodeOperationNotFound:    2,
+	CodeIdempotencyConflict:  3,
+	CodeLockBusy:             4,
+	CodeExecTimeout:          10,
+	CodeExecCancelled:        11,
+	CodeExecExitNonZero:      12,
+	CodeDaemonRestarted:      13,
+	CodePermissionDenied:     20,
+	CodeArtifactNotFound:     2,
+	CodeArtifactChecksum:     5,
+	CodeArtifactInUse:        6,
+	CodeUploadTooLarge:       7,
+	CodeStorageQuotaExceeded: 8,
+	CodeSecretUnresolved:     9,
+	CodeApplicationNotFound:  2,
+	CodeReleaseNotFound:      2,
+	CodeReleaseConflict:      14,
 }
 
 func ExitCode(code ErrorCode) int {

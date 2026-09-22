@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	v1 "frz-tools/api/v1"
 	"frz-tools/internal/domain"
 	"frz-tools/internal/idgen"
+	"frz-tools/migrations"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -66,12 +68,18 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
+
+	want, err := fs.Glob(migrations.FS, "*.sql")
+	if err != nil {
+		t.Fatalf("glob migrations: %v", err)
+	}
+
 	var applied int
 	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if applied != 1 {
-		t.Fatalf("want 1 applied migration, got %d", applied)
+	if applied != len(want) {
+		t.Fatalf("want %d applied migrations, got %d", len(want), applied)
 	}
 }
 
