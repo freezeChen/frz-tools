@@ -20,10 +20,28 @@ execution:
   allowedPaths:
     - /usr/bin
     - /usr/local/bin
+  # 按 key 脱敏的环境变量；SecretRef 解析出的值还会额外按值脱敏。
   sensitiveEnvKeys:
     - TOKEN
     - PASSWORD
     - SECRET
 
+# 制品存储。root 不配置即禁用制品相关端点（返回 CONFIG_INVALID 而非启动失败），
+# 因此迭代 0 的既有部署升级后不必立刻补上这一段。
+artifactStore:
+  root: /var/lib/opsd/artifacts
+  # blob 文件与目录模式，由 opsd 在真实文件系统上强制。
+  fileMode: "0640"
+  dirMode: "0750"
+  maxUploadBytes: 2147483648
+  quotaBytes: 21474836480
+
+# 允许 file 类凭据引用的目录。只有解析符号链接后落在这些目录内、
+# 且不对属组或其他用户开放的文件才会被读取。
+secrets:
+  allowedFileDirectories:
+    - /etc/opsd/secrets
+
+# sudo 白名单：模型已冻结，1a 不使用，实际行为由 1c 的 Linux 适配实现。
 sudo:
   allowedCommands: []

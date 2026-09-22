@@ -298,6 +298,9 @@ JSON」的约定。
 | `RELEASE_NOT_FOUND` | 404 | 2 | 发布记录不存在 |
 | `RELEASE_CONFLICT` | 409 | 14 | 同一应用下版本号重复 |
 
+重名 `Application` 不新增 `APPLICATION_CONFLICT`，而是复用 `INVALID_REQUEST`（400 / 退出码 2），
+理由见第 14 节。
+
 ## 9. 兼容性与迁移影响
 
 - **API**：只新增端点和字段，迭代 0 的现有请求与响应形状不变。回归测试必须覆盖迭代 0 的
@@ -385,3 +388,82 @@ Linux 权限语义。这些条目必须通过 `make verify-linux` 在 Linux 容�
 - **Linux 容器验证 harness 的搭建时机**：已完成，位于 `test/linux/`（`make verify-linux`），
   先用迭代 0 的代码验证通过（22 项断言全绿），并已接入 CI 独立 job。1a 的制品存储与
   `SecretRef` 权限断言直接复用它。
+
+## 14. 实现记录 2026-09-22
+
+### 已实现范围
+
+第 2 节列出的 1a 范围全部落地：`Artifact`、`Application`、`Release`、`SecretRef` 的模型与持久化，
+`StorageBackend` 端口与内容寻址的本地实现，配置版本化与迁移链，按值脱敏，以及对应的 API 端点、
+CLI 子命令、migration `0002` 与测试。
+
+### 对本文档的补充与偏离
+
+1. **新增错误码映射**：重名 `Application` 返回 `INVALID_REQUEST`（HTTP 400 / CLI 退出码 2），
+   而不是再加一个 `APPLICATION_CONFLICT`。理由是这是「输入重复」而非资源冲突，且退出码 2 与
+   其它 `INVALID_REQUEST` 场景一致。第 8 节的错误码表据此补一行即可。
+2. **`--secret-env` 旗标**：第 7.2 节没有列它，但 SecretRef 若只能通过裸 HTTP 触达，就无法
+   端到端验证，因此在 `opsctl operation submit` 上补了 `--secret-env VAR=kind:name`。
+3. **制品下载端点推迟到 1c**：第 7.1 节没有列出下载端点，`StorageBackend.Open` 当前只被
+   `verify` 使用。1c 需要按 manifest 取制品时再补 `GET /api/v1/artifacts/{id}/content`，
+   届时应更新本文档。
+4. **制品端点行为一致化**：未配置 `artifactStore.root` 时，`Get`/`List`/`Delete` 与
+   `Put`/`Verify` 一样返回 `CONFIG_INVALID`，而不是走到一半才失败。
+5. **Runtime 构造改为 Options 结构体**：参数数量已经增长到 10 个，继续用位置参数会让调用点
+   无法分辨，因此改为 `application.Options`。
+6. **`file` 类凭据的权限规则**：从「必须是 `0600`」放宽为「不得对属组或其他用户开放
+   （即 `0600` 或更严格，如 `0400`）」，并写入 `resolver.go`。这条比原设计更安全也更实用。
+
+### 实现过程中被测试暴露的两个缺陷
+
+- **上传上限差一**：`limitingReader` 在恰好等于上限时返回错误，合法的等长上传被拒。改为读满后
+  再探一个字节，区分「刚好达到」与「超限」。
+- **凭据文件必须以 `frz-ops` 创建**：harness 中以 root 创建 `0600` 文件会让 opsd 读不到，
+  导致「0600 通过」与「0644 被拒」两个断言以同一个错误原因同时失败。已改为 `runuser` 创建，
+  并补了属主断言，避免这类假阳性。
+
+## 15. 验证记录 2026-09-22
+
+- 执行者：Command Code agent
+- 变更范围：迭代 1a 全部交付内容
+- 环境：macOS (darwin/arm64)，Go 1.27.1；Linux 容器证据来自 Docker 29.4 / OrbStack
+- 规模：9 个测试包，176 个顶层用例 + 48 个子用例；Linux 容器 harness 34 项断言
+
+### 命令与结果
+
+| 命令 | 结果 | 证据类型 |
+| --- | --- | --- |
+| `make fmt` | PASS | 静态 |
+| `go vet ./...` | PASS | 静态 |
+| `go test ./... -count=1` | PASS（9 个包） | 单元 + 集成 + e2e |
+| `go test -race ./...` | PASS | 单元 + 集成 + e2e |
+| `make cross`（linux/amd64、linux/arm64） | PASS | 交叉编译 |
+| `make verify-linux` | PASS（34 项断言） | **Linux 容器** |
+| `opsctl config validate --file opsd.example.yaml` | PASS | 真实进程 |
+
+### 逐条验收标准的证据
+
+| # | 验收标准 | 证据 |
+| --- | --- | --- |
+| 1 | 上传原子落盘，中断不留半成品 | 合约套件「读取失败的中途中断不留下内容」+ `CleanupTemp` 单测（单元）；blob `0640`/目录 `0750` 落盘（**Linux 容器**） |
+| 2 | 摘要不一致拒绝且不落库 | 合约套件、`ArtifactService.Put`、httpapi 409、e2e 退出码 5（单元 + 集成 + e2e） |
+| 3 | 相同内容复用同一条记录 | `ArtifactService`、httpapi 201→200、e2e 复用断言（单元 + 集成 + e2e） |
+| 4 | 路径穿越防护通过恶意输入测试 | `TestLocalRejectsTraversalInDigest` 4 种恶意摘要 + 合约套件非法摘要（单元） |
+| 5 | `name` 不参与路径构造 | `StorageBackend` 只接受 `digest`（结构性保证）+ 合约套件（单元） |
+| 6 | GC 只清未引用的，`--dry-run` 不删 | `TestArtifactCollectRespectsRetentionAndDryRun`、`TestArtifactCollectRemovesOrphanContent`、e2e 预演断言（单元 + e2e） |
+| 7 | `SecretRef` 值不落库/不进日志/不进审计 | `TestSecretValuesAreRedactedByValue`（单元）、`TestSecretFileIsInjectedAndRedacted`（e2e）；文件权限部分见 **Linux 容器** |
+| 8 | 配置迁移链可用，未知字段仍被拒绝 | `TestMigrationChainIsApplied`、`TestMigrationThatDoesNotAdvanceVersionIsRejected`、`TestUnknownFieldIsStillRejectedAfterMigration`（单元）；缺省配置下迭代 0 行为不变由迭代 0 回归测试保证（单元 + e2e） |
+| 9 | 合约套件在本地实现上全绿 | `TestLocalSatisfiesStorageContract` 10 项子断言（单元） |
+| 10 | `make ci` 全绿 | 见上表（静态 + 构建 + 单元） |
+
+### Linux 容器证据（34 项，覆盖 macOS 无法证明的部分）
+
+- 制品：blob 文件模式 `0640`、属主 `frz-ops`、根/`blobs`/`tmp` 目录 `0750`、上传后 `verify` 通过
+- 凭据：目录 `0700`、文件 `0600`、属主断言；`0600` 可解析并注入命令环境；`0644` 被拒
+- 迭代 0 项：配置 `0600`、socket `0660` 属组访问控制、SQLite WAL `0600`、执行器真实执行
+- systemd：PID 1、unit 写入/`daemon-reload`/`start`/`enable`/`is-active`
+
+### 仍未验证
+
+见第 12 节。额外说明：制品下载端点与 S3/MinIO 后端尚未实现；真实 Linux 主机上的 umask 与
+挂载选项差异、reboot 后的 unit 持久化、SELinux/AppArmor 仍需真实主机验证。
