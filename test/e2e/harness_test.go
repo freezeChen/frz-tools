@@ -46,13 +46,15 @@ func TestMain(m *testing.M) {
 }
 
 type daemon struct {
-	cmd        *exec.Cmd
-	dir        string
-	socket     string
-	database   string
-	workDir    string
-	logDir     string
-	configPath string
+	cmd          *exec.Cmd
+	dir          string
+	socket       string
+	database     string
+	workDir      string
+	logDir       string
+	artifactsDir string
+	secretsDir   string
+	configPath   string
 }
 
 // shortTempDir 返回路径足够短的临时目录，以满足 unix socket 的路径长度限制
@@ -78,12 +80,17 @@ func newDaemon(t *testing.T) *daemon {
 	t.Helper()
 	dir := shortTempDir(t)
 	d := &daemon{
-		dir:        dir,
-		socket:     filepath.Join(dir, "opsd.sock"),
-		database:   filepath.Join(dir, "opsd.db"),
-		workDir:    filepath.Join(dir, "work"),
-		logDir:     filepath.Join(dir, "log"),
-		configPath: filepath.Join(dir, "opsd.yaml"),
+		dir:          dir,
+		socket:       filepath.Join(dir, "opsd.sock"),
+		database:     filepath.Join(dir, "opsd.db"),
+		workDir:      filepath.Join(dir, "work"),
+		logDir:       filepath.Join(dir, "log"),
+		artifactsDir: filepath.Join(dir, "artifacts"),
+		secretsDir:   filepath.Join(dir, "secrets"),
+		configPath:   filepath.Join(dir, "opsd.yaml"),
+	}
+	if err := os.MkdirAll(d.secretsDir, 0o700); err != nil {
+		t.Fatalf("create secrets dir: %v", err)
 	}
 	cfg := fmt.Sprintf(`apiVersion: ops.frz.io/v1alpha1
 kind: OpsdConfig
@@ -105,9 +112,18 @@ execution:
     - /usr/local/bin
   sensitiveEnvKeys:
     - TOKEN
+artifactStore:
+  root: %s
+  fileMode: "0640"
+  dirMode: "0750"
+  maxUploadBytes: 1048576
+  quotaBytes: 16777216
+secrets:
+  allowedFileDirectories:
+    - %s
 sudo:
   allowedCommands: []
-`, d.socket, d.database, d.workDir, d.logDir)
+`, d.socket, d.database, d.workDir, d.logDir, d.artifactsDir, d.secretsDir)
 
 	if err := os.WriteFile(d.configPath, []byte(cfg), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)

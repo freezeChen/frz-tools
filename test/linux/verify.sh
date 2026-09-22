@@ -147,6 +147,7 @@ provision() {
   in_container useradd --system frz-other
   in_container install -d -m 0750 -o frz-ops -g frz-ops /etc/opsd /var/lib/opsd /var/log/opsd
   in_container install -d -m 0755 -o frz-ops -g frz-ops /run/opsd
+  in_container install -d -m 0700 -o frz-ops -g frz-ops /etc/opsd/secrets
   in_container install -m 0600 -o frz-ops -g frz-ops /opt/frz-ops/opsd.verify.yaml /etc/opsd/config.yaml
 }
 
@@ -236,6 +237,83 @@ check_executor() {
   fi
 }
 
+# 制品存储与凭据文件的权限语义是 macOS 无法证明的，必须在真实 Linux 内核上断言。
+check_artifacts_and_secrets() {
+  log "制品存储的文件模式（Linux 容器证据）"
+
+  in_container sh -c 'printf artifact-payload > /opt/frz-ops/payload.bin'
+
+  local uploaded artifact_id
+  uploaded=$(q runuser -u frz-ops -- /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock \
+    artifact put /opt/frz-ops/payload.bin --json)
+  artifact_id=$(printf '%s' "${uploaded}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+
+  if [ -z "${artifact_id}" ]; then
+    fail "制品上传失败：${uploaded}"
+    return 0
+  fi
+  pass "制品上传成功（${artifact_id}）"
+
+  require_ok "制品落盘后校验通过" in_container runuser -u frz-ops -- \
+    /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock artifact verify "${artifact_id}"
+
+  local blob_path
+  blob_path=$(q sh -c 'find /var/lib/opsd/artifacts/blobs -type f | head -1')
+  if [ -z "${blob_path}" ]; then
+    fail "未找到落盘的 blob"
+    return 0
+  fi
+  assert_eq "blob 文件模式" "640" "$(q stat -c '%a' "${blob_path}")"
+  assert_eq "blob 属主" "frz-ops" "$(q stat -c '%U' "${blob_path}")"
+  assert_eq "artifacts 根目录模式" "750" "$(q stat -c '%a' /var/lib/opsd/artifacts)"
+  assert_eq "blobs 目录模式" "750" "$(q stat -c '%a' /var/lib/opsd/artifacts/blobs)"
+  assert_eq "tmp 目录模式" "750" "$(q stat -c '%a' /var/lib/opsd/artifacts/tmp)"
+
+  log "SecretRef 文件权限语义（Linux 容器证据）"
+
+  # 必须以 frz-ops 身份创建：以 root 创建会让 0600 文件对 opsd 不可读，
+  # 从而让「0600 通过 / 0644 被拒」两个断言以同一个错误原因同时失败。
+  in_container runuser -u frz-ops -- sh -c 'printf strict-secret > /etc/opsd/secrets/strict'
+  in_container chmod 0600 /etc/opsd/secrets/strict
+  assert_eq "凭据目录模式" "700" "$(q stat -c '%a' /etc/opsd/secrets)"
+  assert_eq "凭据文件模式" "600" "$(q stat -c '%a' /etc/opsd/secrets/strict)"
+  assert_eq "凭据文件属主" "frz-ops" "$(q stat -c '%U' /etc/opsd/secrets/strict)"
+
+  local submit_out op_id
+  submit_out=$(q runuser -u frz-ops -- /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock operation submit \
+    --kind executor.command --resource verify-secret-strict \
+    --secret-env "FRZ_OK=file:/etc/opsd/secrets/strict" \
+    --json -- /bin/sh -c 'test -n "$FRZ_OK"')
+  op_id=$(printf '%s' "${submit_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+
+  if [ -n "${op_id}" ] && wait_for_status "${op_id}" "succeeded"; then
+    pass "0600 凭据文件可解析并注入命令环境"
+  else
+    fail "0600 凭据文件解析失败：${submit_out}"
+  fi
+
+  # 放开属组/其他用户之后必须被拒绝，否则权限校验形同虚设。
+  in_container chmod 0644 /etc/opsd/secrets/strict
+  submit_out=$(q runuser -u frz-ops -- /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock operation submit \
+    --kind executor.command --resource verify-secret-loose \
+    --secret-env "FRZ_LOOSE=file:/etc/opsd/secrets/strict" \
+    --json -- /usr/bin/true)
+  op_id=$(printf '%s' "${submit_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+
+  if [ -n "${op_id}" ] && wait_for_status "${op_id}" "failed"; then
+    local failure_code
+    failure_code=$(q runuser -u frz-ops -- /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock \
+      operation get "${op_id}" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p')
+    if [ "${failure_code}" = "SECRET_UNRESOLVED" ]; then
+      pass "0644 凭据文件被拒绝"
+    else
+      fail "0644 凭据文件的失败码：${failure_code:-<空>}"
+    fi
+  else
+    fail "0644 凭据文件未被拒绝：${submit_out}"
+  fi
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -258,6 +336,7 @@ main() {
   check_filesystem
   check_socket_acl
   check_executor
+  check_artifacts_and_secrets
   check_systemd
 
   log "结果"

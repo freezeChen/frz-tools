@@ -23,5 +23,16 @@ execution:
   sensitiveEnvKeys:
     - TOKEN
 
+artifactStore:
+  root: /var/lib/opsd/artifacts
+  fileMode: "0640"
+  dirMode: "0750"
+  maxUploadBytes: 1048576
+  quotaBytes: 16777216
+
+secrets:
+  allowedFileDirectories:
+    - /etc/opsd/secrets
+
 sudo:
   allowedCommands: []

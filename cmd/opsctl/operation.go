@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	v1 "frz-tools/api/v1"
@@ -32,6 +33,7 @@ func newSubmitCommand(opts *rootOptions) *cobra.Command {
 		resource string
 		idemKey  string
 		dryRun   bool
+		secrets  []string
 	)
 
 	cmd := &cobra.Command{
@@ -46,7 +48,15 @@ func newSubmitCommand(opts *rootOptions) *cobra.Command {
 				return domain.NewError(v1.CodeInvalidRequest, "argv after -- must not be empty")
 			}
 
-			spec, err := json.Marshal(v1.ExecutorCommandSpec{Argv: args})
+			secretEnvironment, err := parseSecretRefs(secrets)
+			if err != nil {
+				return err
+			}
+
+			spec, err := json.Marshal(v1.ExecutorCommandSpec{
+				Argv:              args,
+				SecretEnvironment: secretEnvironment,
+			})
 			if err != nil {
 				return err
 			}
@@ -76,9 +86,33 @@ func newSubmitCommand(opts *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&resource, "resource", "", "resource to lock for the duration of the operation (required)")
 	cmd.Flags().StringVar(&idemKey, "idempotency-key", "", "idempotency key; repeating it with the same request reuses the operation")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "validate and record the plan without executing anything")
+	cmd.Flags().StringArrayVar(&secrets, "secret-env", nil,
+		"把凭据注入命令环境，格式 VAR=kind:name（kind 为 env 或 file）；明文不会进入请求体或日志")
 	_ = cmd.MarkFlagRequired("resource")
 
 	return cmd
+}
+
+// parseSecretRefs 解析 VAR=kind:name 形式的旗标：从左到右先按 = 切出环境变量名，
+// 再按 : 切出 kind 和 name，因此 file 类凭据的路径里可以继续出现 = 但不能出现 :。
+func parseSecretRefs(raw []string) (map[string]v1.SecretRef, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	refs := make(map[string]v1.SecretRef, len(raw))
+	for _, item := range raw {
+		varName, ref, found := strings.Cut(item, "=")
+		if !found || strings.TrimSpace(varName) == "" {
+			return nil, domain.NewError(v1.CodeInvalidRequest, "--secret-env %q 必须是 VAR=kind:name 形式", item)
+		}
+		kind, name, found := strings.Cut(ref, ":")
+		if !found || strings.TrimSpace(name) == "" {
+			return nil, domain.NewError(v1.CodeInvalidRequest, "--secret-env %q 的 kind 与 name 用冒号分隔", item)
+		}
+		refs[varName] = v1.SecretRef{Kind: kind, Name: name}
+	}
+	return refs, nil
 }
 
 func newGetCommand(opts *rootOptions) *cobra.Command {
