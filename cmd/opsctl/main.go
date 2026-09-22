@@ -48,6 +48,7 @@ func newRootCommand() *cobra.Command {
 		newArtifactCommand(opts),
 		newAppCommand(opts),
 		newReleaseCommand(opts),
+		newScheduleCommand(opts),
 		newConfigCommand(opts),
 	)
 	localizeBuiltinCommands(root)

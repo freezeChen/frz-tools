@@ -314,6 +314,47 @@ check_artifacts_and_secrets() {
   fi
 }
 
+# 时区数据是精简镜像最容易缺失的一环：Go 的 time.LoadLocation 依赖 tzdata，
+# 缺了它所有带时区的计划都会创建失败，而 macOS 上永远测不出这个问题。
+check_schedules() {
+  log "调度器与时区（Linux 容器证据）"
+
+  # 注意：整条命令必须经由 q 进容器执行。写成 $(test -f ...) 会在本机跑，
+  # macOS 上有 zoneinfo，断言就会假通过而完全没检查容器。
+  assert_eq "tzdata 已安装" "yes" \
+    "$(q sh -c 'test -f /usr/share/zoneinfo/Asia/Shanghai && echo yes || echo no')"
+
+  local created next_run
+  created=$(q runuser -u frz-ops -- /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock schedule create \
+    --name tz-check --resource tz-check --cron "0 2 * * *" --timezone Asia/Shanghai \
+    --json -- /usr/bin/true)
+  next_run=$(printf '%s' "${created}" | sed -n 's/.*"nextRunAt": *"\([^"]*\)".*/\1/p')
+
+  if [ -z "${next_run}" ]; then
+    fail "容器内创建带时区的计划失败：${created}"
+    return 0
+  fi
+  pass "容器内可解析 Asia/Shanghai"
+
+  # cron 按计划时区解释：返回的是同一时刻的 UTC 表示，所以要换算到计划时区再断言，
+  # 只看字符串偏移会误判（robfig 会把结果换算回调用方时区再返回）。
+  local shanghai_hour utc_hour
+  shanghai_hour=$(q sh -c "TZ=Asia/Shanghai date -d '${next_run}' +%H:%M 2>/dev/null")
+  utc_hour=$(q sh -c "TZ=UTC date -d '${next_run}' +%H:%M 2>/dev/null")
+
+  assert_eq "按计划时区解释的触发时刻" "02:00" "${shanghai_hour}"
+  if [ "${utc_hour}" = "02:00" ]; then
+    fail "时区未生效：UTC 与 Asia/Shanghai 都是 02:00"
+  else
+    pass "时区确实改变了解释结果（同一时刻 UTC 为 ${utc_hour}）"
+  fi
+
+  require_ok "停用计划" in_container runuser -u frz-ops -- \
+    /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock schedule disable tz-check
+  require_ok "删除计划" in_container runuser -u frz-ops -- \
+    /opt/frz-ops/opsctl --socket /run/opsd/opsd.sock schedule delete tz-check
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -337,6 +378,7 @@ main() {
   check_socket_acl
   check_executor
   check_artifacts_and_secrets
+  check_schedules
   check_systemd
 
   log "结果"

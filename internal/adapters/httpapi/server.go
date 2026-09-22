@@ -72,6 +72,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/releases", s.handleCreateRelease)
 	mux.HandleFunc("GET /api/v1/releases/{id}", s.handleGetRelease)
 
+	mux.HandleFunc("POST /api/v1/schedules", s.handleCreateSchedule)
+	mux.HandleFunc("GET /api/v1/schedules", s.handleListSchedules)
+	mux.HandleFunc("GET /api/v1/schedules/{id}", s.handleGetSchedule)
+	mux.HandleFunc("DELETE /api/v1/schedules/{id}", s.handleDeleteSchedule)
+	mux.HandleFunc("POST /api/v1/schedules/{id}/enable", s.handleEnableSchedule)
+	mux.HandleFunc("POST /api/v1/schedules/{id}/disable", s.handleDisableSchedule)
+	mux.HandleFunc("GET /api/v1/schedules/{id}/runs", s.handleScheduleRuns)
+
 	mux.HandleFunc("/", s.handleNotFound)
 
 	logger := s.logger()

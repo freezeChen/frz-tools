@@ -7,6 +7,7 @@ RUN apt-get update \
       procps \
       iproute2 \
       ca-certificates \
+      tzdata \
  && rm -rf /var/lib/apt/lists/*
 
 CMD ["/lib/systemd/systemd"]
