@@ -71,7 +71,26 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 ## 验证约定
 
 - 每个迭代的验收标准必须给出「命令 / 结果 / 证据类型」。
-- 必须区分证据类型：静态检查、单元测试、集成测试、Linux 主机、真实服务。
+- 证据类型必须显式区分：静态检查、单元测试、集成测试、**Linux 容器**、Linux 主机、真实服务。
+- 「Linux 容器」与「Linux 主机」是两类不同证据，不得混用。容器只验证内核级语义（文件模式、
+  Unix Socket ACL、用户/属组、`runuser` 行为）；真实 reboot 后的 unit 持久化、SELinux/AppArmor、
+  sudoers/PAM 实际策略、真实主机安装规范仍需 Linux 主机验证。
 - 源码检查不能替代真实 Linux 主机、systemd、Nginx、数据库实例的验证；未验证内容要显式
   标注为「未验证」。
 - 若修改 API、状态机、数据表或错误码，先更新对应迭代文档并记录兼容性影响。
+
+### Linux 容器验证的固定配方
+
+systemd 在容器内必须用 `--cgroupns=host`；用 `private` 时 systemd 无法作为 PID 1 启动。
+
+```bash
+# 镜像：FROM ubuntu:24.04，加装 systemd systemd-sysv procps iproute2
+# （jrei/systemd-ubuntu 只有 amd64 清单，Apple Silicon 不可用）
+docker run -d --privileged --cgroupns=host \
+  --tmpfs /run --tmpfs /tmp \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+  frz-systemd-probe:24.04
+```
+
+**不得把 macOS 目录 bind mount 进容器做权限测试**：virtiofs 不保真文件属主与模式，结果不可信。
+二进制应通过容器内构建或 `docker cp` 进入，测试状态留在容器文件系统内。
