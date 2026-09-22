@@ -24,6 +24,10 @@ const (
 	CodeApplicationNotFound  ErrorCode = "APPLICATION_NOT_FOUND"
 	CodeReleaseNotFound      ErrorCode = "RELEASE_NOT_FOUND"
 	CodeReleaseConflict      ErrorCode = "RELEASE_CONFLICT"
+
+	CodeScheduleNotFound ErrorCode = "SCHEDULE_NOT_FOUND"
+	CodeScheduleEnabled  ErrorCode = "SCHEDULE_ENABLED"
+	CodeScheduleInvalid  ErrorCode = "SCHEDULE_INVALID"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -43,6 +47,9 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeApplicationNotFound:  404,
 	CodeReleaseNotFound:      404,
 	CodeReleaseConflict:      409,
+	CodeScheduleNotFound:     404,
+	CodeScheduleEnabled:      409,
+	CodeScheduleInvalid:      400,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -76,6 +83,9 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeApplicationNotFound:  2,
 	CodeReleaseNotFound:      2,
 	CodeReleaseConflict:      14,
+	CodeScheduleNotFound:     2,
+	CodeScheduleEnabled:      15,
+	CodeScheduleInvalid:      16,
 }
 
 func ExitCode(code ErrorCode) int {

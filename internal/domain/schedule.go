@@ -1,0 +1,214 @@
+package domain
+
+import (
+	"encoding/json"
+	"strings"
+	"time"
+
+	v1 "frz-tools/api/v1"
+
+	"github.com/robfig/cron/v3"
+)
+
+type ScheduleKind string
+
+const (
+	ScheduleKindCron     ScheduleKind = "cron"
+	ScheduleKindInterval ScheduleKind = "interval"
+)
+
+// MissedRunPolicy 决定 opsd 停机期间错过的触发时刻如何补偿。
+// skip 全部记为 missed；runOnce 只补跑最近一次；runAll 按时间顺序全部补跑。
+type MissedRunPolicy string
+
+const (
+	MissedRunSkip MissedRunPolicy = "skip"
+	MissedRunOnce MissedRunPolicy = "runOnce"
+	MissedRunAll  MissedRunPolicy = "runAll"
+)
+
+func (p MissedRunPolicy) Valid() bool {
+	switch p {
+	case MissedRunSkip, MissedRunOnce, MissedRunAll:
+		return true
+	}
+	return false
+}
+
+type ScheduleRunResult string
+
+const (
+	RunDispatched ScheduleRunResult = "dispatched"
+	RunSkipped    ScheduleRunResult = "skipped"
+	RunMissed     ScheduleRunResult = "missed"
+	RunFailed     ScheduleRunResult = "failed"
+)
+
+// MinInterval 是 interval 类计划的下限：低于这个粒度更适合用 systemd timer
+// 或外部监控，而不是在 opsd 里常驻高频唤醒。
+const MinInterval = time.Minute
+
+// maxScheduledMoments 限制一次补偿里枚举的时刻数量。定时任务停机很久之后，
+// 每分钟的计划会积累出几万个时刻；这里将其截断，避免一次恢复把数据库写爆。
+const maxScheduledMoments = 1000
+
+type Schedule struct {
+	ID              string
+	Name            string
+	Enabled         bool
+	Kind            ScheduleKind
+	Cron            string
+	Interval        time.Duration
+	Timezone        string
+	Resource        string
+	Spec            json.RawMessage
+	MissedRunPolicy MissedRunPolicy
+	NextRunAt       *time.Time
+	LastRunAt       *time.Time
+	LastResult      string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	CreatedBy       string
+}
+
+func (s *Schedule) Validate() error {
+	if strings.TrimSpace(s.Name) == "" {
+		return NewError(v1.CodeScheduleInvalid, "计划名称不能为空")
+	}
+	if strings.TrimSpace(s.Resource) == "" {
+		return NewError(v1.CodeScheduleInvalid, "计划必须指定 resource")
+	}
+	if len(s.Spec) == 0 {
+		return NewError(v1.CodeScheduleInvalid, "计划必须带 spec")
+	}
+	if !s.MissedRunPolicy.Valid() {
+		return NewError(v1.CodeScheduleInvalid, "missedRunPolicy 取值非法: %q", s.MissedRunPolicy)
+	}
+	if _, err := s.Location(); err != nil {
+		return err
+	}
+
+	switch s.Kind {
+	case ScheduleKindCron:
+		if strings.TrimSpace(s.Cron) == "" {
+			return NewError(v1.CodeScheduleInvalid, "cron 类计划必须提供 cron 表达式")
+		}
+		if s.Interval != 0 {
+			return NewError(v1.CodeScheduleInvalid, "cron 类计划不能同时提供 interval")
+		}
+		if _, err := parseCronSpec(s.Cron); err != nil {
+			return err
+		}
+	case ScheduleKindInterval:
+		if s.Interval <= 0 {
+			return NewError(v1.CodeScheduleInvalid, "interval 类计划必须提供正整数间隔")
+		}
+		if s.Interval < MinInterval {
+			return NewError(v1.CodeScheduleInvalid, "间隔不能小于 %s", MinInterval)
+		}
+		if s.Cron != "" {
+			return NewError(v1.CodeScheduleInvalid, "interval 类计划不能同时提供 cron 表达式")
+		}
+	default:
+		return NewError(v1.CodeScheduleInvalid, "计划类型取值非法: %q", s.Kind)
+	}
+	return nil
+}
+
+// Location 解析计划使用的时区；未配置时按 UTC 处理。
+func (s *Schedule) Location() (*time.Location, error) {
+	if strings.TrimSpace(s.Timezone) == "" {
+		return time.UTC, nil
+	}
+	location, err := time.LoadLocation(s.Timezone)
+	if err != nil {
+		return nil, NewError(v1.CodeScheduleInvalid, "无法解析时区 %q: %v", s.Timezone, err)
+	}
+	return location, nil
+}
+
+// Evaluator 计算计划的下一次触发时刻。只提供 Next，因为错过时刻的枚举可以
+// 从已知的上次触发时刻不断向前推，不需要 Previous。
+type Evaluator interface {
+	// Next 返回严格晚于 after 的下一个计划时刻。
+	Next(after time.Time) time.Time
+}
+
+// NewEvaluator 按计划类型构造触发器。
+func NewEvaluator(s *Schedule) (Evaluator, error) {
+	if err := s.Validate(); err != nil {
+		return nil, err
+	}
+	location, err := s.Location()
+	if err != nil {
+		return nil, err
+	}
+
+	switch s.Kind {
+	case ScheduleKindCron:
+		spec, err := parseCronSpec(s.Cron)
+		if err != nil {
+			return nil, err
+		}
+		// Location 决定 cron 表达式按哪个时区解释，因此夏令时切换前后
+		// 的触发时刻由它负责，而不是靠调用方换算。
+		spec.Location = location
+		return &cronEvaluator{spec: spec}, nil
+	case ScheduleKindInterval:
+		return &intervalEvaluator{interval: s.Interval}, nil
+	}
+	return nil, NewError(v1.CodeScheduleInvalid, "计划类型取值非法: %q", s.Kind)
+}
+
+// parseCronSpec 只接受标准 5 字段表达式：分 时 日 月 周。
+// 不接受秒字段与 @every 之外的别名，避免同一份配置在不同实现下语义漂移。
+func parseCronSpec(expr string) (*cron.SpecSchedule, error) {
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := parser.Parse(strings.TrimSpace(expr))
+	if err != nil {
+		return nil, NewError(v1.CodeScheduleInvalid, "cron 表达式非法 %q: %v", expr, err)
+	}
+	spec, ok := schedule.(*cron.SpecSchedule)
+	if !ok {
+		return nil, NewError(v1.CodeScheduleInvalid, "cron 表达式非法 %q", expr)
+	}
+	return spec, nil
+}
+
+type cronEvaluator struct {
+	spec *cron.SpecSchedule
+}
+
+func (e *cronEvaluator) Next(after time.Time) time.Time { return e.spec.Next(after) }
+
+type intervalEvaluator struct {
+	interval time.Duration
+}
+
+// Next 以「上一次计划时刻」为基准递推，而不是以实际执行时刻为基准，
+// 否则一次执行耗时较长就会把后续计划时间不断推后。
+func (e *intervalEvaluator) Next(after time.Time) time.Time { return after.Add(e.interval) }
+
+// DueMoments 返回 (after, until] 区间内所有应当触发的计划时刻，按时间升序。
+//
+// 返回的第二个值表示是否因为超出上限而被截断：停机很久时每分钟的计划会积累出
+// 几万个时刻，调用方必须知道结果不完整，而不是以为「就这么多」。
+func DueMoments(eval Evaluator, after, until time.Time, limit int) (moments []time.Time, truncated bool) {
+	if limit <= 0 {
+		limit = maxScheduledMoments
+	}
+	cursor := after
+	for len(moments) < limit {
+		next := eval.Next(cursor)
+		if next.IsZero() || next.After(until) {
+			return moments, false
+		}
+		if !next.After(cursor) {
+			// 触发器没有前进说明实现有问题，直接停止，避免死循环。
+			return moments, false
+		}
+		moments = append(moments, next)
+		cursor = next
+	}
+	return moments, true
+}

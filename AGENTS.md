@@ -28,8 +28,9 @@ Makefile、CI 配置），以及 Git 提交信息。
 - 变量命名要有描述性；复杂条件抽取为有含义的布尔变量。
 - 遵循仓库既有模式，不引入新的分层或框架。
 - 注释只写必要的：解释「为什么」以及非显而易见的约束，不要复述代码本身。
-- 依赖保持精简，目前只引入三个第三方依赖：`modernc.org/sqlite`、`github.com/spf13/cobra`、
-  `gopkg.in/yaml.v3`。
+- 依赖保持精简：`modernc.org/sqlite`、`github.com/spf13/cobra`、`gopkg.in/yaml.v3`，
+  以及迭代 1b 引入的 `github.com/robfig/cron/v3`（cron 表达式解析）。
+  新增依赖前应先确认它无法用标准库合理替代。
 - SQL 迁移文件放在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出。
 
 ## 架构说明
