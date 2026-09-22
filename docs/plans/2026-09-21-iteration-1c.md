@@ -408,8 +408,9 @@ opsctl env list
 - **老发行版（systemd 219～246）上的实际行为**：已承诺支持 systemd ≥ 219，但现有
   `test/linux/` harness 用的是 Ubuntu 24.04（systemd 255），**证明不了 219 上的任何事**。
   容器路已验证走不通：CentOS 7 镜像只有 amd64 清单，且 systemd 219 需要 cgroup v1，
-  而当前 Docker Desktop 是 cgroup v2。**已确认由用户提供老版本主机验证**（安排见第 15 节）；
-  在拿到主机之前，`legacy` 档必须标注为**未验证**，其降级路径只有单元测试与静态检查支撑。
+  而当前 Docker Desktop 是 cgroup v2。用户曾提供一台主机，经探测为 Rocky Linux 10.2 /
+  systemd 257 的生产机，已排除（详见第 15 节）。**`legacy` 档的验证主机尚未落实**；
+  在拿到之前，该档必须标注为**未验证**，其降级路径只有单元测试与静态检查支撑。
 - 远程主机、mTLS、批量（迭代 5）。
 
 ## 15. 未决事项（进入实现前必须冻结）
@@ -450,8 +451,16 @@ opsctl env list
 - 更关键的是 **systemd 219 需要 cgroup v1**（对 cgroup v2 统一层级的支持到 226 才开始、
   233 才实用），而当前的 Docker Desktop 用的是 cgroup v2，systemd 219 起不来。
 
-**用户已确认可以提供老版本主机（CentOS 7 / Ubuntu 18.04，或 amd64 + cgroup v1 的 runner）
-用于验证。** 因此安排为：
+**用户曾提供一台主机（`root@192.168.11.101`）用于验证，经只读探测后排除，不能用于本用途：**
+
+- 该机是 **Rocky Linux 10.2 / systemd 257**（`systemctl`、`/usr/lib/systemd/systemd`、`rpm`
+  三种方式一致确认），**比容器里的 255 还新**，属于 `strict` 档，证明不了 `legacy` 档；
+- 该机是**生产环境**，上面跑着 MES、MySQL、Redis、TDengine、EMQX、OpenResty 等实际业务
+  （由 1Panel 管理），用户明确要求只能隔离部署，不碰 `/etc`、不建系统用户、不写 systemd unit；
+- 该机 cgroup 为 v2，systemd 219 在其上无法启动。
+- 探测阶段为**只读操作**，未对该机做任何改动。
+
+因此 `legacy` 档的验证主机**目前仍未落实**。安排为：
 
 1. 1c 先实现两档 unit 模板，`legacy` 档的单元测试与静态检查必须齐全；
 2. `legacy` 档在拿到主机前，一律标注为**未验证**，不得声称「已支持」；

@@ -274,7 +274,9 @@
     整体加双引号并把 `\` → `\\`、`"` → `\"`，否则凭据会被**静默改写**。
     该规则已实测逐字节确认（含 `$` 不展开、单引号不特殊、首尾空格保留）。
 - **老发行版验证安排**：容器路已确认走不通（CentOS 7 镜像仅 amd64；systemd 219 需要
-  cgroup v1，而当前 Docker Desktop 是 cgroup v2）。**用户已确认可提供老版本主机
-  （CentOS 7 / Ubuntu 18.04，或 amd64 + cgroup v1 的 runner）**；在拿到之前，
-  `legacy` 档一律标注**未验证**，不得声称「已支持」。
+  cgroup v1，而当前 Docker Desktop 是 cgroup v2）。用户曾提供 `192.168.11.101`，经只读
+  探测为 **Rocky Linux 10.2 / systemd 257 的生产机**（跑着 MES、MySQL、Redis、TDengine、
+  EMQX、OpenResty，1Panel 管理），既不是老版本也不适合做验证机，已排除；探测过程中未对
+  该机做任何改动。**`legacy` 档的验证主机目前仍未落实**，在拿到之前该档一律标注**未验证**，
+  不得声称「已支持」。
 
