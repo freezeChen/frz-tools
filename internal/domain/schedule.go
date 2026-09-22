@@ -18,18 +18,21 @@ const (
 )
 
 // MissedRunPolicy 决定 opsd 停机期间错过的触发时刻如何补偿。
-// skip 全部记为 missed；runOnce 只补跑最近一次；runAll 按时间顺序全部补跑。
+//
+// 只有两种取值：skip 全部记为 missed 且不执行；runOnce 只补跑最近一次。
+// 之所以没有 runAll：同一 resource 上最多允许一个未完成 Operation，而 resource
+// 是计划自带的，所以「把积压的时刻逐个补跑」必然被锁拒绝——承诺了却做不到的策略
+// 比没有更糟。需要连续补跑多次的场景应改用更短的间隔或拆分 resource。
 type MissedRunPolicy string
 
 const (
 	MissedRunSkip MissedRunPolicy = "skip"
 	MissedRunOnce MissedRunPolicy = "runOnce"
-	MissedRunAll  MissedRunPolicy = "runAll"
 )
 
 func (p MissedRunPolicy) Valid() bool {
 	switch p {
-	case MissedRunSkip, MissedRunOnce, MissedRunAll:
+	case MissedRunSkip, MissedRunOnce:
 		return true
 	}
 	return false

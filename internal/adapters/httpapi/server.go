@@ -27,6 +27,7 @@ type Dependencies struct {
 	Service   *application.Service
 	Artifacts *application.ArtifactService
 	Catalogs  *application.CatalogService
+	Schedules *application.ScheduleService
 	Store     *sqlite.Store
 	Workers   int
 	Logger    *slog.Logger

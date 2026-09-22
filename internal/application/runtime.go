@@ -27,12 +27,14 @@ type Options struct {
 	Now   func() time.Time
 }
 
-// Runtime 把操作服务、制品服务、目录服务与 worker 池组合在一起，使它们共享同
-// 一个取消注册表：服务负责发出取消信号，worker 池负责响应。
+// Runtime 把操作服务、制品服务、目录服务、调度器与 worker 池组合在一起，
+// 使它们共享同一个取消注册表：服务负责发出取消信号，worker 池负责响应。
 type Runtime struct {
 	Service   *Service
 	Artifacts *ArtifactService
 	Catalogs  *CatalogService
+	Schedules *ScheduleService
+	Scheduler *Scheduler
 	Pool      *Pool
 }
 
@@ -68,5 +70,17 @@ func NewRuntime(opts Options) *Runtime {
 
 	catalogs := newCatalogService(opts.Repo, idGen, opts.Now)
 
-	return &Runtime{Service: service, Artifacts: artifacts, Catalogs: catalogs, Pool: pool}
+	// 调度器是触发时刻的唯一权威；它与 worker 池共享唤醒通道，
+	// 计划发生变化时立刻重算等待时间，而不是等兜底周期。
+	scheduler := newScheduler(opts.Repo, idGen, opts.Logger, opts.Now, pool.Notify)
+	schedules := newScheduleService(opts.Repo, opts.Defaults, idGen, opts.Now, scheduler.Wake)
+
+	return &Runtime{
+		Service:   service,
+		Artifacts: artifacts,
+		Catalogs:  catalogs,
+		Schedules: schedules,
+		Scheduler: scheduler,
+		Pool:      pool,
+	}
 }

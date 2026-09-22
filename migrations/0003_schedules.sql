@@ -9,7 +9,7 @@ CREATE TABLE schedules (
     resource          TEXT NOT NULL,
     spec_json         TEXT NOT NULL,
     missed_run_policy TEXT NOT NULL DEFAULT 'skip'
-        CHECK (missed_run_policy IN ('skip', 'runOnce', 'runAll')),
+        CHECK (missed_run_policy IN ('skip', 'runOnce')),
     next_run_at       TEXT,
     last_run_at       TEXT,
     last_result       TEXT,

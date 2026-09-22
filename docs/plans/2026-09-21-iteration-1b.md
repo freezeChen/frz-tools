@@ -23,7 +23,7 @@ resource 锁、Operation 状态机、审计与日志——**不自己执行任�
 
 - 领域模型：`Schedule`、`ScheduleRun`。
 - cron 表达式与固定间隔两种计划类型，带时区。
-- 错过执行策略（skip / runOnce / runAll）与重启后的补偿判断。
+- 错过执行策略（skip / runOnce）与重启后的补偿判断。
 - 持久化表 `schedules`、`schedule_runs`，migration `0003`。
 - 调度循环：计算下一次触发时间，到点创建 Operation 并触发 worker。
 - 每次触发写入 `ScheduleRun`，可查询运行历史与失败原因。
@@ -53,7 +53,7 @@ resource 锁、Operation 状态机、审计与日志——**不自己执行任�
 | `timezone` | IANA 时区，例如 `Asia/Shanghai`；空则用 `UTC` |
 | `resource` | 触发的 Operation 使用的 resource |
 | `spec` | `executor.command` 的 spec，触发时原样写入 Operation |
-| `missedRunPolicy` | `skip`（默认）/ `runOnce` / `runAll` |
+| `missedRunPolicy` | `skip`（默认）/ `runOnce` |
 | `nextRunAt` | 下一次应当触发的时间，由服务端计算后写回 |
 | `lastRunAt` / `lastResult` | 上一次触发的结果摘要，便于列表页展示 |
 | `createdAt` / `updatedAt` / `createdBy` | 审计信息 |
@@ -92,15 +92,30 @@ resource 锁、Operation 状态机、审计与日志——**不自己执行任�
 
 ## 5. 错过执行与重启恢复
 
-`opsd` 启动时：
+### 先区分「正常到点」和「停机积压」
+
+调度器按精确时刻唤醒，正常情况下的延迟在毫秒级。但如果把「刚到期」和「停机期间积压」
+一视同仁，`skip` 策略就会把自己本应执行的准点触发也丢掉。
+
+因此引入**误触发宽限窗口**（`misfireThreshold`，实现取 1 分钟）：只有当**恰好一个**
+到期时刻、且它的延迟不超过该窗口时，才算「正常到点」，此时无论策略是什么都执行；
+否则整批按错过策略处理。
+
+### 策略
+
+只有两种取值（为什么没有 `runAll` 见第 13 节第 4 条）：
+
+- `skip`：为每个漏掉的时刻写一条 `result=missed` 的 `ScheduleRun`，不建 Operation。
+- `runOnce`：只补跑**最近漏掉的那一个**，更早的写 `missed`。
+
+### 恢复流程
+
+`opsd` 启动时（以及此后每次轮询）：
 
 1. 载入所有 `enabled` 的计划。
-2. 对每个计划算出「上次应当触发到现在之间」漏掉的时刻。
-3. 按 `missedRunPolicy` 处理：
-   - `skip`：为每个漏掉的时刻写一条 `result=missed` 的 `ScheduleRun`，不建 Operation。
-   - `runOnce`：只补跑**最近漏掉的那一个**，更早的写 `missed`。
-   - `runAll`：逐个补跑，按时间顺序排队。
-4. 写回 `nextRunAt`，进入正常循环。
+2. 对 `nextRunAt` 已落在过去的计划，算出到 `now` 为止的所有计划时刻。
+3. 按上面的规则判定「正常到点」还是「积压」，再按策略决定每个时刻是派发还是记为 `missed`。
+4. 写回 `nextRunAt`（被截断时不继续追赶积压，从 `now` 之后重新开始），进入正常循环。
 
 这与迭代 0 的 `DAEMON_RESTARTED` 恢复语义不同：那里恢复的是**已中断的 Operation**，
 这里决定的是**尚未发生的计划是否补偿**。两者都要记录，不能互相替代。
@@ -129,7 +144,7 @@ CREATE TABLE schedules (
     resource          TEXT NOT NULL,
     spec_json         TEXT NOT NULL,
     missed_run_policy TEXT NOT NULL DEFAULT 'skip'
-        CHECK (missed_run_policy IN ('skip', 'runOnce', 'runAll')),
+        CHECK (missed_run_policy IN ('skip', 'runOnce')),
     next_run_at       TEXT,
     last_run_at       TEXT,
     last_result       TEXT,
@@ -170,7 +185,7 @@ CREATE INDEX ix_schedule_runs_schedule ON schedule_runs (schedule_id, scheduled_
 
 ```text
 opsctl schedule create --name <n> --resource <r> --cron "<表达式>"|--interval <dur>
-                       --timezone <tz> --missed-run-policy skip|runOnce|runAll
+                       --timezone <tz> --missed-run-policy skip|runOnce
                        -- <argv...>
 opsctl schedule list
 opsctl schedule inspect <id-or-name>
@@ -206,7 +221,7 @@ opsctl schedule delete <id-or-name>
 - cron 解析：合法表达式、字段数量、非法表达式、跨时区同一表达式的下一个触发时间。
 - 间隔递推：执行耗时不会把计划时间推后。
 - 夏令时切换前后不漏跑、不重复。
-- 错过策略三种行为，边界（只漏一个、漏很多个）。
+- 错过策略两种行为，边界（准点、单个迟到、积压多个）。
 - `(scheduleId, scheduledFor)` 唯一约束拒绝重复触发。
 - 触发时 spec 非法在**创建计划**时就失败，而不是到点才失败。
 - 资源被占用时该次触发记为 `failed` + `LOCK_BUSY`，不排队。
@@ -222,7 +237,7 @@ opsctl schedule delete <id-or-name>
 
 1. 创建 cron 与间隔计划各一个，到点各触发一次且只触发一次。
 2. `opsd` 重启后不为已记录的时刻重复触发。
-3. 三种错过执行策略行为符合定义。
+3. 两种错过执行策略行为符合定义，且「准点触发」不会被 skip 丢掉。
 4. 同一时刻同一只计划只能产生一条 `ScheduleRun`（唯一约束）。
 5. 计划 spec 非法在创建时即失败，错误码 `SCHEDULE_INVALID`。
 6. 资源被占用时该次触发记为 `failed`/`LOCK_BUSY`，既有 Operation 不受影响。
@@ -244,6 +259,11 @@ opsctl schedule delete <id-or-name>
    逻辑各自主张。1c 因此**不生成 `.timer`**，只生成 `.service`。将来若确实需要 systemd 集成，
    在 1c 增加一条**显式**的「把某条计划导出为 timer」命令，而不是让两边自动同步。
 3. `intervalSeconds ≥ 60` 的下限是否合适（是否需要秒级间隔）。
+4. **移除 `runAll` 策略（实现中发现，2026-09-22）**：原设计允许「把积压的时刻逐个补跑」，
+   但同一 `resource` 上最多允许一个未完成 Operation（迭代 0 的刻意不变量），而 `resource`
+   是计划自带的，因此 5 个补跑里必然有 4 个撞上 `LOCK_BUSY`。一个通常无法达成其承诺的策略
+   比没有更危险，所以只保留 `skip` 与 `runOnce`。需要连续补跑多次的场景应改用更短的间隔或
+   拆分 `resource`。同时新增**误触发宽限窗口**（第 5 节），否则 `skip` 会连准点触发一起丢掉。
 
 ## 14. 未验证内容
 

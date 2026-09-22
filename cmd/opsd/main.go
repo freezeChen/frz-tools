@@ -125,10 +125,13 @@ func run(cmd *cobra.Command, _ []string) error {
 	}()
 
 	runtime.Pool.Start(ctx)
+	// 调度器与 worker 池并行运行：前者只决定何时创建 Operation，后者负责执行。
+	go runtime.Scheduler.Run(ctx)
 	server := httpapi.NewServer(httpapi.Dependencies{
 		Service:   runtime.Service,
 		Artifacts: runtime.Artifacts,
 		Catalogs:  runtime.Catalogs,
+		Schedules: runtime.Schedules,
 		Store:     store,
 		Workers:   runtime.Pool.Workers(),
 		Logger:    logger,
