@@ -28,6 +28,14 @@ const (
 	CodeScheduleNotFound ErrorCode = "SCHEDULE_NOT_FOUND"
 	CodeScheduleEnabled  ErrorCode = "SCHEDULE_ENABLED"
 	CodeScheduleInvalid  ErrorCode = "SCHEDULE_INVALID"
+
+	CodeSpecNotFound     ErrorCode = "SPEC_NOT_FOUND"
+	CodeManifestInvalid  ErrorCode = "MANIFEST_INVALID"
+	CodeManifestConflict ErrorCode = "MANIFEST_CONFLICT"
+	CodeRuntimeNotReady  ErrorCode = "RUNTIME_NOT_READY"
+	CodeRuntimeUnsupport ErrorCode = "RUNTIME_UNSUPPORTED"
+	CodeHostNotFound     ErrorCode = "HOST_NOT_FOUND"
+	CodeEnvNotFound      ErrorCode = "ENVIRONMENT_NOT_FOUND"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -50,6 +58,13 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeScheduleNotFound:     404,
 	CodeScheduleEnabled:      409,
 	CodeScheduleInvalid:      400,
+	CodeSpecNotFound:         404,
+	CodeManifestInvalid:      400,
+	CodeManifestConflict:     409,
+	CodeRuntimeNotReady:      409,
+	CodeRuntimeUnsupport:     409,
+	CodeHostNotFound:         404,
+	CodeEnvNotFound:          404,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -86,6 +101,13 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeScheduleNotFound:     2,
 	CodeScheduleEnabled:      15,
 	CodeScheduleInvalid:      16,
+	CodeSpecNotFound:         2,
+	CodeManifestInvalid:      17,
+	CodeManifestConflict:     18,
+	CodeRuntimeNotReady:      19,
+	CodeRuntimeUnsupport:     21,
+	CodeHostNotFound:         2,
+	CodeEnvNotFound:          2,
 }
 
 func ExitCode(code ErrorCode) int {
