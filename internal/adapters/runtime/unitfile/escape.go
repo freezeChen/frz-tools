@@ -1,6 +1,10 @@
-// Package systemd 实现 RuntimeAdapter 的 systemd 适配器：unit 渲染、安装、
-// 启停、状态与健康检查。
-package systemd
+// Package unitfile 负责 systemd unit 与环境文件的文本生成：ExecStart 的参数转义
+// 与 EnvironmentFile 的值转义。
+//
+// 它被 systemd 适配器与 proc 假适配器共用，而不是各自实现一份：proc 的职责就是
+// 在 macOS 与 CI 上复现同一套语义，两边各写一遍转义等于把「本地能跑、真机不能跑」
+// 这类故障固化下来。转义规则全部来自实测，见 1c 规格第 6 节。
+package unitfile
 
 import (
 	"bytes"

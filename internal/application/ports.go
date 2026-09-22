@@ -75,6 +75,25 @@ type SecretResolver interface {
 	Resolve(ctx context.Context, ref domain.SecretRef) (string, error)
 }
 
+// RuntimeAdapter 把「应用规格」映射到具体运行时。实现方必须通过
+// internal/application/runtimecontract 的共享合约测试，否则 proc 与 systemd 两个
+// 实现的语义会各自漂移，而「本地能跑、真机不能跑」正是这类工具最难排查的故障。
+//
+// 所有方法都不得假设调用方已经校验过规格：实现方必须在 Prepare/Start/Health/Status
+// 内部先校验，因为「未经验证的规格被直接启动」是最危险的一类误用。
+type RuntimeAdapter interface {
+	// Validate 只检查规格能否被本适配器执行，不产生任何副作用。
+	Validate(ctx context.Context, spec *domain.ApplicationSpec) error
+	// Prepare 创建用户、目录、环境文件与 unit 文件；幂等，可重复调用。
+	Prepare(ctx context.Context, spec *domain.ApplicationSpec) error
+	Start(ctx context.Context, spec *domain.ApplicationSpec) error
+	Stop(ctx context.Context, spec *domain.ApplicationSpec) error
+	// Health 返回「能否接流量」，Status 返回「进程本身的状态」。
+	// 两者刻意不合并：进程活着不等于已就绪。
+	Health(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeHealth, error)
+	Status(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error)
+}
+
 type Defaults struct {
 	Timeout          time.Duration
 	MaxOutputBytes   int64

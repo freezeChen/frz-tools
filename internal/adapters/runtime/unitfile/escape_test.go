@@ -1,4 +1,4 @@
-package systemd
+package unitfile
 
 import (
 	"strings"
