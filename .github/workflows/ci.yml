@@ -18,3 +18,17 @@ jobs:
           cache: true
       - name: Verify formatting, vet, tests and cross builds
         run: make ci
+
+  linux-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # 在真实 Linux 内核上验证 macOS 无法证明的语义：文件模式、属组、
+      # Unix Socket ACL、systemd unit 生命周期。证据类型为「Linux 容器」，
+      # 不等于「Linux 主机」（见 AGENTS.md）。
+      - name: Verify Linux-only semantics in a container
+        run: bash test/linux/verify.sh

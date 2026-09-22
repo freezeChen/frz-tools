@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= bin
 PKGS := ./...
 
-.PHONY: all fmt vet test test-race build cross ci clean
+.PHONY: all fmt vet test test-race build cross verify-linux ci clean
 
 all: fmt vet test
 
@@ -32,6 +32,11 @@ cross:
 	GOOS=linux GOARCH=amd64 $(GO) build -o $(BIN_DIR)/linux-amd64/opsctl ./cmd/opsctl
 	GOOS=linux GOARCH=arm64 $(GO) build -o $(BIN_DIR)/linux-arm64/opsd ./cmd/opsd
 	GOOS=linux GOARCH=arm64 $(GO) build -o $(BIN_DIR)/linux-arm64/opsctl ./cmd/opsctl
+
+## verify-linux 在 Linux 容器内验证文件模式、属组、Unix Socket ACL 与 systemd。
+## 需要 docker，因此不纳入 ci；CI 中作为独立 job 运行。
+verify-linux:
+	bash test/linux/verify.sh
 
 ci: fmt vet test test-race cross
 

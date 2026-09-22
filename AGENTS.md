@@ -52,14 +52,18 @@ Makefile、CI 配置），以及 Git 提交信息。
 ## 常用工作流
 
 ```bash
-make fmt          # 格式检查
-make vet          # 静态检查
-make test         # 单元 + 集成 + e2e
-make test-race    # 竞态检测
-make build        # 构建两个二进制到 bin/
-make cross        # 交叉编译 linux/amd64 与 linux/arm64
-make ci           # 以上全部，提交前必须通过
+make fmt           # 格式检查
+make vet           # 静态检查
+make test          # 单元 + 集成 + e2e
+make test-race     # 竞态检测
+make build         # 构建两个二进制到 bin/
+make cross         # 交叉编译 linux/amd64 与 linux/arm64
+make verify-linux  # Linux 容器验证：文件模式、属组、Unix Socket ACL、systemd（需要 docker）
+make ci            # fmt + vet + test + test-race + cross，提交前必须通过
 ```
+
+`make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行。
+修改了权限、属组、socket 或 systemd 相关逻辑后必须单独跑它。
 
 本地运行：
 
@@ -81,6 +85,9 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 
 ### Linux 容器验证的固定配方
 
+harness 位于 `test/linux/`（`Dockerfile.systemd` + `verify.sh`），用 `make verify-linux` 运行。
+以下是它使用的容器参数，手工排查时同样适用。
+
 systemd 在容器内必须用 `--cgroupns=host`；用 `private` 时 systemd 无法作为 PID 1 启动。
 
 ```bash
@@ -89,8 +96,15 @@ systemd 在容器内必须用 `--cgroupns=host`；用 `private` 时 systemd 无�
 docker run -d --privileged --cgroupns=host \
   --tmpfs /run --tmpfs /tmp \
   -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-  frz-systemd-probe:24.04
+  frz-ops-verify:24.04
 ```
 
-**不得把 macOS 目录 bind mount 进容器做权限测试**：virtiofs 不保真文件属主与模式，结果不可信。
-二进制应通过容器内构建或 `docker cp` 进入，测试状态留在容器文件系统内。
+两个已知坑：
+
+- **不得把 macOS 目录 bind mount 进容器做权限测试**：virtiofs 不保真文件属主与模式，结果不可信。
+  二进制应通过容器内构建或 `docker cp` 进入，测试状态留在容器文件系统内。
+- **`docker cp` 不要写进 `/tmp`**：`--tmpfs /tmp` 会遮住容器根文件系统里的同名目录，
+  复制看似成功但 `docker exec` 看不到文件。改用 `/opt` 下的路径中转。
+
+shell 脚本中变量名后紧跟中文全角字符时，必须写成 `${var}`。macOS 自带的 bash 3.2 会把
+多字节字符的前几个字节算进变量名，报 `unbound variable`；CI 上的 bash 5 不会暴露这个问题。

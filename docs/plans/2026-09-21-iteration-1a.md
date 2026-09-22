@@ -23,12 +23,11 @@
 1. **交付粒度**：拆里程碑，本文件只冻结 1a。
 2. **Linux 验证策略**：分三层。
    - 自动化测试层：端口 + fake 适配器 + 合约测试，可在 macOS 与 CI 上跑。
-   - Linux 容器层：systemd、文件模式、属组与 Unix Socket ACL 用 Linux 容器真实验证
-     （配方见 `AGENTS.md`，`--cgroupns=host` 是必需参数）。
+   - Linux 容器层：systemd、文件模式、属组与 Unix Socket ACL 用 Linux 容器真实验证。
+     harness 已落地于 `test/linux/`，用 `make verify-linux` 运行（配方与已知坑见 `AGENTS.md`）。
    - 真实主机层：reboot 后的 unit 持久化、SELinux/AppArmor、sudoers/PAM 实际策略，
      仍挂起并显式标注「未验证」。
-   注意：容器验证的 harness **尚未搭建**（本迭代先只记录配方），因此 1a 中依赖文件模式语义的
-   验收项在 macOS 本地无法证明，见第 11、12 节。
+   1a 中依赖文件模式语义的验收项由 Linux 容器层覆盖，见第 11、12 节。
 3. **Go module path**：继续使用 `frz-tools`，正式远程仓库确定后一次性全局替换 import 前缀。
 
 ## 2. 范围
@@ -354,15 +353,16 @@ JSON」的约定。
 
 **证据类型限制（重要）**：第 1、2、6、7 条中涉及文件模式（blob `0640`、目录 `0750`、SecretRef
 文件必须 `0600`）和属组语义的部分，**在 macOS 上无法证明**——macOS 与容器 bind mount 都不保真
-Linux 权限语义。这些条目必须用 Linux 容器（或 Linux 主机）验证，证据类型标注为「Linux 容器」。
-在 harness 搭建之前，这些条目只能标为「未验证」，不得用 macOS 上的测试结果替代。
+Linux 权限语义。这些条目必须通过 `make verify-linux` 在 Linux 容器内验证，证据类型标注为
+「Linux 容器」，不得用 macOS 上的测试结果替代。
 
 ## 12. 未验证内容
 
 以下内容在 1a 完成后仍未验证，不得用源码检查替代：
 
-- 制品存储的文件模式（`0640`/`0750`）与 `SecretRef` 文件 `0600` 的实际强制效果：
-  需要 Linux 容器验证，harness 尚未搭建。
+- 制品存储的文件模式（`0640`/`0750`）与 `SecretRef` 文件 `0600` 的实际强制效果：由
+  `make verify-linux` 覆盖（Linux 容器），但**真实 Linux 主机上的 umask 与挂载选项差异**
+  仍未验证。
 - 真实 S3/MinIO 后端行为（1a 只冻结端口）。
 - systemd 的真实控制逻辑（属于 1c）；即使 1c 完成，reboot 持久化与 SELinux/AppArmor 仍需
   真实 Linux 主机。
@@ -382,6 +382,6 @@ Linux 权限语义。这些条目必须用 Linux 容器（或 Linux 主机）验
 
 - 正式远程仓库对应的 module path（当前 `frz-tools` 是临时的）。
 - 认证与多用户隔离：1a 的 API 仍然无鉴权，与迭代 0 一致，多人环境不可用。
-- **Linux 容器验证 harness 的搭建时机**：配方已验证并记录在 `AGENTS.md`（容器可跑真实
-  systemd、可验证文件模式与 Unix Socket ACL），但 harness 本身尚未搭建。最迟在 1c 需要验证
-  systemd 之前必须建好，否则 1a 与 1c 的权限类验收项只能长期停留在「未验证」。
+- **Linux 容器验证 harness 的搭建时机**：已完成，位于 `test/linux/`（`make verify-linux`），
+  先用迭代 0 的代码验证通过（22 项断言全绿），并已接入 CI 独立 job。1a 的制品存储与
+  `SecretRef` 权限断言直接复用它。

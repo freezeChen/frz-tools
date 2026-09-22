@@ -1,0 +1,27 @@
+apiVersion: ops.frz.io/v1alpha1
+kind: OpsdConfig
+
+socket:
+  path: /run/opsd/opsd.sock
+  mode: "0660"
+
+database:
+  path: /var/lib/opsd/opsd.db
+
+runtime:
+  workDirectory: /var/lib/opsd/work
+  logDirectory: /var/log/opsd
+  workers: 2
+
+execution:
+  defaultTimeoutSeconds: 30
+  maxOutputBytes: 65536
+  allowedPaths:
+    - /bin
+    - /usr/bin
+    - /usr/local/bin
+  sensitiveEnvKeys:
+    - TOKEN
+
+sudo:
+  allowedCommands: []
