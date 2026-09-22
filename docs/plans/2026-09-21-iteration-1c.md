@@ -162,6 +162,37 @@ StandardError=append:<logs.directory>/current.log
 WantedBy=multi-user.target
 ```
 
+### systemd 版本兼容档（已承诺支持 ≥ 219）
+
+上面的模板是「新档」。已决定支持 systemd ≥ 219（CentOS 7 起），而模板里有多条指令在
+219 上要么不存在、要么取值不被接受（取值错误会让 unit **加载失败**，不是忽略）：
+
+| 指令 | 最低 systemd | 219 上的后果 |
+| --- | --- | --- |
+| `EnvironmentFile=` | 205 | 可用 |
+| `PrivateTmp=` | 209 | 可用 |
+| `ProtectHome=` | 214 | 可用（`tmpfs` 取值需 232，不得使用） |
+| `NoNewPrivileges=` | 159 | 可用 |
+| `Restart=` / `RestartSec=` | 186 起 | 可用 |
+| `ProtectSystem=strict` | 232 | **取值不被接受，unit 加载失败**；219 只能用 `yes`/`full` |
+| `ReadWritePaths=` | 231 | 旧档须退回 `ReadWriteDirectories=`，否则**指令被忽略**（与 `ProtectSystem=yes` 组合会导致应用写不了自己的工作目录） |
+| `StandardOutput=append:` | 240 | **取值不被接受**；旧档只能用 `file:`（每次启动截断）或 `journal` |
+| `LoadCredential=` | 247 | **指令未知**；见第 15 节的凭据收敛方式 |
+
+因此适配器必须：
+
+1. 运行时探测版本（`systemctl --version`），据此选择 unit 档位；
+2. 至少维护两档——`strict`（≥ 240）与 `legacy`（219～239）；
+3. 把探测到的版本与所选档位写进 unit 的注释与审计，避免「同一份 manifest 在不同主机上
+   生成的 unit 不同」却无迹可查。
+
+需要显式记录的语义损失（旧档无法等价实现，只能降级）：
+
+- `logs.directory` 的**追加**语义。`append:` 只在新档可用；旧档用 `file:` 会在每次启动时
+  截断日志，与 1b「按 Operation 查日志」的预期不一致。备选是旧档统一改用 `journal`，
+  但这要求 `opsd` 从 journald 读日志，而当前设计是直接读文件。
+- 凭据的隔离级别（见第 15 节）。
+
 ### ExecStart 转义规则（必须按 systemd 的语义，不能自己发明）
 
 - 参数按空白切分，除非整体用双引号包裹。
@@ -170,8 +201,9 @@ WantedBy=multi-user.target
 - 除此之外原样输出。
 - 该函数必须有覆盖这些情况的单元测试——转义错误会直接变成服务起不来或参数错乱。
 
-`ProtectSystem=strict` 配合显式 `ReadWritePaths` 是有意的硬约束：unit 只能写
-工作目录、日志目录和解包目录，写不进去就说明规格里漏声明了路径，属于需要暴露的错误。
+`strict` 档中 `ProtectSystem=strict` 配合显式 `ReadWritePaths` 是有意的硬约束：unit 只能写
+工作目录、日志目录和解包目录，写不进去就说明规格里漏声明了路径，属于需要暴露的错误；
+`legacy` 档做不到同等强度（见上表），降级结论必须写进审计。
 
 ## 7. 用户、目录、环境文件与凭据
 
@@ -179,13 +211,19 @@ WantedBy=multi-user.target
   已存在时只校验，不改已有用户的属性。
 - **目录**：`workingDirectory`、`logs.directory`、解包目录全部 `0750`，属主为 `runUser:runUser`。
 - **环境文件**：`/etc/opsd/apps/<application>.env`，`0600`，只写 `exec.environment` 里的**非敏感**值。
-- **凭据文件**：`/etc/opsd/apps/<application>.credentials/<name>`，`0600`，属主为 `runUser`，
-  内容是 `SecretRef` 解析出的值，通过 systemd `LoadCredential=` 挂给服务，
-  进程内用 `$CREDENTIALS_DIRECTORY/<name>` 读取。
+- **凭据文件**：`/etc/opsd/apps/<application>.credentials/<name>`，`0700` 目录、`0600` 文件，
+  属主为 `runUser`，内容是 `SecretRef` 解析出的值。**如何交给进程由 systemd 版本决定**：
 
-**需要用户确认的设计取舍**：为了让托管在 systemd 下的进程拿到凭据，明文必须以某种形式
-到达进程。这里选择写入 `0600` 凭据文件而非写进 unit 的 `Environment=`——
-unit 与环境文件的权限更难管、更容易被 `systemctl show` 或日志带出。它不违反 1a 的
+  - `strict` 档（≥ 247）：`LoadCredential=<name>:<path>`，进程内读 `$CREDENTIALS_DIRECTORY/<name>`；
+  - `legacy` 档（219～246）：没有 `LoadCredential=`，只能走 `EnvironmentFile=` 或
+    `Environment=`，此时凭据以**普通环境变量**出现在进程环境里。
+
+  这个分档意味着「同一份应用在不同主机上读凭据的方式不同」，因此第 15 节把
+  「是否统一走 `EnvironmentFile=`」列为进入实现前必须收敛的取舍。
+
+**已确认的设计取舍（2026-09-22）**：为了让托管在 systemd 下的进程拿到凭据，明文必须以某种
+形式到达进程，**已允许写到磁盘**。这里选择写入 `0600` 凭据文件而非写进 unit 的
+`Environment=`——unit 的权限更难管、更容易被 `systemctl show` 或日志带出。它不违反 1a 的
 「不落库、不进日志、不进审计」，但**确实把明文落到了磁盘**，因此：
 
 - 凭据目录必须 `0700`，文件 `0600`，属主为运行用户；
@@ -317,17 +355,41 @@ opsctl env list
 - **SELinux/AppArmor** 对 `ProtectSystem=strict` 与路径写入的实际约束。
 - **sudoers/PAM** 实际策略与 `useradd --system` 在目标发行版上的细节差异。
 - `tzdata` 缺失对时区解析的影响（与 1b 共用，容器镜像需显式安装并断言）。
-- 真实发行版上 systemd 版本差异（`LoadCredential` 需要 systemd ≥ 247；较老发行版要降级方案）。
+- **老发行版（systemd 219～246）上的实际行为**：已承诺支持 systemd ≥ 219，但现有
+  `test/linux/` harness 用的是 Ubuntu 24.04（systemd 255），**证明不了 219 上的任何事**。
+  要给出该范围的证据，需要第二个 harness 镜像（CentOS 7，systemd 219；注意 CentOS 7
+  已于 2024-06 停止维护）、或一台 Linux 主机。在此之前，「支持 systemd ≥ 219」
+  必须标注为**未验证**，且 unit 模板的降级路径只有静态检查支撑。
 - 远程主机、mTLS、批量（迭代 5）。
 
 ## 15. 未决事项（进入实现前必须冻结）
 
-1. **凭据是否允许落盘**（第 7 节）：`LoadCredential` 方案需要写 `0600` 凭据文件。
-   若不允许，只能改为在 `Start` 时由 opsd 以子进程方式注入环境，这会绕开 systemd 的
-   进程管理，或需要改用外部秘密管理系统——**需要用户拍板**。
+1. **凭据是否允许落盘（已决定，2026-09-22）**：**允许**。采用第 7 节的方案：凭据以
+   `0600` 文件形式落到 `/etc/opsd/apps/<application>.credentials/<name>`，属主为运行用户。
+   靠目录 `0700`、文件 `0600`、属主约束，以及 `opsd` 自身在日志/审计/错误信息中按值脱敏
+   来控制风险；权限强制效果在 Linux 容器中验证，真实主机标注未验证。
 2. **调度器与 systemd timer 的关系（已决定，2026-09-22）**：`opsd` 的进程内调度循环是唯一
    权威，1c 不生成 `.timer`。若将来需要 systemd 集成，增加显式的「导出计划为 timer」命令，
    不做双向自动同步。详见 1b 第 13 节第 2 条。
 3. `application_specs` 是否在迭代 3 改为按 release 版本化（第 8 节说明了影响）。
 4. 制品解包的目标目录布局与权限（本文件只声明了 `stripComponents` 与目录，未定义目录结构）。
 5. `Host`/`Environment` 是否需要与应用建立关联（当前刻意不关联）。
+6. **目标 systemd 版本范围（已决定，2026-09-22）**：支持 **systemd ≥ 219**
+   （覆盖 CentOS 7 / Ubuntu 18.04 起的发行版）。这带来三项必须落实的兼容工作，见第 4 节。
+
+### 待确认：决定 1 与决定 6 之间存在冲突
+
+`LoadCredential=` 需要 **systemd ≥ 247**，而 219 不支持。因此「用 `LoadCredential=` 交付凭据」
+无法覆盖已承诺的版本范围，必须二选一收敛（**需要用户拍板**）：
+
+- **收敛方式一：统一走 `EnvironmentFile=`**。所有发行版都用 `0600` 环境文件，
+  由 systemd 在启动时读入进程环境。一套路径、一个应用契约（应用只认环境变量）。
+  代价：放弃 `LoadCredential` 的额外隔离，凭据以环境变量形式出现在
+  `/proc/<pid>/environ`（仅同用户与 root 可读）。
+- **收敛方式二：双路径 + 应用自行兼容**。≥ 247 用 `LoadCredential=`（应用读
+  `$CREDENTIALS_DIRECTORY/<NAME>`），< 247 用 `EnvironmentFile=`（应用读 `$<NAME>`）。
+  代价：**同一份应用二进制在不同主机上的读取方式不同**，应用必须同时处理两种，
+  且这种差异只在老发行版上才暴露出来。
+
+倾向收敛方式一：本迭代已经为了版本范围放弃了 `LoadCredential`，再让应用契约随宿主机变化，
+是把复杂度转移到了最难排查的地方（应用侧、且只在旧主机上出现）。
