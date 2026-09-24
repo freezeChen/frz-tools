@@ -97,9 +97,15 @@ wait_for() { # 容器名 探测命令…
   exit 1
 }
 
-wait_for "$PG" docker exec "$PG" pg_isready -U postgres
-wait_for "$MYSQL" docker exec "$MYSQL" mysqladmin ping -uroot -p"$DB_PASSWORD" --silent
-wait_for "$MARIA" docker exec "$MARIA" mariadb-admin ping -uroot -p"$DB_PASSWORD" --silent
+# 就绪探测一律走 **TCP**。
+#
+# 数据库容器的入口脚本会先起一个**临时实例**跑初始化、再把它停掉、然后启动真正对外
+# 服务的实例；临时实例只监听 unix socket（入口脚本就是这么隔离它的）。因此在容器里
+# 用默认的 socket 探测会**提前**判定就绪——随后真正那个实例还在重启，建账号就失败了。
+# 这个坑只在 CI 上稳定复现（本地因为慢一点而侥幸躲过），TCP 探测则天然避开临时实例。
+wait_for "$PG" docker exec "$PG" pg_isready -h 127.0.0.1 -U postgres
+wait_for "$MYSQL" docker exec "$MYSQL" mysqladmin ping -h 127.0.0.1 --protocol=TCP -uroot -p"$DB_PASSWORD" --silent
+wait_for "$MARIA" docker exec "$MARIA" mariadb-admin ping -h 127.0.0.1 --protocol=TCP -uroot -p"$DB_PASSWORD" --silent
 
 # ==== 建测试账号 ====
 #
@@ -108,21 +114,45 @@ wait_for "$MARIA" docker exec "$MARIA" mariadb-admin ping -uroot -p"$DB_PASSWORD
 # 否则「隔离恢复」在只有普通账号的生产环境里会直接失败，而本地测试看不出来。
 log "创建测试账号（非超级用户，带建库权限）"
 
-"$DOCKER" exec -i "$PG" psql -U postgres -v ON_ERROR_STOP=1 -q <<SQL
-CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASSWORD}' CREATEDB;
-CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};
-SQL
-pass "PostgreSQL 账号 ${DB_USER}（CREATEDB，库属主）"
+# 建账号的语句一律写成**幂等**的，好用「以结果为准」的重试兜住残余的时序问题。
+create_pg_account() {
+  "$DOCKER" exec -i "$PG" psql -U postgres -q -c \
+    "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER}') \
+     THEN CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASSWORD}' CREATEDB; END IF; END \$\$" || return 1
+  local exists
+  exists=$("$DOCKER" exec -i "$PG" psql -U postgres -tAc \
+    "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" | tr -d '[:space:]') || return 1
+  if [ "$exists" != "1" ]; then
+    "$DOCKER" exec -i "$PG" psql -U postgres -q -c \
+      "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}" || return 1
+  fi
+}
 
-for container in "$MYSQL" "$MARIA"; do
-  client="mysql"
-  [ "$container" = "$MARIA" ] && client="mariadb"
-  "$DOCKER" exec -i "$container" "$client" -uroot -p"$DB_PASSWORD" 2>/dev/null <<SQL
+create_sql_account() { # 客户端 容器
+  "$DOCKER" exec -i "$2" "$1" -uroot -p"$DB_PASSWORD" <<SQL
 CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}';
 GRANT ALL ON *.* TO '${DB_USER}'@'%';
 FLUSH PRIVILEGES;
 SQL
-  pass "${container} 账号 ${DB_USER}（含建库权限）"
+}
+
+wait_until() { # 描述 命令…
+  local desc=$1
+  shift
+  for _ in $(seq 1 60); do
+    if "$@" >/dev/null 2>&1; then
+      pass "$desc"
+      return 0
+    fi
+    sleep 2
+  done
+  fail "$desc 在 120 秒内没有成功"
+  return 1
+}
+
+wait_until "PostgreSQL 账号 ${DB_USER}（CREATEDB，库属主）" create_pg_account
+for pair in "${MYSQL}:mysql" "${MARIA}:mariadb"; do
+  wait_until "${pair%%:*} 账号 ${DB_USER}（含建库权限）" create_sql_account "${pair##*:}" "${pair%%:*}"
 done
 
 # ==== 包装脚本 ====
