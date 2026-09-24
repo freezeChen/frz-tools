@@ -646,7 +646,11 @@
   （`make verify-linux` 118/0 回归不变）与**Linux 容器承载的真实数据库实例**
   （`make verify-db` 13/0：PostgreSQL 16、MySQL 8.0、MariaDB 11 各跑一遍共享合约，
   测试账号是非超级用户 + 建库权限，并检查三个实例上都没有残留的临时库）。
-  `make ci` 全绿。
+  `make ci` 全绿；干净 runner 上的 CI run **`35963799621`** 三个 job 全绿
+  （`test`、`linux-verify` 118/0、`db-verify` 13/0）。先后两次 `db-verify` 失败都是
+  harness 的问题、不是产品缺陷：①就绪探测走了 socket，而容器入口脚本的临时实例只监听
+  socket，于是建账号打在正在重启的实例上；②PATH 里的 `/usr/bin` 让测试解析到 runner
+  自带的 mysql 客户端，且失败输出被自己的 `grep` 过滤掉了正文。两处都已在脚本里就地注释。
 - **未验证**：真实 Linux 主机上的数据库备份（本地 socket、版本组合差异、生产账号的真实权限
   边界、长时间大库与磁盘将满）、GTID 开启的 MySQL 8（适配器刻意不传 `--set-gtid-purged=OFF`，
   因为 MariaDB 的 mysqldump 不认它）、`prune`（属 2d，未实现）。
