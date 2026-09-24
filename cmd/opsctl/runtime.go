@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/adapters/client"
@@ -154,12 +155,42 @@ type runtimeActionFlags struct {
 	app            string
 	idempotencyKey string
 	createdBy      string
+	retryMax       int
+	retryBase      time.Duration
+	retryMaxDelay  time.Duration
 }
 
 func (f *runtimeActionFlags) bind(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&f.app, "app", "", "应用名称或 ID")
 	cmd.Flags().StringVar(&f.idempotencyKey, "idempotency-key", "", "幂等键：相同请求重复提交会返回同一个操作")
 	cmd.Flags().StringVar(&f.createdBy, "created-by", "", "调用方标识")
+	cmd.Flags().IntVar(&f.retryMax, "retry-max", 0,
+		"最多尝试次数，含首次（1 表示不重试，上限 10）。省略则不自动重试")
+	cmd.Flags().DurationVar(&f.retryBase, "retry-base", 0, "退避基数（默认 5s）")
+	cmd.Flags().DurationVar(&f.retryMaxDelay, "retry-max-delay", 0, "退避上限（默认 5m）")
+}
+
+// retrySpec 把 --retry-* 组装成策略；一个都没设置时返回 nil，也就是不自动重试。
+//
+// runtime.start 的重试有一处额外收口：只有「就绪从未通过」才算失败、才可重试；
+// 已就绪过再崩溃归 unit 的 Restart= 与健康检查（迭代 1d 规格 D6）。
+func (f *runtimeActionFlags) retrySpec(cmd *cobra.Command) (*v1.RetrySpec, error) {
+	if !cmd.Flags().Changed("retry-max") && !cmd.Flags().Changed("retry-base") && !cmd.Flags().Changed("retry-max-delay") {
+		return nil, nil
+	}
+	base, err := wholeSeconds(f.retryBase, "retry-base")
+	if err != nil {
+		return nil, err
+	}
+	maxDelay, err := wholeSeconds(f.retryMaxDelay, "retry-max-delay")
+	if err != nil {
+		return nil, err
+	}
+	return &v1.RetrySpec{
+		MaxAttempts:      f.retryMax,
+		BaseDelaySeconds: base,
+		MaxDelaySeconds:  maxDelay,
+	}, nil
 }
 
 func runRuntimeAction(cmd *cobra.Command, opts *rootOptions, kind string, flags *runtimeActionFlags) error {
@@ -167,11 +198,18 @@ func runRuntimeAction(cmd *cobra.Command, opts *rootOptions, kind string, flags 
 		return err
 	}
 
-	in := client.RuntimeActionInput{IdempotencyKey: flags.idempotencyKey, CreatedBy: flags.createdBy}
+	retry, err := flags.retrySpec(cmd)
+	if err != nil {
+		return err
+	}
+	in := client.RuntimeActionInput{
+		IdempotencyKey: flags.idempotencyKey,
+		CreatedBy:      flags.createdBy,
+		Retry:          retry,
+	}
 	var (
 		op      *v1.Operation
 		created bool
-		err     error
 	)
 	if kind == v1.KindRuntimeStart {
 		op, created, err = opts.client().StartRuntime(cmd.Context(), flags.app, in)

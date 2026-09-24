@@ -410,3 +410,69 @@ func mustRequest(t *testing.T, url, idempotencyKey string) *http.Request {
 	request.Header.Set("Idempotency-Key", idempotencyKey)
 	return request
 }
+
+// runtime.* 也允许声明重试（1d 决策 3），因此 retry 段必须一路透传到 Service.Create，
+// 而不是在 HTTP 层被静默丢掉。
+func TestRuntimeActionCarriesRetryPolicy(t *testing.T) {
+	server, _ := newFullServer(t, withRuntime(&stubRuntimeAdapter{}, nil))
+	runtimeReadyApp(t, server, "billing-api")
+
+	request, err := http.NewRequest(http.MethodPost,
+		server.URL+"/api/v1/applications/billing-api/runtime/start",
+		strings.NewReader(`{"createdBy":"alice","retry":{"maxAttempts":3,"baseDelaySeconds":5}}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("post start: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d", response.StatusCode)
+	}
+
+	var decoded v1.OperationResponse
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// maxAttempts 来自请求而不是默认的 1，这就是「策略真的落到了操作上」的证据。
+	if decoded.Operation.MaxAttempts != 3 {
+		t.Fatalf("maxAttempts want 3（retry 未被透传到 Service.Create）, got %d", decoded.Operation.MaxAttempts)
+	}
+	if decoded.Operation.Attempt != 1 {
+		t.Fatalf("第一跳的 attempt want 1, got %d", decoded.Operation.Attempt)
+	}
+}
+
+// 反面对照：非法策略必须被报成 RETRY_POLICY_INVALID。
+//
+// 刻意不注入适配器——校验排在「适配器是否可用」之前，所以如果 HTTP 层把 retry 段丢了，
+// 这个用例会拿到 RUNTIME_UNSUPPORTED 而失败，正好钉住透传这件事。
+func TestRuntimeActionRejectsBadRetryPolicy(t *testing.T) {
+	server, _ := newFullServer(t)
+	runtimeReadyApp(t, server, "billing-api")
+
+	request, err := http.NewRequest(http.MethodPost,
+		server.URL+"/api/v1/applications/billing-api/runtime/start",
+		strings.NewReader(`{"retry":{"maxAttempts":99}}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("post start: %v", err)
+	}
+	defer response.Body.Close()
+
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", response.StatusCode, string(raw))
+	}
+	assertEnvelopeCode(t, raw, v1.CodeRetryPolicyInvalid)
+}

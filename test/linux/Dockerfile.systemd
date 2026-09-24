@@ -8,6 +8,7 @@ RUN apt-get update \
       iproute2 \
       ca-certificates \
       tzdata \
+      sqlite3 \
  && rm -rf /var/lib/apt/lists/*
 
 CMD ["/lib/systemd/systemd"]

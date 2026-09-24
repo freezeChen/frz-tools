@@ -110,7 +110,7 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 可选字段是兼容的；**删除字段、改名、改变语义或必填性，必须提升 `apiVersion` 并登记一段迁移**。
 不要修改历史版本的语义或直接删历史决策。
 
-SQL 迁移在仓库根 `migrations/`（`0001`…`0004`），由 `migrations` 包的 `go:embed` 导出，
+SQL 迁移在仓库根 `migrations/`（`0001`…`0005`），由 `migrations` 包的 `go:embed` 导出，
 `internal/adapters/sqlite` 按文件名排序执行并记录到 `schema_migrations`。
 
 ## 验证纪律
@@ -121,7 +121,7 @@ SQL 迁移在仓库根 `migrations/`（`0001`…`0004`），由 `migrations` 包
 - 修改 API、状态机、数据表或错误码，**先更新对应迭代文档**并记录兼容性影响。
 - 设计文档在 `docs/plans/`：`2026-09-21-linux-ops-tool-roadmap.md` 是总路线图（追加式变更记录，
   不删历史决策），`2026-09-21-iteration-{0,1a,1b,1c,1d,2}.md` 是各迭代规格与验证记录。验收标准
-  必须给出「命令 / 结果 / 证据类型」。**1d（重试与并发策略）的规格已于 2026-09-24 冻结、待实现**；
+  必须给出「命令 / 结果 / 证据类型」。**1d（重试与并发策略）已于 2026-09-24 实现并提交**；
   **迭代 2（数据库与资源备份）的规格也已冻结**（拆成 2a–2d，先做 2a），实现待做。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」；不要引用静态推导值或历史快照当结论。

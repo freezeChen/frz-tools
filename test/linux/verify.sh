@@ -678,6 +678,257 @@ MANIFEST
   assert_eq "缺凭据时 unit 只在失败/重启状态（观察到：${states# }）" "" "${unexpected}"
 }
 
+# ==== 迭代 1d：runtime.* 的重试与 systemd 的 Restart= 不得叠加（规格 D6）====
+#
+# 这条只能在真实 systemd 上验证：要证明的是「unit 已经在进程级重启了，opsd 就不该再
+# 叠一层操作级重试」。假 runner 造不出这个关系——就像 A7 那次「进程身份 vs 目录属主」
+# 永远是测试自己造的那种关系一样。
+#
+# 规格 D6 把语义收成一句话：**只有「就绪从未通过」才算 runtime.start 失败、才可重试；
+# 已就绪过再崩溃归 unit 的 Restart= 与健康检查。** 下面两个夹具正对应这两半。
+RETRY_OK_APP=frz-retry-ok
+RETRY_OK_USER=frz-retry-ok
+RETRY_OK_UNIT=frz-retry-ok.service
+RETRY_OK_PORT=18092
+RETRY_BAD_APP=frz-retry-bad
+RETRY_BAD_USER=frz-retry-bad
+RETRY_BAD_UNIT=frz-retry-bad.service
+RETRY_BAD_PORT=18093
+RETRY_DEAD_PORT=18094
+RETRY_ARM_APP=frz-retry-arm
+RETRY_ARM_USER=frz-retry-arm
+RETRY_ARM_UNIT=frz-retry-arm.service
+RETRY_DB=/var/lib/opsd-root/opsd.db
+
+# ops_on 数出某个应用名下的操作行数。端口上没有「列出全部操作」的方法，而这里要断言的
+# 正是「库里的行数没有变」——只看单个操作证明不了没有多出一行。
+# runtime.* 的 resource 是规范化后的应用 ID，所以要从 applications 表取。
+ops_on() { # app-name
+  q sqlite3 "${RETRY_DB}" \
+    "SELECT COUNT(*) FROM operations WHERE resource IN (SELECT id FROM applications WHERE name = '${1}');"
+}
+
+last_op_state() { # app-name
+  q sqlite3 "${RETRY_DB}" \
+    "SELECT status FROM operations WHERE resource IN (SELECT id FROM applications WHERE name = '${1}') ORDER BY created_at DESC, id DESC LIMIT 1;"
+}
+
+first_op_code() { # app-name
+  q sqlite3 "${RETRY_DB}" \
+    "SELECT COALESCE(error_code, '') FROM operations WHERE resource IN (SELECT id FROM applications WHERE name = '${1}') ORDER BY created_at, id LIMIT 1;"
+}
+
+# wait_for_chain 等到行数达到 want，且最后一跳已经进入终态。
+# 只数行数不够：行数会在最后一跳还在 pending 时就达到预期。
+wait_for_chain() { # app-name want-count
+  local state
+  for _ in $(seq 1 60); do
+    if [ "$(ops_on "${1}")" = "${2}" ]; then
+      state=$(last_op_state "${1}")
+      case "${state}" in
+        pending | running) ;;
+        *) return 0 ;;
+      esac
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# write_retry_spec 为 check_retry 造一份探针 manifest。
+# listen 是探针真正监听的地址，target 是 manifest 声明的就绪目标；两者不同就构成
+# 「进程活着但永远不就绪」，夹具 1 要的正是这个形态。
+write_retry_spec() { # 目标文件 app user unit port artifact listen target start-timeout
+  cat > "$1" <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: $2
+runtime: go
+artifact:
+  id: $6
+exec:
+  argv:
+    - /opt/frz-ops/frz-probe
+    - --report
+    - /var/lib/$2/probe-report.txt
+    - --listen
+    - $7
+  workingDirectory: /var/lib/$2
+  runUser: $3
+  ports:
+    - $5
+health:
+  readiness:
+    type: tcp
+    target: $8
+  startTimeoutSeconds: $9
+  stopTimeoutSeconds: 30
+logs:
+  directory: /var/log/$2
+systemd:
+  unitName: $4
+  restartPolicy: on-failure
+MANIFEST
+}
+
+check_retry() {
+  log "迭代 1d：runtime.* 的重试与 systemd Restart= 不得叠加（Linux 容器证据）"
+
+  # 需要直接查库。镜像里没装 sqlite3 时给出可执行的修复方式，而不是让断言给出
+  # 一个看不懂的失败——复用旧镜像是最容易踩到的坑。
+  if [ -z "$(q command -v sqlite3)" ]; then
+    fail "镜像里没有 sqlite3，无法查库断言行数；请用 --rebuild 重建镜像"
+    return 0
+  fi
+
+  local artifact
+  artifact=$(rq artifact put /opt/frz-ops/frz-probe --media-type application/octet-stream --json |
+    sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${artifact}" ]; then
+    fail "retry 组的制品上传失败"
+    return 0
+  fi
+
+  # ---------------- 夹具 1：就绪永远不会通过 ----------------
+  #
+  # 这条夹具在实现过程中**改掉过一次前提**，值得说明：1d 规格 D6 原先写「runtime.start
+  # 只有在就绪从未通过时才失败」，容器实跑证明这个前提**不成立**——适配器的 Start 根本
+  # 不等就绪（只做 systemctl start 就返回），就绪超时只在 Health 里判定。
+  #
+  # 于是这里断言的是**真实语义**，它恰好也是 D6 想要的结论：就绪失败**不会**变成操作级
+  # 重试，因为那条操作早就成功了——没有失败，就没有可重试的东西。
+  log "夹具 1：就绪永远不会通过（失败发生在 Health，不在 Start）"
+  # 探针监听 RETRY_BAD_PORT，manifest 却把就绪目标指向一个没人监听的端口：
+  # 进程活着、unit 是 active，但就绪永远不通过。
+  write_retry_spec "$WORK_DIR/retry-bad.yaml" "${RETRY_BAD_APP}" "${RETRY_BAD_USER}" \
+    "${RETRY_BAD_UNIT}" "${RETRY_BAD_PORT}" "${artifact}" \
+    "127.0.0.1:${RETRY_BAD_PORT}" "127.0.0.1:${RETRY_DEAD_PORT}" 5
+  docker cp "$WORK_DIR/retry-bad.yaml" "$CID:/opt/frz-ops/retry-bad.yaml"
+  in_container chmod 0644 /opt/frz-ops/retry-bad.yaml
+
+  require_ok "retry 夹具 1：注册应用" runtimectl app create "${RETRY_BAD_APP}"
+  require_ok "retry 夹具 1：提交 manifest" runtimectl spec put \
+    --app "${RETRY_BAD_APP}" --file /opt/frz-ops/retry-bad.yaml
+
+  local bad_out bad_id
+  bad_out=$(rq runtime start --app "${RETRY_BAD_APP}" --retry-max 2 --retry-base 1s --json)
+  bad_id=$(printf '%s' "${bad_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${bad_id}" ]; then
+    fail "retry 夹具 1：runtime start 未返回 operation id：${bad_out}"
+    return 0
+  fi
+  if wait_for_status "${bad_id}" "succeeded" "${RUNTIME_SOCK}"; then
+    pass "Start 不等就绪：就绪不通过也不妨碍 runtime.start 成功"
+  else
+    fail "runtime.start 未在超时内成功（当前状态 $(last_op_state "${RETRY_BAD_APP}")）"
+  fi
+  assert_eq "unit 确实是 active（进程活着，就是没就绪）" "active" \
+    "$(q systemctl is-active ${RETRY_BAD_UNIT})"
+
+  # 等过 startTimeoutSeconds=5，再问健康：失败**只**在这里发生。
+  sleep 6
+  local health_code=0
+  in_container /opt/frz-ops/opsctl --socket "${RUNTIME_SOCK}" runtime health \
+    --app "${RETRY_BAD_APP}" >/dev/null 2>&1 || health_code=$?
+  assert_eq "就绪从未通过时 runtime health 的退出码（19=RUNTIME_NOT_READY）" "19" "${health_code}"
+
+  # D6 的核心结论之一：就绪失败不是操作失败，因此**不该**冒出重试行。
+  assert_eq "就绪失败不得产生操作级重试（链上仍只有一行）" "1" "$(ops_on "${RETRY_BAD_APP}")"
+
+  # ---------------- 夹具 2：runtime.* 的重试确实被武装 ----------------
+  #
+  # 夹具 1 证明的是「不该重试的地方没有重试」，它只有在「该重试的地方确实会重试」成立时
+  # 才有意义。所以这里造一个**真实且可重试**的运行时操作失败：Stop 一个从未 Prepare 的
+  # 应用——适配器的 prepared() 会返回 RUNTIME_NOT_READY，而这个码在默认白名单里。
+  log "夹具 2：runtime.* 的重试确实被武装（Stop 一个从未 Prepare 的应用）"
+  write_retry_spec "$WORK_DIR/retry-arm.yaml" "${RETRY_ARM_APP}" "${RETRY_ARM_USER}" \
+    "${RETRY_ARM_UNIT}" "${RETRY_DEAD_PORT}" "${artifact}" \
+    "127.0.0.1:${RETRY_DEAD_PORT}" "127.0.0.1:${RETRY_DEAD_PORT}" 5
+  docker cp "$WORK_DIR/retry-arm.yaml" "$CID:/opt/frz-ops/retry-arm.yaml"
+  in_container chmod 0644 /opt/frz-ops/retry-arm.yaml
+
+  require_ok "retry 夹具 2：注册应用" runtimectl app create "${RETRY_ARM_APP}"
+  require_ok "retry 夹具 2：提交 manifest（刻意不 Prepare）" runtimectl spec put \
+    --app "${RETRY_ARM_APP}" --file /opt/frz-ops/retry-arm.yaml
+
+  local arm_out arm_id
+  arm_out=$(rq runtime stop --app "${RETRY_ARM_APP}" --retry-max 2 --retry-base 1s --json)
+  arm_id=$(printf '%s' "${arm_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${arm_id}" ]; then
+    fail "retry 夹具 2：runtime stop 未返回 operation id：${arm_out}"
+    return 0
+  fi
+
+  if wait_for_chain "${RETRY_ARM_APP}" 2; then
+    pass "runtime.* 声明重试后确实排出了第二次尝试（链上 2 行）"
+  else
+    fail "runtime.* 声明重试后没有排出第二次尝试（链上 $(ops_on "${RETRY_ARM_APP}") 行）"
+  fi
+  assert_eq "首次失败的原始错误码" "RUNTIME_NOT_READY" "$(first_op_code "${RETRY_ARM_APP}")"
+  assert_eq "maxAttempts=2 时链上恰好两行" "2" "$(ops_on "${RETRY_ARM_APP}")"
+
+  # ---------------- 夹具 3：就绪会通过，然后在运行中被杀 ----------------
+  #
+  # 这是 D6 的另一半，也是本组最要紧的一条：unit 的 Restart= 已经在进程级重启，
+  # opsd **不得**再叠一层操作级重试。判据是链上始终只有一行。
+  log "夹具 3：已就绪过再被 SIGKILL（由 unit 的 Restart= 接管）"
+  write_retry_spec "$WORK_DIR/retry-ok.yaml" "${RETRY_OK_APP}" "${RETRY_OK_USER}" \
+    "${RETRY_OK_UNIT}" "${RETRY_OK_PORT}" "${artifact}" \
+    "127.0.0.1:${RETRY_OK_PORT}" "127.0.0.1:${RETRY_OK_PORT}" 60
+  docker cp "$WORK_DIR/retry-ok.yaml" "$CID:/opt/frz-ops/retry-ok.yaml"
+  in_container chmod 0644 /opt/frz-ops/retry-ok.yaml
+
+  require_ok "retry 夹具 3：注册应用" runtimectl app create "${RETRY_OK_APP}"
+  require_ok "retry 夹具 3：提交 manifest" runtimectl spec put \
+    --app "${RETRY_OK_APP}" --file /opt/frz-ops/retry-ok.yaml
+
+  local ok_out ok_id
+  ok_out=$(rq runtime start --app "${RETRY_OK_APP}" --retry-max 2 --retry-base 1s --json)
+  ok_id=$(printf '%s' "${ok_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${ok_id}" ]; then
+    fail "retry 夹具 3：runtime start 未返回 operation id：${ok_out}"
+    return 0
+  fi
+  if wait_for_status "${ok_id}" "succeeded" "${RUNTIME_SOCK}" &&
+    wait_for_ready "${RETRY_OK_APP}"; then
+    pass "就绪通过时 runtime start 成功且健康"
+  else
+    fail "就绪通过时 runtime start 未成功或未就绪"
+  fi
+
+  # 杀掉主进程。Restart=on-failure 会让 unit 自己把它拉回来——这正是「不该叠加」的场景。
+  in_container systemctl kill --kill-whom=main --signal=SIGKILL "${RETRY_OK_UNIT}" >/dev/null 2>&1 || true
+
+  local restarts=""
+  for _ in $(seq 1 30); do
+    restarts=$(q systemctl show -p NRestarts --value "${RETRY_OK_UNIT}")
+    if [ "${restarts:-0}" != "0" ] && [ "$(q systemctl is-active "${RETRY_OK_UNIT}")" = "active" ]; then
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "${restarts:-0}" != "0" ]; then
+    pass "进程被 SIGKILL 后 unit 由 systemd 重启（NRestarts=${restarts}）"
+  else
+    fail "进程被 SIGKILL 后 unit 没有被 systemd 重启（NRestarts=${restarts}）"
+  fi
+
+  # 等到「万一排出来的重试」也跑完的时间（base 1 秒，留 6 秒足够），
+  # 再断言链上没有多出第二行。这是 D6 的核心判据。
+  sleep 6
+  assert_eq "已就绪过再崩溃不得产生操作级重试（链上仍只有一行）" "1" "$(ops_on "${RETRY_OK_APP}")"
+
+  # 顺带证明确实是健康检查负责「重新就绪」，而不是靠再跑一次 start 操作。
+  if wait_for_ready "${RETRY_OK_APP}"; then
+    pass "重启后仍由健康检查报告就绪（没有第二条 start 路径）"
+  else
+    fail "重启后健康检查未报告就绪"
+  fi
+
+  runtimectl runtime stop --app "${RETRY_OK_APP}" >/dev/null 2>&1 || true
+  runtimectl runtime stop --app "${RETRY_BAD_APP}" >/dev/null 2>&1 || true
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -714,6 +965,9 @@ main() {
   check_artifacts_and_secrets
   check_schedules
   check_systemd
+  # 迭代 1d：runtime.* 的重试与 Restart= 不得叠加。它有自己的两个夹具应用，
+  # 但同样打在 root 实例上，因此放在 check_runtime 之前。
+  check_retry
   # 放在最后：它会故意让探针 unit 停在 failed 状态（验证缺凭据必须起不来）。
   check_runtime
 

@@ -116,7 +116,8 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 89**（2026-09-23 实跑：第 5 轮 exit 0、89 通过 / 0 失败；历史快照：1b 时点 40 项，
+当前为 106**（2026-09-24 迭代 1d 落地后实跑：106 通过 / 0 失败，其中 1c 的 `check_runtime`
+49 项、1d 的 `check_retry` 17 项；历史快照：1c 时点 89 项、1b 时点 40 项，
 A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在
@@ -133,7 +134,8 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 `github.com/freezeChen/frz-tools`；CI 于 2026-09-22 起真实执行，`test` 与 `linux-verify`
 两个 job 在干净的 ubuntu-latest runner 上均通过。**2026-09-24 起 1c 的容器断言已跑全**：
 `1168f29` 之后的运行是干净 runner 上的 **89 项通过 / 0 项失败**（此前 CI 那份只有迭代 0/1b
-的 40 项，`check_runtime` 尚未进入）。该证据因此同时覆盖 **arm64**（本地 OrbStack）与
+的 40 项，`check_runtime` 尚未进入）；迭代 1d 又补了 `check_retry`（17 项），总数到 **106**
+（本地实跑 106/0）。该证据因此同时覆盖 **arm64**（本地 OrbStack）与
 **amd64**（CI runner）两种架构。
 **`/etc/opsd` 的两条断言不是矛盾而是时序**：`check_filesystem` 里的「模式 = `750`」在
 `Prepare` **之前**（安装脚本状态），`check_runtime` 里的「`0751`」在 `Prepare` **之后**

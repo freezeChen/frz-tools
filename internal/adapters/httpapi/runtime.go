@@ -85,6 +85,7 @@ func (s *Server) createRuntimeOperation(w http.ResponseWriter, r *http.Request, 
 		DryRun:         req.DryRun,
 		IdempotencyKey: req.IdempotencyKey,
 		CreatedBy:      req.CreatedBy,
+		Retry:          req.Retry,
 	})
 	if err != nil {
 		writeError(w, s.logger(), err)

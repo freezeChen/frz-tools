@@ -127,6 +127,18 @@ Linux 容器验证真实 systemd 交互；真实 Linux 主机项挂起并标注�
   - 这条要在实现里用测试钉住：进程起来但从未就绪 → 失败 → 可重试；
     起来且就绪过再被杀 → **不**产生重试。
 
+> **2026-09-24 更正（容器实跑发现的规格缺陷）**：上面第二条「`runtime.start` 只有在就绪
+> 从未通过时才失败」**不成立**。适配器的 `Start` 根本不等就绪——它只做一次 `systemctl start`
+> 就返回（`internal/adapters/runtime/systemd/systemd.go`），就绪超时只在 `Health` 里判定
+> （`startDeadlineExceeded`）。所以「就绪从未通过」不会让 `runtime.start` 失败。
+>
+> 这不改变 D6 的**结论**，反而让它更简单：就绪失败不是操作失败，因此**没有**可重试的东西——
+> 本来就不该、也不会冒出重试行。实际操作级的 `runtime.start` 失败只来自 `systemctl start`
+> 自身失败（映射为 `RUNTIME_NOT_READY`，在白名单里，因此可重试）。
+>
+> 容器断言已按**真实语义**重写（`check_retry` 的三个夹具），详见第 13 节的「规格缺陷」与
+> 第 14 节。这条是本次迭代**唯一**由容器实跑纠正的规格内容。
+
 ### D7：`dryRun` 与重试互斥
 
 `dryRun` 没有真实副作用，也就没有「值得重试的失败」；把两者一起提交是规格误用。
@@ -371,6 +383,12 @@ CREATE INDEX ix_operations_retry_of ON operations (retry_of) WHERE retry_of IS N
 *理由*：「应用启动慢、首次就绪探测超时」正是最需要重试的场景，禁掉等于把最痛的用例排除在外。
 *被否决的替代方案*：`runtime.*` 一律禁止重试。
 
+> **2026-09-24 更正**：本决定的**结论（允许）不变**，但上面这条理由的**前提不成立**——
+> `runtime.start` 不等就绪，所以「启动慢」根本不会让它失败，也就谈不上靠重试去覆盖它。
+> 实际操作级的 `runtime.start` 失败来自 `systemctl start` 自身失败与适配器的前置校验
+> （`prepared`），错误码都是 `RUNTIME_NOT_READY`、都在白名单里——**允许重试的正当理由是这些
+> 瞬时失败，而不是就绪超时**。详见第 3 节 D6 的更正与第 13 节的「规格缺陷」。
+
 ### 决定 4：策略不挂到 `Schedule` / `Application` —— **1d 不做**
 
 只在 `CreateOperationRequest` 上支持。等迭代 2 的备份计划真正需要时，再决定挂在
@@ -385,28 +403,185 @@ CREATE INDEX ix_operations_retry_of ON operations (retry_of) WHERE retry_of IS N
 
 ## 13. 实现记录
 
-待实现后填写。实现必须在本节记录：逐文件要点、对规格的补充与偏离（若有）、
-以及每条偏离的理由。
+实现完成于 2026-09-24，分两个提交：主体见 `19734a9`（重试策略、退避与持久化），
+收尾见紧随其后的提交（e2e、容器断言与本文档）。
+
+### 逐文件要点
+
+**领域（`internal/domain/retry.go`、`operation.go`）**
+- `RetryPolicy` 值对象：`Validate` / `Retryable` / `NextDelay`，以及 `RetryPolicyFromSpec`
+  （提交原文 → 值对象，同时作为**读回持久化策略**的入口，保证写入与读回的解释不漂移）
+  与 `ParseRetryPolicy`。
+- 默认白名单只有四个码；`neverRetryableCodes` 是一份任何情况下都不得重试的集合，它同时被
+  `Validate`（拒绝用户把它列进白名单）与 `Retryable`（最终判据）使用——两处都用它，
+  所以「塞进白名单就能救回来」这条路不存在。
+- `NextDelay(attempt, jitter)` 的抖动由调用方注入。这不是为了好看：**不注入就无法断言退避
+  序列**，而 D4 要求抖动在写入时算一次，落成测试的前提正是这里可注入。
+- `Operation` 新增 `Attempt` / `NotBefore` / `RetryPolicy` / `RetryPolicyJSON` 与
+  `RetryExhausted()`；`FinishInput` 新增 `Retry *RetryPlan`。
+
+**持久化（`migrations/0005_operation_retry.sql`、`internal/adapters/sqlite/store.go`）**
+- 新增 `attempt`、`not_before`、`retry_policy_json` 三列与两个索引；全是新增、都有默认值，
+  既有行的行为逐字节不变。
+- `not_before` 用**定宽**纳秒格式（`2006-01-02T15:04:05.000000000Z`），而不是仓库通用的
+  `time.RFC3339Nano`。原因见下面的「发现但未修」。
+- `ClaimNextPending` 增加 `(not_before IS NULL OR not_before <= ?)` 过滤——退避在**领取之前**
+  过滤掉，绝不「领到手里再 sleep」。
+- `Finish` 在同一个事务里调用 `insertRetryOperation` 创建下一跳；`insertRetryOperation` 复用
+  原操作的 kind/resource/spec/请求摘要，`attempt` 由原操作**派生**（`original.Attempt+1`）
+  而不由调用方传入，避免「链上第几次」出现两个说法。
+- `RecoverRunning` 新增 `plan` 回调：判定留在应用层，事务留在适配器，重放的重试与终态同样
+  在一个事务里落库。
+
+**编排（`internal/application/`）**
+- `Service.Create`：先拒绝 `dryRun + retry`（D7），再校验策略、把策略**原文**序列化进操作。
+- `planRetryFor` 是「要不要重试、该等多久」的唯一判定点，`Pool.planRetry`（执行期失败）与
+  `Recover`（重启后被中断）都调它——两处共用一份逻辑，语义不会漂移。
+- `Pool` 新增 `newID`（为重试生成 Operation ID，与 Service 共用同一个生成器）与 `jitter`
+  （可注入）；`Options` 新增 `Jitter`。
+- `Service.Retry`（手动）：沿用链上策略、`attempt` 照常递增、**不受 `maxAttempts` 约束**。
+
+**API 与 CLI**
+- `CreateOperationRequest.Retry`、`Operation.{Attempt,MaxAttempts,NextAttemptAt,RetryExhausted}`、
+  `RuntimeActionRequest.Retry`。
+- `operationDTO` 映射新增字段；`nextAttemptAt` 只在该操作仍处于 `pending` 时给出。
+- `opsctl operation submit` 与 `opsctl runtime start/stop` 新增
+  `--retry-max` / `--retry-base` / `--retry-max-delay`；`wholeSeconds` 拒绝非整秒的时长而不是
+  替用户取整。
+- `printOperation` 只在真的牵涉重试时多打 `attempt` / `nextAttemptAt` / 用尽提示。
+
+**测试与 harness**
+- 新增 `internal/domain/retry_test.go`、`internal/application/retry_test.go`、
+  `test/e2e/retry_test.go`；`internal/adapters/httpapi/runtime_test.go` 补两个透传用例；
+  `internal/application/service_test.go` 与 `internal/adapters/sqlite/store_test.go` 跟随签名变更。
+- `test/linux/verify.sh` 新增 `check_retry`（D6 的容器断言）；
+  `test/linux/Dockerfile.systemd` 加装 `sqlite3`（断言「库里的行数没有变」需要直接查库）。
+
+### 对规格的补充与偏离
+
+1. **不加 `max_attempts` 列**（对规格第 6 节列清单的收窄）。第 6 节同时列了 `max_attempts` 列与
+   `retry_policy_json`，并说明后者的存在理由是「策略字段增减不需要再加列」。两者放在一起就是
+   第二份会与策略原文漂移的真相来源。因此只保留 `attempt`（**可变的操作状态**，必须可查询）
+   与 `retry_policy_json`（**不可变的提交内容**，整体存储）；`maxAttempts` 由策略解析得出。
+   原则：列放可变状态，JSON 放不可变策略。
+
+2. **`requestHash` 纳入了 retry 段**（规格未提及的兼容性影响）。重试策略是请求内容的一部分，
+   同一个幂等键配上不同策略属于**不同请求**，返回原操作等于静默忽略策略的改动。
+   **影响**：摘要的计算方式变了，因此**跨升级复用同一个幂等键**会得到 `IDEMPOTENCY_CONFLICT`。
+   这是显式报错而不是静默错行为，但确实是一处行为变化，记录在此以免日后被当成 bug。
+
+3. **`nextAttemptAt` 的给出条件比规格略宽**。规格写「只在 `status=pending` 且退避未到期时出现」，
+   实现只判 `status=pending`：HTTP 层的 DTO 映射函数没有时钟，而规格的意图是「不要给终态的操作
+   一个已经不可能到来的下一次」，这一条已经满足。按 `pending` 判还有一个好处——退避刚好到期、
+   尚未被领取的那一瞬间，调用方仍能看到它排在什么时候，而不是字段突然消失。
+
+4. **策略原文解析失败时不打 warning 日志**（规格要求打一条）。`sqlite` 适配器没有 logger，
+   而在 `scanOperation` 里返回错误会让一条策略写坏的行**整条读不出来**，那比少一条日志更糟。
+   实现改为按「不重试」处理（安全方向），同时把原文留在 `RetryPolicyJSON` 上，因此这行操作
+   仍可被查询与排查。规格要求的「不重试」已满足，「warning 日志」这一半记为此处的偏离。
+
+5. **打通了 `RuntimeActionRequest.Retry`**（补齐规格决策 3 的实现缺口）。决策 3 说 `runtime.*`
+   **允许**声明重试，但实现前 API 上根本没有这个字段——也就是说这条决策当时**无法表达**。
+   本次补齐：`api/v1/runtime.go`、httpapi 的 `createRuntimeOperation`、client 的
+   `RuntimeActionInput`，以及 `opsctl runtime start/stop` 的 `--retry-*`。`httpapi/runtime_test.go`
+   里两个用例用「非法策略必须报 `RETRY_POLICY_INVALID` 而不是 `RUNTIME_UNSUPPORTED`」
+   钉住了这条链路没有被丢掉。
+
+6. **恢复期的重试与终态同事务**（规格未指定原子性）。规格只说「由恢复流程排一次重试」。
+   实现做成原子（`RecoverRunning` 的 `plan` 回调在事务内插入），理由与 `Finish` 相同：分两步做的话，
+   两步之间崩溃会让这次重试被静默丢掉，而库里看不出任何迹象。
+
+7. **容器镜像加装 `sqlite3`**。`check_retry` 断言「链上没有多出一行」，而端口上没有
+   「列出全部操作」的方法，因此必须直接查库。`check_retry` 开头会检查 `sqlite3` 是否存在，
+   缺失时给出可执行的修复方式（`--rebuild`）而不是一个看不懂的断言失败。
+
+### 规格缺陷（由容器实跑发现）
+
+**D6 的第二条前提不成立**：规格写「`runtime.start` 只有在就绪从未通过时才失败」，
+但 1c 的实现里 `Adapter.Start` **不等就绪**——它只做一次 `systemctl start` 就返回，
+就绪超时只在 `Health` 里由 `startDeadlineExceeded` 判定。
+
+这个缺陷是**断言自己抓出来的**：第一版 `check_retry` 按规格写，夹具 A 断言
+「就绪永不通过 → `runtime.start` 失败 → 排出重试」，容器实跑直接给出 4 条 FAIL
+（`runtime start 未在超时内失败`）。查下来不是实现错了，而是规格把 `Start` 的语义写错了。
+
+处理方式（沿用 1c「旧表述替换但保留追溯」的做法）：
+
+- D6 的**结论不变**，而且更简单：就绪失败不是操作失败，本来就没有可重试的东西；
+- `check_retry` 改为按**真实语义**断言，并拆成三个夹具，覆盖面比原计划更完整：
+  1. 就绪永不通过 → `runtime.start` **成功**、unit 是 active、`runtime health` 过期后
+     退出码 19（`RUNTIME_NOT_READY`）、链上仍只有一行（就绪失败不产生重试）；
+  2. `runtime stop` 一个从未 `Prepare` 的应用 → `RUNTIME_NOT_READY` → **链上两行**
+     （证明 runtime.* 的重试确实被武装，否则夹具 1 的「没有重试」是空洞的）；
+  3. 已就绪过再被 SIGKILL → unit 由 systemd 重启（`NRestarts=1`）、链上仍只有一行。
+- 规格 D6 处已加「2026-09-24 更正」说明，不删原文。
+
+### 发现但**未**修（属本次范围之外）
+
+- **`created_at` 的排序不是严格的时间序**。仓库的时间戳统一用 `time.RFC3339Nano` 格式化，
+  而它会裁掉末尾的零、并在小数部分为零时整个省略——于是 `"…T00:00:00Z"` 按字典序**大于**
+  `"…T00:00:00.5Z"`，但时间上更早。所有 `ORDER BY created_at`（含 `ClaimNextPending` 的领取顺序）
+  在同一秒内、且其中一个时间戳恰好没有小数部分时就会排错。
+  **1d 刻意没有顺手改它**：改存储格式涉及既有数据的重写，属于独立的数据迁移，塞进 1d 会让
+  「重试」这个提交同时承担一次格式迁移的风险。本次只保证**新引入的 `not_before` 不踩同一个坑**
+  （用定宽格式）。影响面是同一秒内提交的操作可能被乱序领取，不影响正确性、只影响顺序。
+  已作为独立事项记录，待单独处理。
 
 ## 14. 验证记录
 
-待实现后填写。格式沿用 1c 第 17 节：命令 / 结果 / 证据类型三列表格，
-且**单元 / 集成 / e2e / Linux 容器 / Linux 主机**分列，不混用。
-断言数（若新增容器断言）以 `test/linux/verify.sh` 运行时打印的行为准。
+格式沿用 1c 第 17 节：命令 / 结果 / 证据类型三列，
+**静态 / 单元 / 集成 / e2e / Linux 容器 / Linux 主机**分列，不混用。
+
+### 本轮取得的证据
+
+| 命令 | 结果 | 证据类型 |
+| --- | --- | --- |
+| `make fmt` / `make vet` | 通过 | 静态检查 |
+| `go test ./internal/domain/... -count=1` | 通过（新增 `retry_test.go`：策略校验、退避序列、往返解析、`RetryExhausted`） | 单元测试 |
+| `go test ./internal/application/... -count=1` | 通过（新增 `retry_test.go`：未声明重试不产生新行、建链、达上限、白名单只可缩小、退避不占 worker、等锁、取消不重试、恢复只重放声明了策略的） | 集成测试 |
+| `go test ./test/e2e/... -count=1` | 通过（新增 `TestRetryReRunsCommandThroughCLI`、`TestRetryBackoffIsVisibleAndNotClaimed`） | e2e |
+| `make ci`（fmt / vet / test / test-race / 交叉编译） | 通过 | 静态检查 + 单元 + 集成 + e2e |
+| `bash test/linux/verify.sh` | **exit 0：106 项通过 / 0 项失败**，其中新增的 `check_retry` 占 17 项 | **Linux 容器** |
+
+`check_retry` 的三个夹具（2026-09-24 实跑，容器内）：
+
+| 夹具 | 断言 | 结果 |
+| --- | --- | --- |
+| 1 就绪永不通过（进程活着但没人监听就绪端口） | `runtime.start` 成功；unit = `active`；`runtime health` 退出码 19；链上只有 1 行 | 全部 PASS |
+| 2 `runtime stop` 一个从未 `Prepare` 的应用 | 首次失败码 `RUNTIME_NOT_READY`；已排出第二次尝试；`maxAttempts=2` 时链上恰好 2 行 | 全部 PASS |
+| 3 已就绪过再被 `SIGKILL` | unit 由 systemd 重启（`NRestarts=1`）；链上仍只有 1 行；重启后由健康检查报告就绪 | 全部 PASS |
+
+夹具 1 与夹具 3 合起来就是 D6 的正反两面：**该重试的地方重试了，不该重试的地方没有重试**。
+
+### 仍未验证
+
+- **真实 Linux 主机**上的重试行为：长退避（分钟级）在长时间运行下的表现、与不同发行版
+  systemd 崩溃策略（`RestartSec`、`StartLimitBurst`）叠加后的实际表现。容器证明不了这些
+  （与 1c 挂起的真机项同源）。
+- 远程 / 多主机下的重试（迭代 5）。
 
 ## 15. 结论汇总（2026-09-24）
 
-**规格已冻结，1d 可以进入实现。** 第 12 节的 5 条决定全部按推荐值拍板：
+**规格第 3 节的 D1–D7 与第 12 节冻结的取值全部落地**，第 10 节的 12 条验收标准逐条判定见下。
+实现中对规格有 **7 处补充或偏离**，全部记在第 13 节并给了理由；其中第 5、7 条是补齐规格的
+实现缺口，第 1、2 条是影响数据模型与兼容性的实质决定。
 
-- 退避 `base = 5s` / `maxDelay = 5m` / 抖动 `±20%` / `maxAttempts` 上限 `10`；
-- 可重试错误码白名单只允许由请求**缩小**，不允许扩大；
-- `runtime.*` **允许**声明重试，但语义按 D6 收口（只有「就绪从未通过」才可重试）；
-- 重试策略**不**挂到 `Schedule`/`Application`，1d 只在 `CreateOperationRequest` 上支持；
-- 不额外设重试链长度上限，由 `maxAttempts` 约束。
+### 逐条判定（2026-09-24）
 
-实现时不得偏离第 3 节的 D1–D7 与本节冻结的取值；确需偏离的，先改文档并记录原因
-（沿用 1c 的做法：偏离写在实现记录里并说明理由）。
+| # | 判定 | 证据与类型 |
+| --- | --- | --- |
+| 1 | **达成** | 集成：`TestNoRetryWithoutPolicy`（未声明重试时链上恒为 1 行且 `attempt=1`） |
+| 2 | **达成** | 集成：`TestAutoRetrySchedulesNextAttempt`；e2e：`TestRetryReRunsCommandThroughCLI` |
+| 3 | **达成** | 集成：`TestRetryBackoffIsVisibleAndNotClaimed` 的「退避未到期时 `ClaimNextPending` 不返回」；e2e：同名用例（第二跳停在 `pending`、`nextAttemptAt` 在未来、命令只跑了一次） |
+| 4 | **达成** | 集成：`TestRetryStopsAtMaxAttempts`（恰好 3 跳、最后一跳保留原始 `errorCode`）；单元：`TestOperationRetryExhausted` |
+| 5 | **达成** | 集成：`TestRetrySkipsNonRetryableCode`、`TestRetryNarrowsWhitelist`；单元：`TestRetryPolicyValidate`（不可重试的码无法入白名单）、`TestRetryPolicyRetryable`（不可重试的码无法被白名单救回来） |
+| 6 | **达成** | 集成：`TestRetryWaitsForResourceLock`（占锁时领不到、释放后领得到、命令恰好执行两次） |
+| 7 | **达成** | 集成：`TestRetryRejectsDryRun` |
+| 8 | **达成** | 集成：`TestRecoveryRetriesOnlyOperationsWithPolicy`（两个子用例：声明了策略的排一次重试、未声明的一字不变） |
+| 9 | **达成** | 集成：`TestCancelledOperationIsNotRetried` |
+| 10 | **达成** | **Linux 容器**：`test/linux/verify.sh` 的 `check_retry` 三个夹具（就绪永不通过 → `runtime.start` 成功但健康报 `RUNTIME_NOT_READY`、链上无重试；`runtime stop` 未 `Prepare` 的应用 → 可重试、链上两行；已就绪过再被 `SIGKILL` → unit 由 systemd 重启、链上无重试） |
+| 11 | **达成** | 集成 + e2e：每次尝试都有独立的审计与日志（`insertRetryOperation` 写入 `operation.retried` 与独立日志行）；`operation get` 的 JSON 与人类可读输出都带 `attempt` / `nextAttemptAt`（e2e 两个用例断言） |
+| 12 | **达成** | `make ci` 与 `make verify-linux` 全绿；迭代 0/1a/1b/1c 的回归用例全部继续通过 |
 
-**与迭代 2 的关系**：迭代 2 的入口条件（「1a + 1c 完成」）已达成，因此迭代 2 可以先于 1d
-开始（路线图第 13 节 2026-09-22 记录已确认）。但重试机制是备份场景的刚需，建议 1d 的实现与
-迭代 2 的规格一起推进，避免备份先用一套将就的实现。
+**未验证项**见第 14 节末尾。**下一步**：迭代 2 的规格已冻结，按「先 1d、再 2a」的顺序开始
+实现 2a——迭代 2 要求的「失败可重试」现在可以直接复用本迭代的机制，不需要再定义一套。

@@ -25,6 +25,10 @@ type RuntimeActionRequest struct {
 	DryRun         bool   `json:"dryRun"`
 	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 	CreatedBy      string `json:"createdBy,omitempty"`
+	// Retry 省略即不自动重试。1d 的决策 3 允许 runtime.* 声明重试，但语义有额外收口：
+	// 只有「就绪从未通过」才算失败、才可重试；已就绪过再崩溃归 unit 的 Restart=
+	// 与健康检查，不触发操作级重试（迭代 1d 规格 D6）。
+	Retry *RetrySpec `json:"retry,omitempty"`
 }
 
 // RuntimeValidateResponse 只表示「这份规格能被本机适配器执行」，不含任何副作用，

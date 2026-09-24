@@ -39,6 +39,9 @@ func (c *Client) RuntimeHealth(ctx context.Context, appRef string) (*v1.RuntimeH
 type RuntimeActionInput struct {
 	IdempotencyKey string
 	CreatedBy      string
+	// Retry 为 nil 表示不自动重试。runtime.* 允许声明重试，但只有「就绪从未通过」
+	// 才算失败、才可重试（迭代 1d 规格 D6）。
+	Retry *v1.RetrySpec
 }
 
 // StartRuntime 创建 runtime.start 操作；返回的 Operation 可用既有的 operation 命令查询。
@@ -53,7 +56,7 @@ func (c *Client) StopRuntime(ctx context.Context, appRef string, in RuntimeActio
 func (c *Client) runtimeAction(ctx context.Context, appRef, action string, in RuntimeActionInput) (*v1.Operation, bool, error) {
 	var out v1.OperationResponse
 	created, err := c.doWithStatus(ctx, http.MethodPost, runtimePath(appRef, action), nil,
-		v1.RuntimeActionRequest{IdempotencyKey: in.IdempotencyKey, CreatedBy: in.CreatedBy}, &out)
+		v1.RuntimeActionRequest{IdempotencyKey: in.IdempotencyKey, CreatedBy: in.CreatedBy, Retry: in.Retry}, &out)
 	if err != nil {
 		return nil, false, err
 	}
