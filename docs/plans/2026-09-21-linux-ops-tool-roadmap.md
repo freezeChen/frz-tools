@@ -532,6 +532,43 @@
   文件备份适配器、元数据持久化、`backup run|list|verify`）。迭代 2 要求的「失败可重试」
   现在直接复用本迭代的机制。
 
+### 2026-09-24（补记六）迭代 2a 实现完成；2c 并入 2a
+
+- **变更原因**：按已冻结的迭代 2 规格实现 2a。实现过程中发现规格的**里程碑拆分与验收标准
+  自相矛盾**，向用户提出两个选项并采纳了 A（见下）。实现记录与验证记录见
+  `docs/plans/2026-09-21-iteration-2.md` 第 13、14 节。
+- **2c 并入 2a（决定 A，用户拍板）**：规格原把传输编码（压缩 / AES-256-GCM 加密 / 摘要 /
+  原子提交）放在 2c，但与 2a 的验收标准冲突——标准 #3 要求「内容寻址」，而摘要不可能不在 2a
+  （`StorageBackend.Put` 本来就必须收 digest，`backups.storage_digest` 也是 schema 的一部分）；
+  标准 #10 关于加密失败的要求在加密未实现时无意义；且**加密默认开启**，不做加密的 2a
+  交付的东西在默认配置下根本跑不起来。因此 **2c 里程碑取消**。剩余里程碑为
+  **2b（PostgreSQL/MySQL 适配器）与 2d（GFS 保留与 prune）**。
+- **交付**（五个提交）：`BackupPolicy` 模型与解析、`BackupAdapter` 端口与共享合约测试、
+  文件备份适配器、migration `0006`（`backup_policies` / `backups`）、传输编码
+  （`internal/backupcodec`：先压缩后加密、AES-256-GCM 分块、分块序号进 AAD、零长度收尾块）、
+  备份编排（`io.Pipe` 流水线、逻辑/落盘字节数分开记）、`backup.run|verify|restore` 走 Operation、
+  API+CLI、以及 `Schedule.operationKind`（D6）。
+- **独立存储根（D5）**：`backupStore.root` 与 `artifactStore.root` 分开、配额各自计数。
+  这条是**防数据丢失**的结构性要求——1a 的制品 GC 把「digest 不在 artifacts 表里」一律当
+  孤儿删除，共用根会让 `artifact gc` 删掉**全部**备份。e2e 与容器断言都直接钉了它。
+- **对 1d 一条冻结决定的修订**：备份失败以 `BACKUP_*` 呈现，而 1d 的重试白名单里没有它们，
+  因此备份实际上**永远不会自动重试**——而路线图要求备份「标记失败并可重试」。增补
+  `BACKUP_PREFLIGHT_FAILED` 与 `BACKUP_VERIFY_FAILED`，**不加**配置/用户错误那两个。
+  已在 1d 文档第 3 节 D3 的表格里就地注明，不删原文。
+- **两处由测试抓出的真实缺陷**：`FinishBackup` 把备份 ID 填进了有外键约束的
+  `audit_events.operation_id`；`prepareDirectories` 把未配置的 `backupStore.root`（空串）
+  交给 `MkdirAll`，使「功能没启用」变成「守护进程起不来」。
+- **一处规格表述需精确化**：加密流每块用独立随机 nonce（GCM 的正确用法，改不得），
+  因此**同一份内容加密两次得到不同 digest**——「同内容同 digest」只在未加密时字面成立。
+  加密开启时不做去重是所有带客户端加密的备份系统的共同取舍，已写进 2a 的判定表与实现记录。
+- **验收**：第 10 节 12 条标准逐条判定见 2a 文档；其中第 9 条只实现了数据侧判据
+  （`Usable()`），`prune` 命令属 2d、**未实现**。容器断言由 106 项增至 **118 项**
+  （新增 `check_backup` 12 项），本地实跑 118/0。
+- **仍未验证**：2b/2d 的全部内容（含真实数据库实例）、真实 Linux 主机上的长时间大容量备份、
+  备份的长期可恢复性（需要真实的时间跨度）。
+- **下一步**：**2b**（PostgreSQL 与 MySQL/MariaDB 适配器）。共享合约测试已就位，
+  新适配器必须过同一套。
+
 
 ### 2026-09-24（补记五）时间列的「字符串序 ≠ 时间序」缺陷已修复
 

@@ -17,7 +17,8 @@ Makefile、CI 配置），以及 Git 提交信息。
 Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与退避。容器断言在本地与
 干净 runner 上均为 **106 通过 / 0 失败**。
 
-**迭代 2（数据库与资源备份）的规格已冻结、实现未开始**；迭代 3–5 未开始。
+**迭代 2a（备份：端口、策略模型、文件适配器、传输编码、API+CLI）已实现并验证**；
+2b（PostgreSQL/MySQL 适配器）与 2d（GFS 保留与 prune）未开始；迭代 3–5 未开始。
 **仍缺 `legacy` 档（systemd 219–239）与真实 Linux 主机的证据**，这两项不得写成已验证。
 进度与逐条证据见 `docs/plans/` 下对应迭代文档的第 13 节之后（实现记录与验证记录）。
 
@@ -117,9 +118,9 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 106**（2026-09-24 迭代 1d 落地后实跑：106 通过 / 0 失败，其中 1c 的 `check_runtime`
-49 项、1d 的 `check_retry` 17 项；历史快照：1c 时点 89 项、1b 时点 40 项，
-A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
+当前为 118**（2026-09-24 迭代 2a 落地后实跑：118 通过 / 0 失败，其中 1c 的 `check_runtime`
+49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项；历史快照：1d 时点 106 项、
+1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在
 它上面，前缀未动），另一个**以 root 运行**（配置 `test/linux/opsd.root.verify.yaml`，独立
@@ -135,8 +136,9 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 `github.com/freezeChen/frz-tools`；CI 于 2026-09-22 起真实执行，`test` 与 `linux-verify`
 两个 job 在干净的 ubuntu-latest runner 上均通过。**2026-09-24 起 1c 的容器断言已跑全**：
 `1168f29` 之后的运行是干净 runner 上的 **89 项通过 / 0 项失败**（此前 CI 那份只有迭代 0/1b
-的 40 项，`check_runtime` 尚未进入）；迭代 1d 又补了 `check_retry`（17 项），总数到 **106**
-（本地实跑 106/0，并已在干净 runner 上复现：run `35949920348` 的 `linux-verify` 106/0）。
+的 40 项，`check_runtime` 尚未进入）；迭代 1d 补了 `check_retry`（17 项）、迭代 2a 又补了
+`check_backup`（12 项），总数到 **118**（本地实跑 118/0；106 那一档已在干净 runner 上复现：
+run `35949920348` 的 `linux-verify` 106/0）。
 该证据因此同时覆盖 **arm64**（本地 OrbStack）与
 **amd64**（CI runner）两种架构。
 **`/etc/opsd` 的两条断言不是矛盾而是时序**：`check_filesystem` 里的「模式 = `750`」在

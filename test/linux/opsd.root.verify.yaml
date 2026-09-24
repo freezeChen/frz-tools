@@ -39,6 +39,15 @@ artifactStore:
   maxUploadBytes: 8388608
   quotaBytes: 16777216
 
+# 备份用**独立的**存储根：与制品共用会让 artifact gc 把备份当孤儿删掉
+# （迭代 2 规格 D5）。check_backup 里那条「跑一次制品 GC、备份内容仍在」的断言
+# 就是钉这件事的。
+backupStore:
+  root: /var/lib/opsd-root/backups
+  fileMode: "0640"
+  dirMode: "0750"
+  quotaBytes: 16777216
+
 secrets:
   allowedFileDirectories:
     - /etc/opsd/secrets

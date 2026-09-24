@@ -53,6 +53,7 @@ type daemon struct {
 	workDir      string
 	logDir       string
 	artifactsDir string
+	backupsDir   string
 	secretsDir   string
 	configPath   string
 }
@@ -86,6 +87,7 @@ func newDaemon(t *testing.T) *daemon {
 		workDir:      filepath.Join(dir, "work"),
 		logDir:       filepath.Join(dir, "log"),
 		artifactsDir: filepath.Join(dir, "artifacts"),
+		backupsDir:   filepath.Join(dir, "backups"),
 		secretsDir:   filepath.Join(dir, "secrets"),
 		configPath:   filepath.Join(dir, "opsd.yaml"),
 	}
@@ -118,12 +120,18 @@ artifactStore:
   dirMode: "0750"
   maxUploadBytes: 1048576
   quotaBytes: 16777216
+# 备份用**独立的**存储根：与制品共用会让 artifact gc 把备份当孤儿删掉。
+backupStore:
+  root: %s
+  fileMode: "0640"
+  dirMode: "0750"
+  quotaBytes: 16777216
 secrets:
   allowedFileDirectories:
     - %s
 sudo:
   allowedCommands: []
-`, d.socket, d.database, d.workDir, d.logDir, d.artifactsDir, d.secretsDir)
+`, d.socket, d.database, d.workDir, d.logDir, d.artifactsDir, d.backupsDir, d.secretsDir)
 
 	if err := os.WriteFile(d.configPath, []byte(cfg), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)

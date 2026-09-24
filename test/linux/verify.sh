@@ -208,6 +208,19 @@ provision() {
   docker cp "$WORK_DIR/probe-env-value" "$CID:/opt/frz-ops/probe-env-reference"
   in_container chmod 0600 /opt/frz-ops/probe-env-reference
 
+  # 2a 夹具：被备份的目录。内容与权限位都在 check_backup 里被断言，
+  # 因此刻意用一个不是默认值的模式（0640），让「恢复时模式错了」能被发现。
+  in_container install -d -m 0750 -o root -g root /opt/frz-ops/backup-source
+  in_container install -d -m 0750 -o root -g root /opt/frz-ops/backup-source/nested
+  in_container install -m 0640 /dev/null /opt/frz-ops/backup-source/alpha.txt
+  printf '%s' 'alpha-content-for-backup' > "$WORK_DIR/backup-alpha"
+  docker cp "$WORK_DIR/backup-alpha" "$CID:/opt/frz-ops/backup-source/alpha.txt"
+  in_container chmod 0640 /opt/frz-ops/backup-source/alpha.txt
+  in_container install -m 0600 /dev/null /opt/frz-ops/backup-source/nested/beta.bin
+  printf 'binary\000\001\002\377' > "$WORK_DIR/backup-beta"
+  docker cp "$WORK_DIR/backup-beta" "$CID:/opt/frz-ops/backup-source/nested/beta.bin"
+  in_container chmod 0600 /opt/frz-ops/backup-source/nested/beta.bin
+
   # 1c 夹具之三：kind=file 凭据的源，多行内容且刻意不以换行结尾——
   # 解析器会裁掉行尾的 CR/LF，留一个尾巴会让「逐字节一致」这条断言变成在对裁剪规则下注。
   printf '%s' '-----BEGIN FRZ KEY-----
@@ -929,6 +942,122 @@ check_retry() {
   runtimectl runtime stop --app "${RETRY_BAD_APP}" >/dev/null 2>&1 || true
 }
 
+# ==== 迭代 2a：备份（独立存储根、权限、与制品 GC 的隔离）====
+#
+# 这一组要钉的是 D5 那条**防数据丢失**的结构性要求：备份必须写在与制品分开的存储根里，
+# 因为 1a 的制品 GC 把「digest 不在 artifacts 表里」一律当作孤儿删除——共用根会让
+# `artifact gc` 删掉全部备份，而且是静默的，只有真要恢复时才会发现。
+BACKUP_POLICY=frz-backup-policy
+BACKUP_SOURCE=/opt/frz-ops/backup-source
+BACKUP_ROOT=/var/lib/opsd-root/backups
+
+check_backup() {
+  log "迭代 2a：备份的存储根、权限与与制品 GC 的隔离（Linux 容器证据）"
+
+  cat > "$WORK_DIR/backup-policy.yaml" <<POLICY
+apiVersion: ops.frz.io/v1alpha1
+kind: BackupPolicy
+name: ${BACKUP_POLICY}
+resource:
+  kind: files
+  paths:
+    - ${BACKUP_SOURCE}
+encoding:
+  compression: gzip
+  encryption:
+    enabled: false
+retention:
+  keepLast: 3
+POLICY
+  docker cp "$WORK_DIR/backup-policy.yaml" "$CID:/opt/frz-ops/backup-policy.yaml"
+  in_container chmod 0644 /opt/frz-ops/backup-policy.yaml
+
+  require_ok "提交备份策略" runtimectl backup policy put --file /opt/frz-ops/backup-policy.yaml
+
+  local run_out run_id
+  run_out=$(rq backup run --policy "${BACKUP_POLICY}" --json)
+  run_id=$(printf '%s' "${run_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${run_id}" ]; then
+    fail "backup run 未返回 operation id：${run_out}"
+    return 0
+  fi
+  if wait_for_status "${run_id}" "succeeded" "${RUNTIME_SOCK}"; then
+    pass "备份走 Operation 且成功（${run_id}）"
+  else
+    fail "备份未在超时内成功"
+    return 0
+  fi
+
+  # 落盘产物的模式与属主：备份根由 opsd 在真实文件系统上按配置强制。
+  assert_eq "备份存储根模式" "750" "$(q stat -c %a ${BACKUP_ROOT})"
+  assert_eq "备份 blobs 目录模式" "750" "$(q stat -c %a ${BACKUP_ROOT}/blobs)"
+  local blob
+  blob=$(q find ${BACKUP_ROOT}/blobs -type f | head -1)
+  if [ -z "${blob}" ]; then
+    fail "备份根下没有落盘的 blob"
+  else
+    assert_eq "备份文件模式" "640" "$(q stat -c %a ${blob})"
+    assert_eq "备份文件属主" "root" "$(q stat -c %U ${blob})"
+  fi
+
+  local backup_id
+  backup_id=$(rq backup list --json |
+    sed -n 's/.*"id": *"\(bkp_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "${backup_id}" ]; then
+    fail "backup list 里没有 bkp_ 开头的记录"
+    return 0
+  fi
+  pass "backup list 能列出刚完成的备份（${backup_id}）"
+
+  # D5 的核心断言：跑一次制品 GC，备份内容必须**完好**。
+  require_ok "制品 GC（会回收它自己根下的孤儿）" runtimectl artifact gc
+  assert_eq "制品 GC 之后备份 blob 仍在" "yes" \
+    "$(test -n "$(q find ${BACKUP_ROOT}/blobs -type f | head -1)" && echo yes)"
+
+  local verify_out verify_id
+  verify_out=$(rq backup verify "${backup_id}" --json)
+  verify_id=$(printf '%s' "${verify_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${verify_id}" ]; then
+    fail "backup verify 未返回 operation id：${verify_out}"
+    return 0
+  fi
+  if wait_for_status "${verify_id}" "succeeded" "${RUNTIME_SOCK}"; then
+    pass "制品 GC 之后备份仍能校验通过"
+  else
+    fail "制品 GC 之后备份校验失败——很可能备份内容被删了"
+  fi
+
+  # 隔离恢复：端到端能解出来，且不碰源目录。
+  local restore_out restore_id
+  restore_out=$(rq backup restore "${backup_id}" --mode isolated --json)
+  restore_id=$(printf '%s' "${restore_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${restore_id}" ]; then
+    fail "隔离恢复未返回 operation id：${restore_out}"
+    return 0
+  fi
+  if wait_for_status "${restore_id}" "succeeded" "${RUNTIME_SOCK}"; then
+    pass "隔离恢复成功（走 Operation，${restore_id}）"
+  else
+    fail "隔离恢复未在超时内成功"
+  fi
+
+  # 没有密钥的部署在**提交期**就该被拒（加密默认开启，见迭代 2 规格决定 3）。
+  cat > "$WORK_DIR/backup-enc.yaml" <<'POLICY'
+apiVersion: ops.frz.io/v1alpha1
+kind: BackupPolicy
+name: frz-backup-enc
+resource:
+  kind: files
+  paths:
+    - /opt/frz-ops/backup-source
+retention:
+  keepLast: 1
+POLICY
+  docker cp "$WORK_DIR/backup-enc.yaml" "$CID:/opt/frz-ops/backup-enc.yaml"
+  require_fail "未给密钥的策略被拒（加密默认开启）" \
+    runtimectl backup policy put --file /opt/frz-ops/backup-enc.yaml
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -968,6 +1097,8 @@ main() {
   # 迭代 1d：runtime.* 的重试与 Restart= 不得叠加。它有自己的两个夹具应用，
   # 但同样打在 root 实例上，因此放在 check_runtime 之前。
   check_retry
+  # 迭代 2a：备份的存储根、权限与与制品 GC 的隔离。
+  check_backup
   # 放在最后：它会故意让探针 unit 停在 failed 状态（验证缺凭据必须起不来）。
   check_runtime
 
