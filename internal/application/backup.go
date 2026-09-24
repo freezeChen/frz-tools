@@ -71,6 +71,17 @@ func (s *BackupService) SavePolicy(ctx context.Context, policy *domain.BackupPol
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
+	// 提交期就走一遍**适配器**的校验，而不只是领域模型的校验：
+	// 「这个 kind 本版本有没有适配器」「这份声明与工具的实际行为一致吗」
+	// （例如 postgres 的归档自带压缩、必须声明 compression: none）都是适配器才知道的事，
+	// 让它们在第一次备份跑到一半时才失败，等于把一份必然失败的策略存进库里。
+	adapter, err := s.adapterFor(policy.Resource.Kind)
+	if err != nil {
+		return nil, err
+	}
+	if err := adapter.Validate(ctx, policy); err != nil {
+		return nil, err
+	}
 	saved, err := s.repo.SaveBackupPolicy(ctx, policy, s.newID("bpl"), s.now(), updatedBy)
 	if err != nil {
 		return nil, err
@@ -203,10 +214,38 @@ func (s *BackupService) adapterFor(kind domain.BackupResourceKind) (BackupAdapte
 		return adapter, nil
 	}
 	// 用 MANIFEST_INVALID 而不是新造一个码：这是「这份 manifest 声明的资源种类在本
-	// 版本没有对应适配器」，属于对提交内容的判断。2b 加入 postgres/mysql 后自然消失。
+	// 版本没有对应适配器」，属于对提交内容的判断。
 	return nil, domain.NewError(v1.CodeManifestInvalid,
-		"resource.kind=%s 在本版本没有对应的备份适配器（2a 只有 files）", kind)
+		"resource.kind=%s 在本版本没有对应的备份适配器", kind)
 }
+
+// cleanupAdapter 释放适配器在本次操作里留下的临时资源（临时目录、隔离恢复的临时库）。
+//
+// 它**不是**保留策略：「哪些备份该删」由 GFS 决定，是通用逻辑，属于应用层（规格 D2）。
+//
+// 两处细节是有意的：
+//   - 无论成败都调用。中断路径留下的东西没有别的出口——在 2b 之前，端口的
+//     Cleanup 其实只有合约测试在调，产品路径上从来没人调过。
+//   - 用**不带取消**的上下文加一个固定超时。操作被取消时 ctx 已经死了，
+//     而收尾恰恰是取消之后最该做完的事；反过来，收尾也不该无限期挂着。
+func (s *BackupService) cleanupAdapter(ctx context.Context, adapter BackupAdapter, policy *domain.BackupPolicy, operationID string) {
+	if adapter == nil || policy == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+
+	if err := adapter.Cleanup(cleanupCtx, policy, operationID); err != nil {
+		// 清理失败**不改**操作的结果：恢复成功这件事不会因为临时库没删掉而变成失败。
+		// 但必须留下痕迹——这些残留会一直占着对端的磁盘。
+		s.logger.Warn("backup adapter cleanup failed",
+			"policy", policy.Name, "operationId", operationID, "error", err)
+	}
+}
+
+// cleanupTimeout 是收尾动作的固定预算：它发生在操作结束之后，不在任何 Operation
+// 的超时预算之内。
+const cleanupTimeout = 60 * time.Second
 
 // ---------------------------------------------------------------------------
 // 执行入口。worker 调用这三个方法，它们负责把结果落进 backups 表。
@@ -221,6 +260,7 @@ func (s *BackupService) ExecuteRun(ctx context.Context, policy *domain.BackupPol
 	if err != nil {
 		return err
 	}
+	defer s.cleanupAdapter(ctx, adapter, policy, operationID)
 
 	// 预检必须在产生任何备份产物之前完成——它的全部意义就在这里。
 	logf("info", domain.PhaseValidate, "开始预检", map[string]string{"policy": policy.Name})
@@ -379,95 +419,148 @@ func (s *BackupService) resolveKey(ctx context.Context, policy *domain.BackupPol
 //
 // 它**不接触目标资源**，因此比隔离恢复便宜得多；也正因如此，它证明不了
 // 「内容能放回去」——那要 restore。
+//
+// 两件事都在这条路径上发生，它们回答的是**不同**的问题：
+//
+//  1. 适配器的自洽性检查：「这个工具读不读得动这份备份」；
+//  2. 存储摘要核对：「存储里的字节与当初记录的 digest 一致吗」。
+//
+// 第二件是 2b 补上的（规格 D14）。在它之前，存储层按 digest **定位**文件却从不
+// **重算**摘要：`compression: none` 且不加密的备份被改坏或换掉，校验会一路通过。
+// 路线图的验收标准写的是「备份文件可通过 checksum 验证」，缺的就是这一环。
 func (s *BackupService) ExecuteVerify(ctx context.Context, backupID string, logf BackupLogf) error {
-	backup, policy, reader, err := s.openBackup(ctx, backupID)
+	opened, err := s.openBackup(ctx, backupID)
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer opened.Reader.Close()
 
-	adapter, err := s.adapterFor(policy.Resource.Kind)
+	adapter, err := s.adapterFor(opened.Policy.Resource.Kind)
 	if err != nil {
 		return err
 	}
+	defer s.cleanupAdapter(ctx, adapter, opened.Policy, backupID)
 
-	logf("info", domain.PhaseExecute, "开始校验备份流", map[string]string{"digest": backup.StorageDigest.String()})
-	if err := adapter.Verify(ctx, policy, reader); err != nil {
-		// 校验**不通过**也要落库：「校验过但没通过」与「从没校验过」是两件事。
-		if markErr := s.repo.MarkBackupVerified(ctx, backupID, false, s.now()); markErr != nil {
-			s.logger.Error("failed to record verify result", "backupId", backupID, "error", markErr)
-		}
+	logf("info", domain.PhaseExecute, "开始校验备份流", map[string]string{"digest": opened.Backup.StorageDigest.String()})
+	verifyErr := s.verifyStream(ctx, adapter, opened)
+	// 校验**不通过**也要落库：「校验过但没通过」与「从没校验过」是两件事。
+	if markErr := s.repo.MarkBackupVerified(ctx, backupID, verifyErr == nil, s.now()); markErr != nil {
+		s.logger.Error("failed to record verify result", "backupId", backupID, "error", markErr)
+	}
+	if verifyErr != nil {
+		return verifyErr
+	}
+	logf("info", domain.PhaseFinalize, "校验通过", map[string]string{
+		"storedBytes": itoa64(opened.Digest.Size()),
+	})
+	return nil
+}
+
+// verifyStream 依次做适配器自检与存储摘要核对。
+func (s *BackupService) verifyStream(ctx context.Context, adapter BackupAdapter, opened openedBackup) error {
+	if err := adapter.Verify(ctx, opened.Policy, opened.Reader); err != nil {
 		return err
 	}
-	if err := s.repo.MarkBackupVerified(ctx, backupID, true, s.now()); err != nil {
-		return err
+	// 适配器可能没有把流读到底（例如只读目录不读数据），摘要因此需要补读剩余的字节
+	// 才算得全。读干净之后的摘要才代表**存储里的全部内容**。
+	if _, err := io.Copy(io.Discard, opened.Reader); err != nil {
+		return domain.NewError(v1.CodeBackupVerifyFailed, "读取备份流失败: %v", err)
 	}
-	logf("info", domain.PhaseFinalize, "校验通过", nil)
+	if opened.Backup.StorageDigest == "" {
+		return nil
+	}
+	if got := opened.Digest.Digest(); got != opened.Backup.StorageDigest {
+		return domain.NewError(v1.CodeBackupVerifyFailed,
+			"存储内容与记录不一致：记录里的摘要是 %s，实际读到的是 %s——"+
+				"这份备份的内容已经变了，不能当作可恢复的备份",
+			opened.Backup.StorageDigest, got)
+	}
 	return nil
 }
 
 // ExecuteRestore 恢复一份备份。
 func (s *BackupService) ExecuteRestore(ctx context.Context, backupID string, mode domain.RestoreMode, logf BackupLogf) error {
-	backup, policy, reader, err := s.openBackup(ctx, backupID)
+	opened, err := s.openBackup(ctx, backupID)
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer opened.Reader.Close()
 
-	adapter, err := s.adapterFor(policy.Resource.Kind)
+	adapter, err := s.adapterFor(opened.Policy.Resource.Kind)
 	if err != nil {
 		return err
 	}
+	defer s.cleanupAdapter(ctx, adapter, opened.Policy, backupID)
 
 	logf("info", domain.PhaseExecute, "开始恢复", map[string]string{
-		"backupId": backup.ID,
+		"backupId": opened.Backup.ID,
 		"mode":     string(mode),
 	})
-	if err := adapter.Restore(ctx, policy, reader, mode); err != nil {
+	// 恢复**不做**摘要核对（与 verify 不同）：流是边读边往目标写的，等读完才知道摘要
+	// 对不对时，数据已经写进去了。要提前知道内容对不对，先跑一次 `backup verify`。
+	if err := adapter.Restore(ctx, opened.Policy, opened.Reader, mode); err != nil {
 		return err
 	}
 	logf("info", domain.PhaseFinalize, "恢复完成", map[string]string{"mode": string(mode)})
 	return nil
 }
 
+// openedBackup 是一份**解码之后**的逻辑流，外加核对存储摘要所需的东西。
+type openedBackup struct {
+	Backup *domain.Backup
+	Policy *domain.BackupPolicy
+	// Reader 是解码之后的明文逻辑流：适配器永远只看到明文，不需要知道备份压过还是加过密。
+	Reader io.ReadCloser
+	// Digest 边读边算**存储字节**（压缩加密之后的那些字节）的摘要，
+	// 用来与 backups.storage_digest 核对。
+	Digest *domain.Hasher
+}
+
 // openBackup 取出备份、它的策略，以及**解码之后**的逻辑流。
 //
 // 解码（去压缩、解密）在这里完成，因此适配器永远只看到明文逻辑流，
 // 不需要知道备份是压过的还是加过密的。
-func (s *BackupService) openBackup(ctx context.Context, backupID string) (*domain.Backup, *domain.BackupPolicy, io.ReadCloser, error) {
+func (s *BackupService) openBackup(ctx context.Context, backupID string) (openedBackup, error) {
 	if !s.Configured() {
-		return nil, nil, nil, domain.NewError(v1.CodeConfigInvalid, "本部署未配置备份存储根")
+		return openedBackup{}, domain.NewError(v1.CodeConfigInvalid, "本部署未配置备份存储根")
 	}
 	backup, err := s.repo.GetBackup(ctx, backupID)
 	if err != nil {
-		return nil, nil, nil, err
+		return openedBackup{}, err
 	}
 	if backup.StorageDigest == "" {
-		return nil, nil, nil, domain.NewError(v1.CodeBackupNotFound,
+		return openedBackup{}, domain.NewError(v1.CodeBackupNotFound,
 			"备份 %s 没有对应的存储内容（状态 %s）", backup.ID, backup.Status)
 	}
 	policy, err := s.repo.GetBackupPolicy(ctx, backup.PolicyID)
 	if err != nil {
-		return nil, nil, nil, err
+		return openedBackup{}, err
 	}
 
 	raw, err := s.store.Open(ctx, backup.StorageDigest)
 	if err != nil {
-		return nil, nil, nil, err
+		return openedBackup{}, err
 	}
 
 	key, _, err := s.resolveKey(ctx, policy)
 	if err != nil {
 		_ = raw.Close()
-		return nil, nil, nil, err
+		return openedBackup{}, err
 	}
 
-	decoded, err := backupcodec.Decode(raw, backup.Compression, key)
+	// 摘要算在**存储字节**上（解码之前），与 Put 时算的是同一串字节。
+	hasher := domain.NewHasher()
+	decoded, err := backupcodec.Decode(io.TeeReader(raw, hasher), backup.Compression, key)
 	if err != nil {
 		_ = raw.Close()
-		return nil, nil, nil, err
+		return openedBackup{}, err
 	}
-	return backup, policy, &decodeCloser{Reader: decoded, raw: raw}, nil
+	return openedBackup{
+		Backup: backup,
+		Policy: policy,
+		Reader: &decodeCloser{Reader: decoded, raw: raw},
+		Digest: hasher,
+	}, nil
 }
 
 func (s *BackupService) finishBackup(ctx context.Context, in domain.FinishBackupInput) (*domain.Backup, error) {

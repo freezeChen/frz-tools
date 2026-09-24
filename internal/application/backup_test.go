@@ -1,11 +1,13 @@
 package application_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -494,28 +496,50 @@ func TestBackupRejectsDryRun(t *testing.T) {
 
 // 2a 只实现 files；声明 postgres 的策略在**创建期**就该被挡住，
 // 而不是先排一条注定失败的 Operation。
-func TestBackupRejectsUnregisteredResourceKind(t *testing.T) {
+// 本版本没有适配器的资源种类，必须在**提交期**就被拒。
+//
+// 2a 时这个用例断言的是「能存下、但跑不了」——那时 postgres/mysql 确实还没实现。
+// 2b 起两者都有了适配器，规则收紧成「没有适配器就不许存」：存一份必然跑不起来的
+// 策略进库，只会让人在第一次备份失败时才发现。
+func TestBackupRejectsUnregisteredResourceKindAtSubmit(t *testing.T) {
 	f := newBackupFixture(t)
 	ctx := context.Background()
 
-	_, err := f.rt.Backups.SavePolicy(ctx, &domain.BackupPolicy{
-		APIVersion: domain.BackupPolicyAPIVersion,
-		Kind:       domain.BackupPolicyKind,
-		Name:       "orders-db",
-		Resource: domain.BackupResource{
-			Kind:      domain.BackupResourcePostgres,
-			DSNSecret: domain.SecretRef{Kind: domain.SecretKindFile, Name: "/etc/opsd/secrets/dsn"},
-			Database:  "orders",
-		},
-		Retention: domain.BackupRetention{KeepLast: 1},
-	}, "tester")
-	if err != nil {
-		t.Fatalf("策略本身是合法的，应当能保存: %v", err)
+	_, err := f.rt.Backups.SavePolicy(ctx, postgresPolicy("orders-db"), "tester")
+	if domain.CodeOf(err) != v1.CodeManifestInvalid {
+		t.Fatalf("want MANIFEST_INVALID（本部署没有 postgres 适配器）, got %v", err)
+	}
+}
+
+// 但「存进去了」这条路径仍然要挡：库里可能留着一份**旧版本**写下的策略，
+// 或者有人绕过了服务直接写库。执行期再判一次，代价只有一次 map 查找。
+func TestBackupRejectsUnregisteredResourceKindAtRun(t *testing.T) {
+	f := newBackupFixture(t)
+	ctx := context.Background()
+
+	// 直接落库，绕过 SavePolicy。
+	if _, err := f.sqlStore.SaveBackupPolicy(ctx, postgresPolicy("orders-db"), "bpl_legacy", time.Now().UTC(), "tester"); err != nil {
+		t.Fatalf("写库失败: %v", err)
 	}
 
-	_, _, err = f.rt.Service.Create(ctx, backupRunRequest("orders-db"))
+	_, _, err := f.rt.Service.Create(ctx, backupRunRequest("orders-db"))
 	if domain.CodeOf(err) != v1.CodeManifestInvalid {
 		t.Fatalf("want MANIFEST_INVALID（本版本没有 postgres 适配器）, got %v", err)
+	}
+}
+
+func postgresPolicy(name string) *domain.BackupPolicy {
+	return &domain.BackupPolicy{
+		APIVersion: domain.BackupPolicyAPIVersion,
+		Kind:       domain.BackupPolicyKind,
+		Name:       name,
+		Resource: domain.BackupResource{
+			Kind:      domain.BackupResourcePostgres,
+			DSNSecret: domain.SecretRef{Kind: domain.SecretKindFile, Name: "orders-dsn"},
+			Database:  "orders",
+		},
+		Encoding:  domain.BackupEncoding{Compression: domain.CompressionNone},
+		Retention: domain.BackupRetention{KeepLast: 1},
 	}
 }
 
@@ -546,4 +570,167 @@ func sortStrings(values []string) {
 			values[j], values[j-1] = values[j-1], values[j]
 		}
 	}
+}
+
+// D14：校验必须核对**存储摘要**，而不只是问适配器「你读得动吗」。
+//
+// 存储层按 digest 定位文件却从不重算摘要，所以在这之前，一份 compression: none
+// 且不加密的备份被改坏之后，校验会一路通过——路线图的验收标准写的是
+// 「备份文件可通过 checksum 验证」，缺的正是这一环。
+func TestVerifyDetectsTamperedBlob(t *testing.T) {
+	f := newBackupFixture(t)
+	ctx := context.Background()
+
+	// compression=none 且不加密：存储里的字节就是 tar 本体，改一个内容字节之后
+	// tar 结构仍然完整、仍读得动。于是能发现它的只可能是摘要核对本身。
+	f.savePolicy(t, "orders", func(policy *domain.BackupPolicy) {
+		policy.Encoding.Compression = domain.CompressionNone
+	})
+	f.populate(t)
+
+	op := f.runOperation(t, backupRunRequest("orders"))
+	if op.Status != domain.StatusSucceeded {
+		t.Fatalf("备份应当成功，got %s (%s)", op.Status, op.ErrorMessage)
+	}
+	record := f.singleBackup(t)
+
+	// 先证明「没被动过时校验是通过的」——否则下面的失败说明不了任何事。
+	if clean := f.runOperation(t, v1.CreateOperationRequest{
+		Kind: v1.KindBackupVerify, Resource: record.ID,
+	}); clean.Status != domain.StatusSucceeded {
+		t.Fatalf("未改动时校验应当通过，got %s (%s)", clean.Status, clean.ErrorMessage)
+	}
+
+	path := f.storedBlobPath(t)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读存储内容: %v", err)
+	}
+	const original = "alpha-content"
+	if !bytes.Contains(content, []byte(original)) {
+		t.Fatalf("存储里应当能直接看到原始内容（compression=none），实际前 200 字节: %q", content[:min(200, len(content))])
+	}
+	// 等长替换：tar 的头部长度字段仍然自洽，因此适配器的结构校验会放行。
+	tampered := bytes.Replace(content, []byte(original), []byte("alpha-CONTENT"), 1)
+	if err := os.WriteFile(path, tampered, 0o640); err != nil {
+		t.Fatalf("篡改存储内容: %v", err)
+	}
+
+	verifyOp := f.runOperation(t, v1.CreateOperationRequest{
+		Kind: v1.KindBackupVerify, Resource: record.ID,
+	})
+	if verifyOp.Status != domain.StatusFailed {
+		t.Fatalf("被改过的备份必须校验失败，got %s", verifyOp.Status)
+	}
+	if verifyOp.ErrorCode != string(v1.CodeBackupVerifyFailed) {
+		t.Fatalf("want BACKUP_VERIFY_FAILED, got %s: %s", verifyOp.ErrorCode, verifyOp.ErrorMessage)
+	}
+	if !strings.Contains(verifyOp.ErrorMessage, "摘要") {
+		t.Fatalf("错误信息要指明是摘要不符，got %s", verifyOp.ErrorMessage)
+	}
+
+	// 「校验过但没通过」与「从没校验过」是两件事。
+	after, err := f.rt.Backups.Get(ctx, record.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if after.VerifiedOK == nil || *after.VerifiedOK {
+		t.Fatalf("校验不通过的记录不得被标成通过，got %v", after.VerifiedOK)
+	}
+	// 而这份备份也因此不该参与保留策略的计算（D9）。
+	if after.Usable() {
+		t.Fatal("校验失败的备份不得算作可用")
+	}
+}
+
+// 端口的 Cleanup 有实现 ≠ 产品路径上有人调它。2b 之前它只有合约测试在调，
+// 于是「被中断的恢复留下的临时资源」在生产上没有任何出口。
+func TestAdapterCleanupRunsOnProductPath(t *testing.T) {
+	var recorder *recordingAdapter
+	f := newBackupFixture(t, func(options *application.Options) {
+		recorder = &recordingAdapter{BackupAdapter: options.BackupAdapters[0]}
+		options.BackupAdapters = []application.BackupAdapter{recorder}
+	})
+
+	f.savePolicy(t, "orders")
+	f.populate(t)
+	op := f.runOperation(t, backupRunRequest("orders"))
+	if op.Status != domain.StatusSucceeded {
+		t.Fatalf("备份应当成功，got %s (%s)", op.Status, op.ErrorMessage)
+	}
+	record := f.singleBackup(t)
+
+	f.runOperation(t, v1.CreateOperationRequest{Kind: v1.KindBackupVerify, Resource: record.ID})
+	f.runOperation(t, v1.CreateOperationRequest{
+		Kind: v1.KindBackupRestore, Resource: record.ID,
+		Spec: mustRestoreOptions(t, domain.RestoreIsolated, false),
+	})
+
+	// 三次操作各收尾一次。断言「至少 3 次」而不是精确值：将来多一次收尾
+	// 不该让这条用例失败，而**一次都没有**才是要抓的。
+	if got := recorder.cleanupCount(); got < 3 {
+		t.Fatalf("每次操作结束后都应当收尾一次，实际只调用了 %d 次", got)
+	}
+}
+
+// recordingAdapter 包一层适配器，用来观察产品路径到底调了端口的哪些方法。
+type recordingAdapter struct {
+	application.BackupAdapter
+
+	mu        sync.Mutex
+	cleanups  int
+	lastOpsID []string
+}
+
+func (r *recordingAdapter) Cleanup(ctx context.Context, policy *domain.BackupPolicy, operationID string) error {
+	r.mu.Lock()
+	r.cleanups++
+	r.lastOpsID = append(r.lastOpsID, operationID)
+	r.mu.Unlock()
+	return r.BackupAdapter.Cleanup(ctx, policy, operationID)
+}
+
+func (r *recordingAdapter) cleanupCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cleanups
+}
+
+// singleBackup 取出唯一一条备份记录。
+func (f *backupFixture) singleBackup(t *testing.T) *domain.Backup {
+	t.Helper()
+	backups, err := f.rt.Backups.List(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("应当恰好一条备份记录，got %d", len(backups))
+	}
+	return &backups[0]
+}
+
+// storedBlobPath 找出存储根里唯一的那个 blob 文件。
+//
+// 刻意**不**复刻一遍 blob 的分片路径规则：那是第二份会与实现漂移的真相。
+// 测试要的是「存储里那几个字节」，走一遍目录比复刻规则结实。
+func (f *backupFixture) storedBlobPath(t *testing.T) string {
+	t.Helper()
+	var found []string
+	err := filepath.WalkDir(f.backupStore.Root(), func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		found = append(found, path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("遍历存储根: %v", err)
+	}
+	if len(found) != 1 {
+		t.Fatalf("存储根里应当恰好一个 blob，got %v", found)
+	}
+	return found[0]
 }

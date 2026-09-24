@@ -14,6 +14,8 @@ import (
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/adapters/backup/files"
+	"github.com/freezeChen/frz-tools/internal/adapters/backup/mysql"
+	"github.com/freezeChen/frz-tools/internal/adapters/backup/postgres"
 	"github.com/freezeChen/frz-tools/internal/adapters/blob"
 	"github.com/freezeChen/frz-tools/internal/adapters/config"
 	"github.com/freezeChen/frz-tools/internal/adapters/executor"
@@ -124,12 +126,21 @@ func run(cmd *cobra.Command, _ []string) error {
 	}
 
 	runtime := application.NewRuntime(application.Options{
-		Repo:            store,
-		Executor:        exec,
-		Secrets:         secretResolver,
-		Store:           artifactStore,
-		BackupStore:     backupStore,
-		BackupAdapters:  []application.BackupAdapter{files.New()},
+		Repo:        store,
+		Executor:    exec,
+		Secrets:     secretResolver,
+		Store:       artifactStore,
+		BackupStore: backupStore,
+		BackupAdapters: []application.BackupAdapter{
+			files.New(),
+			// 数据库适配器共用同一个执行器实例。它在**绝对路径**上做 allowedPaths
+			// 校验，而 pg_dump/mysqldump 一般不在 executor 默认放行的目录里——
+			// 运维需要在 execution.allowedPaths 里放行客户端工具所在的目录
+			// （例如 /usr/lib/postgresql/16/bin）。适配器不绕过这道校验，
+			// 它只负责把工具名解析成绝对路径。
+			postgres.New(exec, secretResolver),
+			mysql.New(exec, secretResolver),
+		},
 		RuntimeAdapter:  runtimeAdapter,
 		PrepareReporter: prepareReporter,
 		AllowExecutable: cfg.ExecutableAllowed,
