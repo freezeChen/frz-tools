@@ -120,3 +120,52 @@ func (r *BackupRunRequest) Validate() error {
 	}
 	return nil
 }
+
+// PreflightCheck 是预检里的一项。
+//
+// 失败的那一项必须能说清「差在哪」：只回「预检没过」，用户不知道该修什么，
+// 而预检的全部意义正是在**产生备份产物之前**把问题暴露出来。
+type PreflightCheck struct {
+	Name   string
+	OK     bool
+	Detail string
+}
+
+// PreflightReport 是一次预检的汇总。
+type PreflightReport struct {
+	Checks []PreflightCheck
+	// ToolVersion / ServerVersion 记下「哪个版本的工具备的哪个版本的对端」。
+	// 恢复时的兼容性判断只能靠它——「12 的 pg_dump 备的库能不能恢复到 15」
+	// 这个问题没有别的依据。
+	ToolVersion   string
+	ServerVersion string
+}
+
+// Passed 报告预检是否全部通过。
+func (r PreflightReport) Passed() bool {
+	_, failed := r.Failure()
+	return !failed
+}
+
+// Failure 返回第一项未通过的检查，便于直接作为错误信息的内容。
+func (r PreflightReport) Failure() (PreflightCheck, bool) {
+	for _, check := range r.Checks {
+		if !check.OK {
+			return check, true
+		}
+	}
+	return PreflightCheck{}, false
+}
+
+// BackupMetadata 是适配器对「这次备份是什么」的自述。
+//
+// 它刻意**不含**摘要、字节数与编码方式：那些由应用层在流上算出，适配器看不到、
+// 也不该看到（规格 D1）——否则每个适配器都会长出一份自己的摘要实现。
+type BackupMetadata struct {
+	ResourceKind  BackupResourceKind
+	ServerVersion string
+	ClientVersion string
+	Tool          string
+	// Labels 是保留策略需要的标记（如 GFS 的日/周/月）；没有就留空。
+	Labels map[string]string
+}

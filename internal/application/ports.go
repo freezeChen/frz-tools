@@ -63,6 +63,18 @@ type Repository interface {
 	CreateEnvironment(ctx context.Context, environment *domain.Environment) error
 	GetEnvironment(ctx context.Context, ref string) (*domain.Environment, error)
 	ListEnvironments(ctx context.Context) ([]domain.Environment, error)
+
+	// 备份：策略以 name 为键 upsert（policyID 只在首次插入时使用，冲突时保留原有 id，
+	// 否则指向它的历史备份会改归属）；备份记录描述「这份备份能不能用」，
+	// 与 Operation 的状态分开。
+	SaveBackupPolicy(ctx context.Context, policy *domain.BackupPolicy, policyID string, now time.Time, updatedBy string) (*domain.BackupPolicy, error)
+	GetBackupPolicy(ctx context.Context, ref string) (*domain.BackupPolicy, error)
+	ListBackupPolicies(ctx context.Context) ([]domain.BackupPolicy, error)
+	CreateBackup(ctx context.Context, backup *domain.Backup) error
+	GetBackup(ctx context.Context, id string) (*domain.Backup, error)
+	ListBackups(ctx context.Context, policyRef string, limit int) ([]domain.Backup, error)
+	FinishBackup(ctx context.Context, in domain.FinishBackupInput, now time.Time) (*domain.Backup, error)
+	MarkBackupVerified(ctx context.Context, id string, ok bool, now time.Time) error
 }
 
 // Executor 是进程执行端口，由本机执行器适配器实现。
@@ -108,6 +120,42 @@ type RuntimeAdapter interface {
 	// 两者刻意不合并：进程活着不等于已就绪。
 	Health(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeHealth, error)
 	Status(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error)
+}
+
+// BackupAdapter 把「一份备份策略」映射到具体的资源类型（目录、数据库……）。
+//
+// 它只产出**逻辑备份流**：压缩、加密、摘要与原子提交到 StorageBackend 由应用层统一
+// 负责（迭代 2 规格 D1）。把这些下放给每个适配器，等于让每种数据库各实现一套加密——
+// 任何一处写错都是静默的数据泄露，或静默的不可恢复。
+//
+// 所有方法都不得假设调用方已经校验过策略：实现方必须在内部先校验，
+// 因为「未经验证的策略被直接执行」是最危险的一类误用。
+type BackupAdapter interface {
+	// Kind 报告它负责的资源种类，装配层据此按策略分派。
+	Kind() domain.BackupResourceKind
+
+	// Validate 只检查策略能否被本适配器执行，不产生任何副作用。
+	Validate(ctx context.Context, policy *domain.BackupPolicy) error
+
+	// Preflight 检查连接、客户端版本、磁盘空间、凭据可解析等前置条件。
+	// 必须在 Backup 之前完成，且**不得留下任何备份产物**。
+	Preflight(ctx context.Context, policy *domain.BackupPolicy) (domain.PreflightReport, error)
+
+	// Backup 把逻辑备份流写进 w，并返回本次备份的自述元数据。
+	Backup(ctx context.Context, policy *domain.BackupPolicy, w io.Writer) (domain.BackupMetadata, error)
+
+	// Restore 从 r 读回逻辑备份流并恢复。mode 决定恢复到真实目标还是隔离环境。
+	Restore(ctx context.Context, policy *domain.BackupPolicy, r io.Reader, mode domain.RestoreMode) error
+
+	// Verify 校验备份流的自洽性（如 tar -t），**不接触目标资源**。
+	Verify(ctx context.Context, policy *domain.BackupPolicy, r io.Reader) error
+
+	// Cleanup 释放本适配器在本次操作中产生的临时资源（临时目录、临时恢复实例）。
+	//
+	// 它**不**决定保留策略：「哪些备份该删」由 GFS 策略决定，那是通用逻辑，属于应用层
+	// （规格 D2）。保留策略一旦抽象进适配器，每个适配器都要实现一遍，而它们对「一次备份」
+	// 的理解各不相同，最后必然漂移成几套语义。
+	Cleanup(ctx context.Context, policy *domain.BackupPolicy, operationID string) error
 }
 
 // RuntimePrepareReporter 让装配层把适配器独有的 Prepare 决策（systemd 的 unit 档位与
