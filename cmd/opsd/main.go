@@ -175,6 +175,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		Hosts:     runtime.Hosts,
 		Runtimes:  runtime.Runtimes,
 		Schedules: runtime.Schedules,
+		Backups:   runtime.Backups,
 		Store:     store,
 		Workers:   runtime.Pool.Workers(),
 		Logger:    logger,

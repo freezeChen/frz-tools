@@ -12,12 +12,14 @@ import (
 )
 
 type CreateScheduleInput struct {
-	Name            string
-	Kind            string
-	Cron            string
-	Interval        time.Duration
-	Timezone        string
-	Resource        string
+	Name     string
+	Kind     string
+	Cron     string
+	Interval time.Duration
+	Timezone string
+	Resource string
+	// OperationKind 省略时是 executor.command。
+	OperationKind   string
 	Spec            json.RawMessage
 	MissedRunPolicy string
 	CreatedBy       string
@@ -32,6 +34,7 @@ func (c *Client) CreateSchedule(ctx context.Context, in CreateScheduleInput) (*v
 		IntervalSeconds: int(in.Interval / time.Second),
 		Timezone:        in.Timezone,
 		Resource:        in.Resource,
+		OperationKind:   in.OperationKind,
 		Spec:            in.Spec,
 		MissedRunPolicy: in.MissedRunPolicy,
 		CreatedBy:       in.CreatedBy,

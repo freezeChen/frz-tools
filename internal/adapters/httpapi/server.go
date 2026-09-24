@@ -31,6 +31,7 @@ type Dependencies struct {
 	Hosts     *application.HostService
 	Runtimes  *application.RuntimeService
 	Schedules *application.ScheduleService
+	Backups   *application.BackupService
 	Store     *sqlite.Store
 	Workers   int
 	Logger    *slog.Logger
@@ -89,6 +90,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/environments", s.handleListEnvironments)
 	mux.HandleFunc("POST /api/v1/environments", s.handleCreateEnvironment)
 	mux.HandleFunc("GET /api/v1/environments/{id}", s.handleGetEnvironment)
+
+	mux.HandleFunc("PUT /api/v1/backup-policies/{name}", s.handlePutBackupPolicy)
+	mux.HandleFunc("GET /api/v1/backup-policies/{name}", s.handleGetBackupPolicy)
+	mux.HandleFunc("GET /api/v1/backup-policies", s.handleListBackupPolicies)
+	mux.HandleFunc("POST /api/v1/backups", s.handleRunBackup)
+	mux.HandleFunc("GET /api/v1/backups", s.handleListBackups)
+	mux.HandleFunc("GET /api/v1/backups/{id}", s.handleGetBackup)
+	mux.HandleFunc("POST /api/v1/backups/{id}/verify", s.handleVerifyBackup)
+	mux.HandleFunc("POST /api/v1/backups/{id}/restore", s.handleRestoreBackup)
 
 	mux.HandleFunc("POST /api/v1/schedules", s.handleCreateSchedule)
 	mux.HandleFunc("GET /api/v1/schedules", s.handleListSchedules)

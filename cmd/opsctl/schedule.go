@@ -31,42 +31,63 @@ func newScheduleCommand(opts *rootOptions) *cobra.Command {
 
 func newScheduleCreateCommand(opts *rootOptions) *cobra.Command {
 	var (
-		name       string
-		resource   string
-		cronExpr   string
-		interval   time.Duration
-		timezone   string
-		policy     string
-		createdBy  string
-		secretEnvs []string
+		name          string
+		resource      string
+		operationKind string
+		specJSON      string
+		cronExpr      string
+		interval      time.Duration
+		timezone      string
+		policy        string
+		createdBy     string
+		secretEnvs    []string
 	)
 
 	cmd := &cobra.Command{
-		Use:   "create --name <n> --resource <r> (--cron <表达式> | --interval <时长>) -- <argv...>",
+		Use:   "create --name <n> --resource <r> (--cron <表达式> | --interval <时长>) [--operation-kind <kind>] -- <argv...>",
 		Short: "创建定时计划",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if cmd.ArgsLenAtDash() == -1 {
-				return domain.NewError(v1.CodeInvalidRequest, "请把命令 argv 写在 -- 之后，例如：-- /usr/bin/true")
-			}
-			if len(args) == 0 {
-				return domain.NewError(v1.CodeInvalidRequest, "-- 之后的 argv 不能为空")
-			}
 			if (cronExpr == "") == (interval == 0) {
 				return domain.NewError(v1.CodeScheduleInvalid, "必须且只能提供 --cron 或 --interval 之一")
 			}
 
-			// 与 operation submit 共用同一套 spec 构造，两个入口的语义不会漂移。
-			secretEnvironment, err := parseSecretRefs(secretEnvs)
-			if err != nil {
-				return err
-			}
-			spec, err := json.Marshal(v1.ExecutorCommandSpec{
-				Argv:              args,
-				SecretEnvironment: secretEnvironment,
-			})
-			if err != nil {
-				return err
+			// spec 的形状取决于**触发时创建哪种操作**：executor.command 要 argv；
+			// backup.run / backup.verify / runtime.* 执行时读当前的策略或规格，因此
+			// 计划里不带 spec（带了服务端会拒绝，而不是默默忽略）。
+			var spec json.RawMessage
+			switch operationKind {
+			case v1.KindExecutorCommand:
+				if cmd.ArgsLenAtDash() == -1 {
+					return domain.NewError(v1.CodeInvalidRequest, "请把命令 argv 写在 -- 之后，例如：-- /usr/bin/true")
+				}
+				if len(args) == 0 {
+					return domain.NewError(v1.CodeInvalidRequest, "-- 之后的 argv 不能为空")
+				}
+				// 与 operation submit 共用同一套 spec 构造，两个入口的语义不会漂移。
+				secretEnvironment, err := parseSecretRefs(secretEnvs)
+				if err != nil {
+					return err
+				}
+				encoded, err := json.Marshal(v1.ExecutorCommandSpec{
+					Argv:              args,
+					SecretEnvironment: secretEnvironment,
+				})
+				if err != nil {
+					return err
+				}
+				spec = encoded
+			default:
+				if len(args) > 0 {
+					return domain.NewError(v1.CodeInvalidRequest,
+						"operationKind=%s 不接受 argv（只有 executor.command 需要）", operationKind)
+				}
+				if specJSON != "" {
+					if !json.Valid([]byte(specJSON)) {
+						return domain.NewError(v1.CodeInvalidRequest, "--spec 不是合法 JSON")
+					}
+					spec = json.RawMessage(specJSON)
+				}
 			}
 
 			kind := string(domain.ScheduleKindCron)
@@ -81,6 +102,7 @@ func newScheduleCreateCommand(opts *rootOptions) *cobra.Command {
 				Interval:        interval,
 				Timezone:        timezone,
 				Resource:        resource,
+				OperationKind:   operationKind,
 				Spec:            spec,
 				MissedRunPolicy: policy,
 				CreatedBy:       createdBy,
@@ -98,6 +120,10 @@ func newScheduleCreateCommand(opts *rootOptions) *cobra.Command {
 
 	cmd.Flags().StringVar(&name, "name", "", "计划名称，唯一（必填）")
 	cmd.Flags().StringVar(&resource, "resource", "", "触发时创建的 Operation 使用的 resource（必填）")
+	cmd.Flags().StringVar(&operationKind, "operation-kind", v1.KindExecutorCommand,
+		"到点创建哪种操作：executor.command（默认）、backup.run、backup.verify、runtime.start 等")
+	cmd.Flags().StringVar(&specJSON, "spec", "",
+		"随计划保存的 spec（JSON）；只有 backup.restore 之类需要，其余操作执行时读当前策略/规格")
 	cmd.Flags().StringVar(&cronExpr, "cron", "", "cron 表达式，标准 5 字段：分 时 日 月 周")
 	cmd.Flags().DurationVar(&interval, "interval", 0, "固定间隔，例如 30m；最小 1m")
 	cmd.Flags().StringVar(&timezone, "timezone", "UTC", "IANA 时区，例如 Asia/Shanghai")

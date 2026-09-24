@@ -6,26 +6,31 @@ import (
 )
 
 type CreateScheduleRequest struct {
-	Name            string          `json:"name"`
-	Kind            string          `json:"kind"`
-	Cron            string          `json:"cron,omitempty"`
-	IntervalSeconds int             `json:"intervalSeconds,omitempty"`
-	Timezone        string          `json:"timezone,omitempty"`
-	Resource        string          `json:"resource"`
+	Name            string `json:"name"`
+	Kind            string `json:"kind"`
+	Cron            string `json:"cron,omitempty"`
+	IntervalSeconds int    `json:"intervalSeconds,omitempty"`
+	Timezone        string `json:"timezone,omitempty"`
+	Resource        string `json:"resource"`
+	// OperationKind 是到点要创建哪种操作，省略时是 executor.command。
+	// 没有它，「按计划跑备份」从模型上就做不到（迭代 2 规格 D6）。
+	OperationKind   string          `json:"operationKind,omitempty"`
 	Spec            json.RawMessage `json:"spec,omitempty"`
 	MissedRunPolicy string          `json:"missedRunPolicy,omitempty"`
 	CreatedBy       string          `json:"createdBy,omitempty"`
 }
 
 type Schedule struct {
-	ID              string          `json:"id"`
-	Name            string          `json:"name"`
-	Enabled         bool            `json:"enabled"`
-	Kind            string          `json:"kind"`
-	Cron            string          `json:"cron,omitempty"`
-	IntervalSeconds int             `json:"intervalSeconds,omitempty"`
-	Timezone        string          `json:"timezone,omitempty"`
-	Resource        string          `json:"resource"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Enabled         bool   `json:"enabled"`
+	Kind            string `json:"kind"`
+	Cron            string `json:"cron,omitempty"`
+	IntervalSeconds int    `json:"intervalSeconds,omitempty"`
+	Timezone        string `json:"timezone,omitempty"`
+	Resource        string `json:"resource"`
+	// OperationKind 是到点要创建哪种操作，省略时是 executor.command。
+	OperationKind   string          `json:"operationKind"`
 	Spec            json.RawMessage `json:"spec,omitempty"`
 	MissedRunPolicy string          `json:"missedRunPolicy"`
 	NextRunAt       *time.Time      `json:"nextRunAt,omitempty"`

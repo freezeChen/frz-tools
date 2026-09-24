@@ -53,6 +53,7 @@ func newRootCommand() *cobra.Command {
 		newHostCommand(opts),
 		newEnvCommand(opts),
 		newScheduleCommand(opts),
+		newBackupCommand(opts),
 		newConfigCommand(opts),
 	)
 	localizeBuiltinCommands(root)
