@@ -129,9 +129,10 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 118**（2026-09-24 迭代 2a 落地后实跑：118 通过 / 0 失败，其中 1c 的 `check_runtime`
-49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项；历史快照：1d 时点 106 项、
-1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
+当前为 131**（2026-09-24 迭代 2d 落地后实跑：131 通过 / 0 失败，其中 1c 的 `check_runtime`
+49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项、2d 的 `check_prune` 13 项；
+历史快照：2a 时点 118 项、1d 时点 106 项、1c 时点 89 项、1b 时点 40 项，A7 落地时的静态
+推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在
 它上面，前缀未动），另一个**以 root 运行**（配置 `test/linux/opsd.root.verify.yaml`，独立

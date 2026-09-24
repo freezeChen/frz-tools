@@ -761,7 +761,8 @@
   不删内容、旧库 gfs 被报告）、**e2e**（走 CLI 的闭环）、**Linux 容器**（`make verify-linux`
   **131/0**，新增 `check_prune` 13 项）、**Linux 容器承载的真实数据库实例**（`make verify-db`
   13/0）、**Linux 主机**（`make verify-host` **95/0**，Rocky Linux 10.2 / systemd 257 /
-  SELinux enforcing）。`make ci` 全绿。
+  SELinux enforcing）。`make ci` 全绿；干净 runner 上的 CI run **`35970555579`** 三个 job 全绿
+  （`test`、`linux-verify` **131/0**、`db-verify` 13/0）。
 - **明确不做**：GFS（停放区第 2 节，六个待定问题已各给推荐值）、store-wide 的备份孤儿回收
   （塞进按策略的命令是设计错误，应当是一个独立的 `backup gc`；**后果**是 prune 在「标记」与
   「删内容」之间崩溃会留下无人回收的孤儿 blob）、以及「校验失败的备份永远不会被清理」
