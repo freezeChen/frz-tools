@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"sync"
@@ -76,6 +77,30 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		return nil, false, domain.NewError(v1.CodeInvalidRequest, "resource is required")
 	}
 
+	// D7：dryRun 没有真实副作用，也就没有「值得重试的失败」，把两者一起提交是规格误用。
+	if req.Retry != nil && req.DryRun {
+		return nil, false, domain.NewError(v1.CodeInvalidRequest,
+			"dryRun 与 retry 不能同时使用：dryRun 不产生真实副作用，重试它没有意义")
+	}
+
+	// 重试策略在提交时校验并序列化成**原文**存下来：事后能查到「当时到底按什么策略
+	// 重试的」，且策略字段增减不需要再加数据库列。
+	var (
+		retryPolicy domain.RetryPolicy
+		retryJSON   json.RawMessage
+	)
+	if req.Retry != nil {
+		retryPolicy = domain.RetryPolicyFromSpec(*req.Retry)
+		if err := retryPolicy.Validate(); err != nil {
+			return nil, false, err
+		}
+		raw, err := json.Marshal(req.Retry)
+		if err != nil {
+			return nil, false, domain.NewError(v1.CodeInternal, "无法序列化重试策略: %v", err)
+		}
+		retryJSON = raw
+	}
+
 	// runtime.* 与 executor.command 共用这一条创建路径：锁、幂等键、请求摘要与 worker
 	// 唤醒全部走同一段代码，因此 runtime.start 在 operation get/logs/cancel/retry 上
 	// 的行为与命令行执行完全一致，不存在第二条旁路。
@@ -111,22 +136,25 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		}
 	}
 
-	hash, err := requestHash(req.Kind, resource, req.DryRun, specJSON)
+	hash, err := requestHash(req.Kind, resource, req.DryRun, retryJSON, specJSON)
 	if err != nil {
 		return nil, false, err
 	}
 
 	op := &domain.Operation{
-		ID:             s.newID(),
-		Kind:           req.Kind,
-		Resource:       resource,
-		Status:         domain.StatusPending,
-		DryRun:         req.DryRun,
-		IdempotencyKey: req.IdempotencyKey,
-		RequestHash:    hash,
-		Spec:           specJSON,
-		CreatedAt:      s.now(),
-		CreatedBy:      req.CreatedBy,
+		ID:              s.newID(),
+		Kind:            req.Kind,
+		Resource:        resource,
+		Status:          domain.StatusPending,
+		DryRun:          req.DryRun,
+		IdempotencyKey:  req.IdempotencyKey,
+		RequestHash:     hash,
+		Spec:            specJSON,
+		CreatedAt:       s.now(),
+		CreatedBy:       req.CreatedBy,
+		Attempt:         1,
+		RetryPolicy:     retryPolicy,
+		RetryPolicyJSON: retryJSON,
 	}
 
 	result, err := s.repo.CreateOperation(ctx, op)
@@ -172,22 +200,28 @@ func (s *Service) Retry(ctx context.Context, id string) (*domain.Operation, erro
 			"operation %s in status %q cannot be retried", id, original.Status)
 	}
 
-	hash, err := requestHash(original.Kind, original.Resource, original.DryRun, original.Spec)
+	hash, err := requestHash(original.Kind, original.Resource, original.DryRun, original.RetryPolicyJSON, original.Spec)
 	if err != nil {
 		return nil, err
 	}
 
+	// 手动重试沿用链上的策略（这样后续失败仍会自动重试），但**不受 maxAttempts 限制**：
+	// 运维的判断优先于策略的自动上限。attempt 照常递增，让链上的计数保持连续，
+	// 因此「第几次尝试」这件事永远只有一个说法。
 	retry := &domain.Operation{
-		ID:          s.newID(),
-		Kind:        original.Kind,
-		Resource:    original.Resource,
-		Status:      domain.StatusPending,
-		DryRun:      original.DryRun,
-		RequestHash: hash,
-		RetryOf:     original.ID,
-		Spec:        original.Spec,
-		CreatedAt:   s.now(),
-		CreatedBy:   original.CreatedBy,
+		ID:              s.newID(),
+		Kind:            original.Kind,
+		Resource:        original.Resource,
+		Status:          domain.StatusPending,
+		DryRun:          original.DryRun,
+		RequestHash:     hash,
+		RetryOf:         original.ID,
+		Spec:            original.Spec,
+		CreatedAt:       s.now(),
+		CreatedBy:       original.CreatedBy,
+		Attempt:         original.Attempt + 1,
+		RetryPolicy:     original.RetryPolicy,
+		RetryPolicyJSON: original.RetryPolicyJSON,
 	}
 
 	result, err := s.repo.CreateOperation(ctx, retry)

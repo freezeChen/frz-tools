@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/idgen"
 )
 
 const defaultIdlePoll = 250 * time.Millisecond
@@ -27,11 +29,20 @@ type Pool struct {
 	logger   *slog.Logger
 	wake     chan struct{}
 	now      func() time.Time
+	// newID 为自动重试生成新的 Operation ID。与 Service 共用同一个生成器，
+	// 因此重试链上的每一跳在日志与审计里看起来都是普通的 Operation。
+	newID func(prefix string) string
+	// jitter 返回 [0,1) 的均匀随机数，用于给退避加抖动。可注入是为了让退避序列
+	// 在测试里可断言——不可注入的随机会让「退避是否正确」无法被测试钉住。
+	jitter func() float64
 }
 
-func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, runtimes *RuntimeService, workers int, logger *slog.Logger) *Pool {
+func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, runtimes *RuntimeService, workers int, logger *slog.Logger, newID func(string) string) *Pool {
 	if workers < 1 {
 		workers = 1
+	}
+	if newID == nil {
+		newID = idgen.New
 	}
 	return &Pool{
 		repo:     repo,
@@ -45,6 +56,8 @@ func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults D
 		logger:   logger,
 		wake:     make(chan struct{}, 1),
 		now:      func() time.Time { return time.Now().UTC() },
+		newID:    newID,
+		jitter:   rand.Float64,
 	}
 }
 
@@ -376,15 +389,71 @@ func (p *Pool) appendLog(ctx context.Context, op *domain.Operation, redactor *do
 	}
 }
 
+// finish 落库终态，并在应当重试时把下一次尝试**一并**提交。
+//
+// 重试计划作为 FinishInput 的一部分传下去，由仓储在同一个事务里创建——分成两步做的话，
+// 两步之间崩溃会静默丢掉这次重试，而且没有任何迹象（失败的操作还在，只是不会重试）。
 func (p *Pool) finish(ctx context.Context, op *domain.Operation, status domain.Status, exitCode *int, errorCode, errorMessage string) {
-	if _, err := p.repo.Finish(ctx, domain.FinishInput{
+	input := domain.FinishInput{
 		OperationID:  op.ID,
 		Status:       status,
 		ExitCode:     exitCode,
 		ErrorCode:    errorCode,
 		ErrorMessage: errorMessage,
-	}, p.now()); err != nil {
+		Retry:        p.planRetry(op, status, errorCode),
+	}
+	if _, err := p.repo.Finish(ctx, input, p.now()); err != nil {
 		p.logger.Error("failed to persist operation result", "operationId", op.ID, "error", err)
+		return
+	}
+	if input.Retry != nil {
+		// 叫醒空闲的 worker：退避可能很短，没必要等下一次轮询。
+		p.Notify()
+	}
+}
+
+// planRetry 依据**这一次失败**决定要不要排下一次尝试；不需要重试时返回 nil。
+//
+// 判定发生在终态落库的这一刻，而不是等守护进程重启之后再重算——后者会让
+// 「当时到底该不该重试」取决于重启之后的策略快照，同一个失败会有两种结论。
+func (p *Pool) planRetry(op *domain.Operation, status domain.Status, errorCode string) *domain.RetryPlan {
+	// 成功没有「下一次尝试」可言；取消更不能有——用户主动取消之后还排自动重试，
+	// 等于违抗指令。
+	if status != domain.StatusFailed {
+		return nil
+	}
+	return planRetryFor(op, v1.ErrorCode(errorCode), p.now(), p.newID, p.jitter)
+}
+
+// planRetryFor 是「要不要排下一次尝试」的**唯一判定点**，由两个调用方共用：
+// worker（执行过程中失败）与 Recover（守护进程重启后被中断的操作）。
+// 共用一份逻辑，「当时该不该重试、该等多久」才不会有两个说法。
+//
+// 退避在这里算一次就写进 NotBefore，**不在读取时重算**：否则重启后同一个操作会算出
+// 不同的时间，退避窗口漂移，测试也无法断言。
+func planRetryFor(op *domain.Operation, failureCode v1.ErrorCode, now time.Time, newID func(string) string, jitter func() float64) *domain.RetryPlan {
+	if !op.RetryPolicy.Enabled() {
+		return nil
+	}
+	if !op.RetryPolicy.Retryable(failureCode) {
+		return nil
+	}
+
+	attempt := op.Attempt
+	if attempt < 1 {
+		attempt = 1
+	}
+	// 已达尝试上限：不再排新的尝试。最后一跳的终态与错误码保持原始失败原因，
+	// 让运维看到的是「为什么失败」而不是「重试用完了」。
+	if attempt+1 > op.RetryPolicy.MaxAttempts {
+		return nil
+	}
+
+	delay := op.RetryPolicy.NextDelay(attempt, jitter())
+	return &domain.RetryPlan{
+		OperationID:     newID("op"),
+		NotBefore:       now.Add(delay),
+		RetryPolicyJSON: op.RetryPolicyJSON,
 	}
 }
 

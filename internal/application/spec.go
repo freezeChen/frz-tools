@@ -79,17 +79,28 @@ func BuildCommandSpec(kind string, raw json.RawMessage, defaults Defaults) (doma
 
 // requestHash 对规范化后的请求做摘要，用于区分「幂等键重复且请求相同」
 // 与「幂等键相同但请求不同」两种情况。
-func requestHash(kind, resource string, dryRun bool, spec json.RawMessage) (string, error) {
+// requestHash 把「这次请求要做什么」摘要成一个值，用于幂等键的冲突检测。
+//
+// retry 也被摘进去：重试策略是请求内容的一部分，同一个幂等键配上不同的重试策略
+// 属于**不同的请求**，返回原来的操作就等于静默忽略了策略的改动。
+func requestHash(kind, resource string, dryRun bool, retry, spec json.RawMessage) (string, error) {
 	var canonical any
 	if len(spec) > 0 {
 		if err := json.Unmarshal(spec, &canonical); err != nil {
 			return "", domain.NewError(v1.CodeInvalidRequest, "spec is not valid JSON: %v", err)
 		}
 	}
+	var canonicalRetry any
+	if len(retry) > 0 {
+		if err := json.Unmarshal(retry, &canonicalRetry); err != nil {
+			return "", domain.NewError(v1.CodeInvalidRequest, "retry is not valid JSON: %v", err)
+		}
+	}
 	payload, err := json.Marshal(map[string]any{
 		"kind":     kind,
 		"resource": resource,
 		"dryRun":   dryRun,
+		"retry":    canonicalRetry,
 		"spec":     canonical,
 	})
 	if err != nil {

@@ -32,6 +32,9 @@ type Options struct {
 	// NewID 可覆盖，用于测试注入确定性 ID；默认由 idgen.New 按前缀生成。
 	NewID func(prefix string) string
 	Now   func() time.Time
+	// Jitter 可覆盖退避的抖动源（返回 [0,1)）；默认取 math/rand。
+	// 可注入是为了让退避序列在测试里可断言。
+	Jitter func() float64
 }
 
 // Runtime 把操作服务、制品服务、目录服务、调度器与 worker 池组合在一起，
@@ -59,12 +62,15 @@ func NewRuntime(opts Options) *Runtime {
 	runtimes := newRuntimeService(opts.Repo, opts.RuntimeAdapter, opts.PrepareReporter)
 
 	cancels := newCancelRegistry()
-	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, opts.Workers, opts.Logger)
+	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, opts.Workers, opts.Logger, idGen)
 	if opts.Idle > 0 {
 		pool.idle = opts.Idle
 	}
 	if opts.Now != nil {
 		pool.now = opts.Now
+	}
+	if opts.Jitter != nil {
+		pool.jitter = opts.Jitter
 	}
 
 	service := newService(opts.Repo, opts.Defaults, opts.AllowExecutable, cancels, runtimes, func() string {

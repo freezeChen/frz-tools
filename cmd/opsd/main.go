@@ -78,7 +78,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		return domain.NewError(v1.CodeInternal, "执行数据库迁移失败: %v", err)
 	}
 
-	recovered, err := application.Recover(ctx, store, logger, time.Now().UTC())
+	recovered, err := application.Recover(ctx, store, logger, time.Now().UTC(), application.RecoveryOptions{})
 	if err != nil {
 		return domain.NewError(v1.CodeInternal, "启动时的恢复流程失败: %v", err)
 	}

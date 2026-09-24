@@ -303,7 +303,7 @@ func intQuery(r *http.Request, name string, fallback int) (int, error) {
 }
 
 func operationDTO(op *domain.Operation) v1.Operation {
-	return v1.Operation{
+	dto := v1.Operation{
 		ID:             op.ID,
 		Kind:           op.Kind,
 		Resource:       op.Resource,
@@ -322,6 +322,24 @@ func operationDTO(op *domain.Operation) v1.Operation {
 		FinishedAt:     op.FinishedAt,
 		CreatedBy:      op.CreatedBy,
 	}
+
+	// attempt / maxAttempts 始终有值：未声明重试的操作是 1 / 1，让调用方不必区分
+	// 「字段缺失」与「就执行这一次」。
+	dto.Attempt = op.Attempt
+	if dto.Attempt < 1 {
+		dto.Attempt = 1
+	}
+	dto.MaxAttempts = op.RetryPolicy.MaxAttempts
+	if dto.MaxAttempts < 1 {
+		dto.MaxAttempts = 1
+	}
+	// nextAttemptAt 只在「还在排队」时有意义：终态的操作不会再有下一次，
+	// 给它一个时间只会让人以为还有希望。
+	if op.Status == domain.StatusPending && op.NotBefore != nil {
+		dto.NextAttemptAt = op.NotBefore
+	}
+	dto.RetryExhausted = op.RetryExhausted()
+	return dto
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

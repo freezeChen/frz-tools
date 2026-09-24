@@ -151,11 +151,11 @@ func TestCreateIdempotency(t *testing.T) {
 }
 
 func TestRequestHashIgnoresKeyOrder(t *testing.T) {
-	a, err := requestHash(v1.KindExecutorCommand, "r", false, json.RawMessage(`{"argv":["/usr/bin/true"],"timeoutSeconds":5}`))
+	a, err := requestHash(v1.KindExecutorCommand, "r", false, nil, json.RawMessage(`{"argv":["/usr/bin/true"],"timeoutSeconds":5}`))
 	if err != nil {
 		t.Fatalf("hash: %v", err)
 	}
-	b, err := requestHash(v1.KindExecutorCommand, "r", false, json.RawMessage(`{"timeoutSeconds":5,"argv":["/usr/bin/true"]}`))
+	b, err := requestHash(v1.KindExecutorCommand, "r", false, nil, json.RawMessage(`{"timeoutSeconds":5,"argv":["/usr/bin/true"]}`))
 	if err != nil {
 		t.Fatalf("hash: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestRecoverFailsInterruptedOperation(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	count, err := Recover(ctx, store, discardLogger(), time.Now().UTC())
+	count, err := Recover(ctx, store, discardLogger(), time.Now().UTC(), RecoveryOptions{})
 	if err != nil {
 		t.Fatalf("recover: %v", err)
 	}

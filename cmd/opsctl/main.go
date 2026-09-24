@@ -192,6 +192,16 @@ func printOperation(op *v1.Operation) {
 	if op.RetryOf != "" {
 		fmt.Printf("retryOf:   %s\n", op.RetryOf)
 	}
+	// 只有真的牵涉重试时才打印这几行，避免给每一个普通操作都加噪音。
+	if op.MaxAttempts > 1 || op.Attempt > 1 {
+		fmt.Printf("attempt:   %d/%d\n", op.Attempt, op.MaxAttempts)
+	}
+	if op.NextAttemptAt != nil {
+		fmt.Printf("nextAttemptAt: %s\n", op.NextAttemptAt.Format(time.RFC3339))
+	}
+	if op.RetryExhausted {
+		fmt.Println("retry:     尝试次数已用尽，不会再自动重试")
+	}
 	if op.ExitCode != nil {
 		fmt.Printf("exitCode:  %d\n", *op.ExitCode)
 	}

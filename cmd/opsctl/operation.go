@@ -29,11 +29,14 @@ func newOperationCommand(opts *rootOptions) *cobra.Command {
 
 func newSubmitCommand(opts *rootOptions) *cobra.Command {
 	var (
-		kind     string
-		resource string
-		idemKey  string
-		dryRun   bool
-		secrets  []string
+		kind          string
+		resource      string
+		idemKey       string
+		dryRun        bool
+		secrets       []string
+		retryMax      int
+		retryBase     time.Duration
+		retryMaxDelay time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -61,12 +64,32 @@ func newSubmitCommand(opts *rootOptions) *cobra.Command {
 				return err
 			}
 
+			// --retry-* 任一被显式设置就构成一个重试策略；都没设时不带 retry 段，
+			// 也就是不自动重试（1d 规格 D2）。
+			var retry *v1.RetrySpec
+			if cmd.Flags().Changed("retry-max") || cmd.Flags().Changed("retry-base") || cmd.Flags().Changed("retry-max-delay") {
+				base, err := wholeSeconds(retryBase, "retry-base")
+				if err != nil {
+					return err
+				}
+				maxDelay, err := wholeSeconds(retryMaxDelay, "retry-max-delay")
+				if err != nil {
+					return err
+				}
+				retry = &v1.RetrySpec{
+					MaxAttempts:      retryMax,
+					BaseDelaySeconds: base,
+					MaxDelaySeconds:  maxDelay,
+				}
+			}
+
 			operation, created, err := opts.client().CreateOperation(cmd.Context(), v1.CreateOperationRequest{
 				Kind:           kind,
 				Resource:       resource,
 				DryRun:         dryRun,
 				Spec:           spec,
 				IdempotencyKey: idemKey,
+				Retry:          retry,
 			})
 			if err != nil {
 				return err
@@ -86,6 +109,12 @@ func newSubmitCommand(opts *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&resource, "resource", "", "操作期间持有的资源锁，相同资源会串行执行（必填）")
 	cmd.Flags().StringVar(&idemKey, "idempotency-key", "", "幂等键；相同请求再次提交会复用同一个操作")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "只校验并记录计划，不执行任何东西")
+	cmd.Flags().IntVar(&retryMax, "retry-max", 0,
+		"最多尝试次数，含首次（1 表示不重试，上限 10）。省略则不自动重试")
+	cmd.Flags().DurationVar(&retryBase, "retry-base", 0,
+		"退避基数（默认 5s），失败后按指数增长并叠加 ±20% 抖动")
+	cmd.Flags().DurationVar(&retryMaxDelay, "retry-max-delay", 0,
+		"退避上限（默认 5m），也是抖动之后的绝对上限")
 	cmd.Flags().StringArrayVar(&secrets, "secret-env", nil,
 		"把凭据注入命令环境，格式 VAR=kind:name（kind 为 env 或 file）；明文不会进入请求体或日志")
 	_ = cmd.MarkFlagRequired("resource")
@@ -210,4 +239,16 @@ func newLogsCommand(opts *rootOptions) *cobra.Command {
 	cmd.Flags().BoolVar(&follow, "follow", false, "流式输出，本迭代保留参数但尚未实现")
 
 	return cmd
+}
+
+// wholeSeconds 把时长转成整秒。API 的重试字段以秒为单位，非整秒的输入会被静默截断，
+// 那等于悄悄改了用户给的退避时间——所以直接拒绝，而不是替用户取整。
+func wholeSeconds(d time.Duration, flag string) (int, error) {
+	if d < 0 {
+		return 0, domain.NewError(v1.CodeRetryPolicyInvalid, "--%s 不能为负数", flag)
+	}
+	if d%time.Second != 0 {
+		return 0, domain.NewError(v1.CodeRetryPolicyInvalid, "--%s 必须是整秒（got %s）", flag, d)
+	}
+	return int(d / time.Second), nil
 }

@@ -23,6 +23,17 @@ type CreateOperationRequest struct {
 	Spec           json.RawMessage `json:"spec,omitempty"`
 	IdempotencyKey string          `json:"idempotencyKey,omitempty"`
 	CreatedBy      string          `json:"createdBy,omitempty"`
+	// Retry 省略即不重试（1d 规格 D2）。执行器跑的是任意 argv，默认重试等于
+	// 默认重复执行副作用，所以自动重试必须由调用方显式声明。
+	Retry *RetrySpec `json:"retry,omitempty"`
+}
+
+// RetrySpec 是提交时声明的重试策略。字段省略时取服务端默认值（base 5s、maxDelay 5m）。
+type RetrySpec struct {
+	MaxAttempts         int      `json:"maxAttempts,omitempty"`
+	BaseDelaySeconds    int      `json:"baseDelaySeconds,omitempty"`
+	MaxDelaySeconds     int      `json:"maxDelaySeconds,omitempty"`
+	RetryableErrorCodes []string `json:"retryableErrorCodes,omitempty"`
 }
 
 type ExecutorCommandSpec struct {
@@ -60,6 +71,14 @@ type Operation struct {
 	StartedAt      *time.Time      `json:"startedAt,omitempty"`
 	FinishedAt     *time.Time      `json:"finishedAt,omitempty"`
 	CreatedBy      string          `json:"createdBy,omitempty"`
+
+	// 重试链上的位置。Attempt 从 1 开始；未声明重试的操作 attempt=1、maxAttempts=1。
+	Attempt       int        `json:"attempt"`
+	MaxAttempts   int        `json:"maxAttempts"`
+	NextAttemptAt *time.Time `json:"nextAttemptAt,omitempty"`
+	// RetryExhausted 只在「声明了重试、已失败、且到达上限」时为 true，
+	// 让调用方不必自己数链就知道不会再有下一次。
+	RetryExhausted bool `json:"retryExhausted,omitempty"`
 }
 
 type OperationResponse struct {

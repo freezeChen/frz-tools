@@ -225,7 +225,7 @@ func TestRecoverRunningMarksFailedAndReleasesLocks(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	recovered, err := store.RecoverRunning(ctx, time.Now().UTC())
+	recovered, err := store.RecoverRunning(ctx, time.Now().UTC(), nil)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
 	}

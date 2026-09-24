@@ -231,7 +231,7 @@ func chooseDispatchedMoments(moments []time.Time, policy domain.MissedRunPolicy,
 // buildOperation 把计划翻译成一条 pending Operation。它走的是与手工提交完全相同的
 // 路径，因此 resource 锁与幂等语义不会有第二套实现。
 func (s *Scheduler) buildOperation(schedule *domain.Schedule, now time.Time) (*domain.Operation, error) {
-	hash, err := requestHash(v1.KindExecutorCommand, schedule.Resource, false, schedule.Spec)
+	hash, err := requestHash(v1.KindExecutorCommand, schedule.Resource, false, nil, schedule.Spec)
 	if err != nil {
 		return nil, err
 	}

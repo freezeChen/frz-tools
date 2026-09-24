@@ -18,7 +18,7 @@ type Repository interface {
 	AppendLog(ctx context.Context, entry domain.LogEntry) error
 	AppendAudit(ctx context.Context, event domain.AuditEvent) error
 	ListLogs(ctx context.Context, operationID string, afterID int64, limit int) ([]domain.LogEntry, error)
-	RecoverRunning(ctx context.Context, now time.Time) ([]domain.Operation, error)
+	RecoverRunning(ctx context.Context, now time.Time, plan func(domain.Operation) *domain.RetryPlan) ([]domain.Operation, error)
 	ActiveLock(ctx context.Context, resource string) (*domain.ResourceLock, error)
 	CountByStatus(ctx context.Context, status domain.Status) (int, error)
 

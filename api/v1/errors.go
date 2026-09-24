@@ -36,6 +36,10 @@ const (
 	CodeRuntimeUnsupport ErrorCode = "RUNTIME_UNSUPPORTED"
 	CodeHostNotFound     ErrorCode = "HOST_NOT_FOUND"
 	CodeEnvNotFound      ErrorCode = "ENVIRONMENT_NOT_FOUND"
+
+	// 重试策略本身非法。单独成一个码而不是复用 INVALID_REQUEST：调用方需要能一眼
+	// 看出问题出在 retry 段，而不是整个请求体。
+	CodeRetryPolicyInvalid ErrorCode = "RETRY_POLICY_INVALID"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -65,6 +69,7 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeRuntimeUnsupport:     409,
 	CodeHostNotFound:         404,
 	CodeEnvNotFound:          404,
+	CodeRetryPolicyInvalid:   400,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -108,6 +113,7 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeRuntimeUnsupport:     21,
 	CodeHostNotFound:         2,
 	CodeEnvNotFound:          2,
+	CodeRetryPolicyInvalid:   22,
 }
 
 func ExitCode(code ErrorCode) int {

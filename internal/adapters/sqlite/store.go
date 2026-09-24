@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
@@ -19,7 +20,18 @@ import (
 const timeLayout = time.RFC3339Nano
 
 const operationColumns = `id, kind, resource, status, phase, dry_run, idempotency_key, request_hash,
-	retry_of, exit_code, error_code, error_message, spec_json, created_at, started_at, finished_at, created_by`
+	retry_of, exit_code, error_code, error_message, spec_json, created_at, started_at, finished_at, created_by,
+	attempt, not_before, retry_policy_json`
+
+// notBeforeLayout 是 not_before 专用的**定宽**时间格式。
+//
+// 不用仓库通用的 time.RFC3339Nano：它会裁掉末尾的零、并在小数部分为零时整个省略，
+// 于是 "…T00:00:00Z" 按字典序大于 "…T00:00:00.5Z" 而时间上更早。领取查询要在 SQL 里
+// 直接做 `not_before <= ?`，字符串序必须等于时间序，所以固定 9 位小数。
+// 定宽格式仍能被既有的 RFC3339 解析器读出，所以读回不需要额外分支。
+const notBeforeLayout = "2006-01-02T15:04:05.000000000Z"
+
+func formatNotBefore(t time.Time) string { return t.UTC().Format(notBeforeLayout) }
 
 type Store struct {
 	db *sql.DB
@@ -147,6 +159,10 @@ func (s *Store) GetOperation(ctx context.Context, id string) (*domain.Operation,
 // ClaimNextPending 在同一事务内获取资源锁，并把最旧的、可运行的 pending 操作
 // 推进为 running。没有可运行的操作时返回 (nil, nil)，例如所有 pending 操作的
 // 资源当前都被占用。
+//
+// 「可运行」包含退避：not_before 晚于 now 的操作**不领取**。退避必须在领取之前
+// 过滤掉，绝不能在领取之后 sleep——后者会让退避中的操作占着 worker，把正常的新操作
+// 饿死（迭代 1d 规格 D4）。
 func (s *Store) ClaimNextPending(ctx context.Context, now time.Time) (*domain.Operation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -158,12 +174,13 @@ func (s *Store) ClaimNextPending(ctx context.Context, now time.Time) (*domain.Op
 	err = tx.QueryRowContext(ctx, `
 		SELECT o.id FROM operations o
 		WHERE o.status = 'pending'
+		  AND (o.not_before IS NULL OR o.not_before <= ?)
 		  AND NOT EXISTS (
 		    SELECT 1 FROM resource_locks l
 		    WHERE l.resource = o.resource AND l.released_at IS NULL
 		  )
 		ORDER BY o.created_at, o.id
-		LIMIT 1`).Scan(&id)
+		LIMIT 1`, formatNotBefore(now)).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -301,6 +318,16 @@ func (s *Store) Finish(ctx context.Context, in domain.FinishInput, now time.Time
 	}); err != nil {
 		return nil, err
 	}
+
+	// 下一次尝试与本次终态在**同一个事务**里落库。分成两步做的话，两步之间崩溃会
+	// 静默丢掉这次重试——失败的操作还留在库里，看起来只是「没重试」，
+	// 没有任何迹象表明少做了一步（迭代 1d 规格 D4）。
+	if in.Retry != nil {
+		if err := insertRetryOperation(ctx, tx, op, in.Retry, now); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -479,7 +506,13 @@ func (s *Store) ActiveLock(ctx context.Context, resource string) (*domain.Resour
 
 // RecoverRunning 把上一个守护进程实例遗留的 running 操作标记为失败，并释放
 // 它们持有的锁。
-func (s *Store) RecoverRunning(ctx context.Context, now time.Time) ([]domain.Operation, error) {
+// RecoverRunning 把上一个守护进程实例遗留的 running 操作标记为失败，并释放它们持有的
+// 资源锁。被中断的命令不会被自动重放。
+//
+// plan 为每个被中断的操作返回「要不要排一次重试」（nil = 不重试）。返回非 nil 时，重试与
+// 终态在**同一个事务**里落库——分成两步做的话，两步之间崩溃会让这次重试被静默丢掉，
+// 而库里看不出任何迹象。
+func (s *Store) RecoverRunning(ctx context.Context, now time.Time, plan func(domain.Operation) *domain.RetryPlan) ([]domain.Operation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -540,6 +573,13 @@ func (s *Store) RecoverRunning(ctx context.Context, now time.Time) ([]domain.Ope
 		}); err != nil {
 			return nil, err
 		}
+		if plan != nil {
+			if retry := plan(op); retry != nil {
+				if err := insertRetryOperation(ctx, tx, &op, retry, now); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -566,14 +606,96 @@ func insertOperation(ctx context.Context, ex execer, op *domain.Operation) error
 	_, err := ex.ExecContext(ctx, `
 		INSERT INTO operations (
 			id, kind, resource, status, phase, dry_run, idempotency_key, request_hash, retry_of,
-			exit_code, error_code, error_message, spec_json, created_at, started_at, finished_at, created_by
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			exit_code, error_code, error_message, spec_json, created_at, started_at, finished_at, created_by,
+			attempt, not_before, retry_policy_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		op.ID, op.Kind, op.Resource, string(op.Status), op.Phase, boolToInt(op.DryRun),
 		nullString(op.IdempotencyKey), op.RequestHash, nullString(op.RetryOf),
 		nullableInt(op.ExitCode), nullString(op.ErrorCode), nullString(op.ErrorMessage),
 		string(op.Spec), formatTime(op.CreatedAt), nullTime(op.StartedAt), nullTime(op.FinishedAt),
-		nullString(op.CreatedBy))
+		nullString(op.CreatedBy),
+		normalizeAttempt(op.Attempt), nullNotBefore(op.NotBefore), nullBytes(op.RetryPolicyJSON))
 	return err
+}
+
+// normalizeAttempt 把未设置的 attempt 归一为 1：零值在库里没有意义，
+// 而且「第一次尝试」正是默认语义。
+func normalizeAttempt(attempt int) int {
+	if attempt < 1 {
+		return 1
+	}
+	return attempt
+}
+
+func nullNotBefore(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return formatNotBefore(*t)
+}
+
+func nullBytes(raw []byte) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return string(raw)
+}
+
+// insertRetryOperation 在同一个事务里创建重试链的下一跳。
+//
+// 它复用原操作的 kind、resource、spec 与请求摘要——重试的是**同一件事**，只是又一次
+// 尝试；只有 id、attempt、retry_of 与 not_before 是新的。attempt 从原操作派生而不由
+// 调用方传入，避免出现「链上的第几次尝试」有两个说法。
+//
+// 它刻意不走 CreateOperation 的检查：资源锁已经在同一个事务里释放，而幂等键不该被
+// 重试链复用（每一次尝试都是独立的操作，复用键会让后一次尝试被当成重复提交而被吞掉）。
+func insertRetryOperation(ctx context.Context, ex execer, original *domain.Operation, plan *domain.RetryPlan, now time.Time) error {
+	attempt := normalizeAttempt(original.Attempt) + 1
+	notBefore := plan.NotBefore
+	details := map[string]string{
+		"retryOf":   original.ID,
+		"attempt":   strconv.Itoa(attempt),
+		"notBefore": formatNotBefore(notBefore),
+		"automatic": "true",
+	}
+
+	retry := &domain.Operation{
+		ID:              plan.OperationID,
+		Kind:            original.Kind,
+		Resource:        original.Resource,
+		Status:          domain.StatusPending,
+		DryRun:          original.DryRun,
+		RequestHash:     original.RequestHash,
+		RetryOf:         original.ID,
+		Spec:            original.Spec,
+		CreatedAt:       now,
+		CreatedBy:       original.CreatedBy,
+		Attempt:         attempt,
+		NotBefore:       &notBefore,
+		RetryPolicyJSON: plan.RetryPolicyJSON,
+	}
+	if err := insertOperation(ctx, ex, retry); err != nil {
+		return err
+	}
+	if err := insertAudit(ctx, ex, domain.AuditEvent{
+		EventType:   domain.EventOperationRetried,
+		Actor:       original.CreatedBy,
+		OperationID: retry.ID,
+		Resource:    retry.Resource,
+		Result:      string(domain.StatusPending),
+		Time:        now,
+		Details:     details,
+	}); err != nil {
+		return err
+	}
+	return insertLog(ctx, ex, domain.LogEntry{
+		OperationID: retry.ID,
+		Level:       "info",
+		Phase:       domain.PhasePrepare,
+		Message:     "retry scheduled",
+		Fields:      details,
+		Time:        now,
+	})
 }
 
 func insertAudit(ctx context.Context, ex execer, event domain.AuditEvent) error {
@@ -653,24 +775,28 @@ type scanner interface {
 
 func scanOperation(sc scanner) (*domain.Operation, error) {
 	var (
-		op         domain.Operation
-		status     string
-		dryRun     int
-		idem       sql.NullString
-		retryOf    sql.NullString
-		exitCode   sql.NullInt64
-		errorCode  sql.NullString
-		errorMsg   sql.NullString
-		spec       string
-		createdAt  string
-		startedAt  sql.NullString
-		finishedAt sql.NullString
-		createdBy  sql.NullString
+		op          domain.Operation
+		status      string
+		dryRun      int
+		idem        sql.NullString
+		retryOf     sql.NullString
+		exitCode    sql.NullInt64
+		errorCode   sql.NullString
+		errorMsg    sql.NullString
+		spec        string
+		createdAt   string
+		startedAt   sql.NullString
+		finishedAt  sql.NullString
+		createdBy   sql.NullString
+		attempt     int
+		notBefore   sql.NullString
+		retryPolicy sql.NullString
 	)
 	if err := sc.Scan(
 		&op.ID, &op.Kind, &op.Resource, &status, &op.Phase, &dryRun,
 		&idem, &op.RequestHash, &retryOf, &exitCode, &errorCode, &errorMsg,
 		&spec, &createdAt, &startedAt, &finishedAt, &createdBy,
+		&attempt, &notBefore, &retryPolicy,
 	); err != nil {
 		return nil, err
 	}
@@ -682,6 +808,14 @@ func scanOperation(sc scanner) (*domain.Operation, error) {
 	op.ErrorMessage = errorMsg.String
 	op.CreatedBy = createdBy.String
 	op.Spec = json.RawMessage(spec)
+	op.Attempt = normalizeAttempt(attempt)
+	op.RetryPolicyJSON = json.RawMessage(retryPolicy.String)
+	// 策略解析失败时按「不重试」处理，但**保留原文**（RetryPolicyJSON 上面已经赋上），
+	// 所以这行操作仍然可以在库里被看见、被排查。这里刻意不返回错误：
+	// 一条策略写坏的行不该让整条查询失败，导致连「它存在」都看不到。
+	if policy, err := domain.ParseRetryPolicy(op.RetryPolicyJSON); err == nil {
+		op.RetryPolicy = policy
+	}
 	if exitCode.Valid {
 		code := int(exitCode.Int64)
 		op.ExitCode = &code
@@ -689,6 +823,13 @@ func scanOperation(sc scanner) (*domain.Operation, error) {
 	var err error
 	if op.CreatedAt, err = parseTime(createdAt); err != nil {
 		return nil, err
+	}
+	if notBefore.Valid {
+		t, err := parseTime(notBefore.String)
+		if err != nil {
+			return nil, err
+		}
+		op.NotBefore = &t
 	}
 	if startedAt.Valid {
 		t, err := parseTime(startedAt.String)
