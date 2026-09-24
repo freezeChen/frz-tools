@@ -560,6 +560,24 @@ func CurrentReleaseDir(application string) string {
 	return path.Join(ReleaseRootDir(application), "current")
 }
 
+// InReleaseTree 报告 candidate 是否落在该应用的 releases 子树**内部**（子树根自身不算）。
+//
+// 它存在是因为一条容易踩到的分工：releases 子树归 ReleaseAdapter 所有——根由物化建、
+// release 目录由解包建、`current` 由切换建。运行时适配器若「顺手把目录建出来」，就会在
+// **第一次部署**时把 `exec.workingDirectory` 指向的 `current` 建成一个**实体目录**，
+// 之后 Activate 的 `rename(current.tmp, current)` 会因为目标是目录而失败
+// ——而那时报出来的错是「改名失败」，与真实原因（有人在建我该建的东西）毫无关系。
+//
+// 判据用 path.Clean：manifest 只保证「是绝对路径」，尾随斜杠会让前缀比较凭空失败。
+func InReleaseTree(application, candidate string) bool {
+	root := ReleaseRootDir(application)
+	cleaned := path.Clean(candidate)
+	if cleaned == root {
+		return false
+	}
+	return strings.HasPrefix(cleaned, root+"/")
+}
+
 // ResolveArgv 把 manifest 里的 argv 解析成最终要执行的 argv（迭代 3 规格 D4）。
 //
 // **只解析 argv[0]**：绝对路径原样，相对路径拼到 release 的 current 之下。

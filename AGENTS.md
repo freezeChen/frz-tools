@@ -22,8 +22,9 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 **2d（保留策略与 `prune`）已实现并验证**——范围是**只用 `keepLast` / `keepDays`**，
 **GFS 已按用户指示移出并停放为未来迭代目标**
 （见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）。
-**迭代 3（Go/Java 通用进程部署）的 3a / 3b 已实现并验证**（解包与 release 目录、部署与回滚），
-**3c（资源限制与 Java 运行时）未开始**；迭代 4–5 未开始。
+**迭代 3（Go/Java 通用进程部署）的 3a / 3b / 3c 都已实现**（解包与 release 目录、部署与回滚、
+资源限制与 Java 运行时的解释器预检）；其中 **3c 的真机复跑与重启验证未完成**（容器与单元/集成
+证据齐全），迭代 4–5 未开始。
 **真实 Linux 主机的证据已于 2026-09-24 取得**（Rocky Linux 10.2 / systemd 257 / SELinux
 enforcing，含一次真实重启，见 `test/host/`）；
 **仍缺 `legacy` 档（systemd 219–239）的证据**，这一项不得写成已验证。
@@ -43,7 +44,8 @@ enforcing，含一次真实重启，见 `test/host/`）；
 - `docs/plans/2026-09-21-iteration-1d.md`：任务引擎的重试、退避与并发策略（已实现并提交）
 - `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b、2d 已实现并验证；
   GFS 已移出 2d，见第 22 节）
-- `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a、3b 已实现并验证，3c 未开始）
+- `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a/3b/3c 已实现；
+  3c 的真机复跑未完成，见 §17）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -132,9 +134,10 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 151**（2026-09-24 迭代 3b 落地后实跑：151 通过 / 0 失败，其中 1c 的 `check_runtime`
+当前为 170**（2026-09-24 迭代 3c 落地后实跑：170 通过 / 0 失败，其中 1c 的 `check_runtime`
 49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项、2d 的 `check_prune` 13 项、
-3b 的 `check_deploy` 20 项；历史快照：2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
+3b 的 `check_deploy` 23 项（原 20 + 迭代 3c 加的「物化失败」3 项）、3c 的 `check_resources`
+16 项；历史快照：3b 时点 151 项、2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
 1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在
@@ -148,10 +151,16 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 **不等于「Linux 主机」**——sudoers/PAM 实际策略与 `legacy` 档（systemd 219–239，
 容器只有 255）都仍是**未验证**。
 
+**在那台主机上排查时不要用 `pkill` / `killall` 这类宽匹配的杀进程方式**：它上面跑着不在
+systemd 下、也不在容器里的业务进程（`/home/data/ems/ems-server` 由 `nohup ./start.sh` 启动），
+杀掉之后没有任何东西会把它拉起来。2026-09-24 一次 `pkill -x java` 就把它一起杀了（停了约
+72 秒才人工恢复）。要停什么就指名道姓：`systemctl stop <unit>`（harness 只这么做）或明确的 PID。
+
 `make verify-host`（`test/host/run.sh` + `test/host/verify.sh`）是**第一类「Linux 主机」证据**：
 在一台真实主机（2026-09-24：**Rocky Linux 10.2 / 内核 6.12 / systemd 257 / SELinux Enforcing** /
 x86_64）上把 opsd 装成 systemd 服务、跑完 RuntimeAdapter 的生命周期与真实的 MySQL 8.4 备份闭环，
-实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），结束时把主机上创建的一切删干净。
+1c/2b 那一轮实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），结束时把主机上创建的一切
+删干净。
 **重启验证也做了**（用户单独授权重启那台机）：停机 44 秒、`boot_id` 前后不同（这是「真的
 重启过」的硬证据）、重启后 **21 项通过 / 0 项失败**——两个 unit 都 enabled 且自动回到 active、
 **`/run/opsd` 由 systemd 重新创建**（`/run` 是 tmpfs，容器里被 `install -d` 掩盖的那一点）、
@@ -162,6 +171,15 @@ x86_64）上把 opsd 装成 systemd 服务、跑完 RuntimeAdapter 的生命周�
 都落在 `unconfined_service_t`——本工具不提供 SELinux 加固，这一条是「未实现」而不是「已支持」**；
 以 root 运行的 opsd 建出的 socket 是 `root:root 0660`，非 root 用户用不了 opsctl（配置里没有
 socket 属组项）；MySQL 的隔离恢复对备份账号的权限要求不只是 CREATEDB（见 `iteration-2.md` 第 21 节）。
+
+迭代 3c 又跑了一轮（`full` 阶段，新增部署、真 JVM 与资源限制）：**111 项通过 / 1 项失败**，
+那一项正是缺陷（预检失败时 Operation 报 `DEPLOY_ROLLED_BACK` 而不是原因码，已修复）。
+通过的部分包含真机才有的证据：用 `/opt/jdk-17.0.1` 编译打包的真实 JAR 部署成功并起来、
+**JVM 报告的工作目录就是 `current` 解析出的 release 目录**、**`/proc/<pid>/cmdline` 与
+manifest 的 argv 逐元素一致**、`-Xmx256m` 生效、`systemctl show` 与 **cgroup 的
+`memory.max` / `cpu.max`** 都是声明的值。**修复后的复跑与「部署出来的 release 跨重启存活」
+那一轮尚未执行**（复跑前那台主机从本机完全不可达：整个 `192.168.11.0/24` 连同网关都不通），
+因此 **3c 的真机验证未完成，不得写成已验证**——见 `iteration-3.md` §17。
 
 `make verify-db`（`test/linux/verify-db.sh`）是**另一类**容器证据：它在真实的
 PostgreSQL / MySQL / MariaDB 实例上跑备份适配器的共享合约（`test/dbbackup`，由
@@ -236,6 +254,12 @@ docker run -d --privileged --cgroupns=host \
   二进制应通过容器内构建或 `docker cp` 进入，测试状态留在容器文件系统内。
 - **`docker cp` 不要写进 `/tmp`**：`--tmpfs /tmp` 会遮住容器根文件系统里的同名目录，
   复制看似成功但 `docker exec` 看不到文件。改用 `/opt` 下的路径中转。
+
+**cgroup 路径不要写死**（迭代 3c）：`/sys/fs/cgroup/system.slice/<unit>` 在容器里**不存在**
+——那台容器的 systemd 跑在自己的 cgroup 命名空间里（`/sys/fs/cgroup/docker/<id>/system.slice/…`）。
+可移植的来源是 `systemctl show <unit> -p ControlGroup --value`，再拼到 `/sys/fs/cgroup` 上。
+另外 `systemctl show` 报 CPU 配额用的是时间量写法：`CPUQuota=200%` → `CPUQuotaPerSecUSec=2s`，
+内核那一侧则是 `cpu.max` 的 `200000 100000`（`<quota> <period>`）。
 
 shell 脚本中变量名后紧跟中文全角字符时，必须写成 `${var}`。macOS 自带的 bash 3.2 会把
 多字节字符的前几个字节算进变量名，报 `unbound variable`；CI 上的 bash 5 不会暴露这个问题。

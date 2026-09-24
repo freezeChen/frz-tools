@@ -29,6 +29,11 @@ const (
 	// TierStrictMinVersion 由 StandardOutput=append: 的最低版本决定（240），
 	// 它是两档里门槛最高的那条指令。
 	TierStrictMinVersion = 240
+	// memoryMaxMinVersion 是 MemoryMax= 的最低版本（231）。
+	//
+	// 它落在两档之间：strict 档（≥240）一定支持，legacy 档（219～239）**有一部分不支持**。
+	// 因此它是「legacy 档 + 内存上限 = 拒绝」这条规则的依据（见 RenderUnit）。
+	memoryMaxMinVersion = 231
 )
 
 // RestartSec 是重启间隔。systemd 默认 100ms 对「崩溃即重启」的循环来说太快，
@@ -65,6 +70,10 @@ func (t Tier) Degradations() []string {
 		return []string{
 			"日志改投 journal：legacy 档不支持 StandardOutput=append:，无法实现「每次启动不截断」的追加语义；opsd 当前按文件读日志，按 Operation 查日志需要改走 journalctl。",
 			"文件系统防护降级为 ProtectSystem=yes：写权限不再被限制在显式列出的路径上，隔离强度低于 strict 档。",
+			// MemoryMax= 是 231 才有的指令。而 219～239 这一档里既有「支持」也有
+			// 「不支持」的版本，因此这里不是「降级」而是**拒绝**：声明了内存上限的规格
+			// 在这一档上直接报 RUNTIME_UNSUPPORTED，见 RenderUnit。
+			"不支持 resources.memoryMaxBytes（MemoryMax= 需要 systemd 231，本档覆盖的 219～239 里有一部分表达不了）：声明了内存上限的规格会被显式拒绝，而不是生成一个语义未定的 unit。",
 			tierLegacyUnverifiedNote,
 		}
 	}
@@ -125,6 +134,20 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 		return Rendered{}, err
 	}
 
+	// 资源限制在这一档能不能表达（迭代 3c）。
+	//
+	// CPUQuota= 需要 213 —— 两档都满足（本工具的最低支持版本是 219）。
+	// MemoryMax= 需要 231，而 legacy 档覆盖 219～239，**有一部分表达不了**。这里刻意
+	// 拒绝而不是「发出去看看」：我们没有在 219～230 上验证过 systemd 面对一条它不认识的
+	// 指令会怎么处理，而两种可能都不能接受——被忽略意味着 manifest 里写着的内存上限
+	// **静默失效**（服务实际可以吃满整台机器），被拒绝意味着服务直接起不来。二者都不是
+	// 用户声明这条限制时想要的，因此宁可让 Prepare 明确失败。
+	if tier == TierLegacy && spec.Resources.MemoryMaxBytes > 0 {
+		return Rendered{}, domain.NewError(v1.CodeRuntimeUnsupport,
+			"systemd %d 落在 legacy 档（%d～%d）：该档无法表达 resources.memoryMaxBytes（MemoryMax= 需要 %d），拒绝生成一个语义未定的 unit；请升级 systemd 或去掉内存上限",
+			systemdVersion, MinSupportedSystemdVersion, TierStrictMinVersion-1, memoryMaxMinVersion)
+	}
+
 	writable := []string{
 		spec.Exec.WorkingDirectory,
 		spec.Logs.Directory,
@@ -168,6 +191,21 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 	fmt.Fprintf(&b, "RestartSec=%d\n", int(RestartSec/time.Second))
 	fmt.Fprintf(&b, "TimeoutStartSec=%d\n", startSeconds)
 	fmt.Fprintf(&b, "TimeoutStopSec=%d\n", stopSeconds)
+
+	// 资源限制（迭代 3c）。**0 一律表示「不限制」，因此那一行不写**：写 `CPUQuota=0`
+	// 或 `MemoryMax=0` 能不能被 systemd 正确理解，我们没有在真机上验证过，而「不写」
+	// 的语义是确定的（沿用它自己的默认值）。
+	//
+	// MemoryMax= 写**原始字节数**而不是 `512M` 这种后缀：后缀要经过一次单位换算，而
+	// 换算一旦写错（K/M 按 1000 还是 1024）就是一个静默的、差一点点生效的限制——那正是
+	// 最难发现的一类错误。字节数没有这个问题，且 systemd 本来就接受它。
+	if spec.Resources.CPUQuotaPercent > 0 {
+		fmt.Fprintf(&b, "CPUQuota=%d%%\n", spec.Resources.CPUQuotaPercent)
+	}
+	if spec.Resources.MemoryMaxBytes > 0 {
+		fmt.Fprintf(&b, "MemoryMax=%d\n", spec.Resources.MemoryMaxBytes)
+	}
+
 	b.WriteString("NoNewPrivileges=true\n")
 	b.WriteString("PrivateTmp=true\n")
 

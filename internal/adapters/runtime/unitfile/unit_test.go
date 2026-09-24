@@ -396,3 +396,77 @@ func TestRenderForVersionPicksTierFromVersion(t *testing.T) {
 		t.Fatal("218 必须报错")
 	}
 }
+
+// ==== 资源限制（迭代 3c）====
+
+// 断言的是**字节级**的形式：MemoryMax= 写原始字节数，不写 `512M` 这种后缀——
+// 后缀要过一道单位换算，而换算写错就是一个「差一点点生效」的限制。
+func TestRenderUnitResources(t *testing.T) {
+	spec := validSpec()
+	spec.Resources = domain.SpecResources{CPUQuotaPercent: 200, MemoryMaxBytes: 536870912}
+
+	got, err := RenderUnit(spec, TierStrict, 255)
+	if err != nil {
+		t.Fatalf("RenderUnit: %v", err)
+	}
+	body := directiveLines(got.Content)
+	for _, want := range []string{"CPUQuota=200%\n", "MemoryMax=536870912\n"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("渲染结果缺少 %q:\n%s", want, got.Content)
+		}
+	}
+	// 声明了限制的 unit 必须真的能被 systemd 读到：两条指令都在 [Service] 段里。
+	service := got.Content[strings.Index(got.Content, "[Service]"):strings.Index(got.Content, "[Install]")]
+	for _, want := range []string{"CPUQuota=200%\n", "MemoryMax=536870912\n"} {
+		if !strings.Contains(service, want) {
+			t.Fatalf("%q 不在 [Service] 段里:\n%s", want, got.Content)
+		}
+	}
+}
+
+// 0 = 不限制：**那一行不写**，而不是写 `CPUQuota=0`。`0` 会被 systemd 解释成什么
+// 我们没有在真机上验证过，而「不写」的语义是确定的。
+func TestRenderUnitOmitsResourcesWhenUnlimited(t *testing.T) {
+	spec := validSpec() // Resources 全 0
+	got, err := RenderUnit(spec, TierStrict, 255)
+	if err != nil {
+		t.Fatalf("RenderUnit: %v", err)
+	}
+	if strings.Contains(directiveLines(got.Content), "CPUQuota=") ||
+		strings.Contains(directiveLines(got.Content), "MemoryMax=") {
+		t.Fatalf("不限制时不该写出资源指令:\n%s", got.Content)
+	}
+}
+
+// legacy 档（219～239）里有一部分 systemd 没有 MemoryMax=（需要 231）。
+// 这里刻意**拒绝**而不是发出去：被忽略 = 声明的内存上限静默失效，被拒绝 = 服务起不来，
+// 两种都不能接受，因此宁可让 Prepare 明确失败。
+func TestRenderUnitRefusesMemoryMaxOnLegacyTier(t *testing.T) {
+	spec := validSpec()
+	spec.Resources = domain.SpecResources{MemoryMaxBytes: 536870912}
+
+	_, err := RenderUnit(spec, TierLegacy, 239)
+	if domain.CodeOf(err) != v1.CodeRuntimeUnsupport {
+		t.Fatalf("want RUNTIME_UNSUPPORTED, got %v", err)
+	}
+
+	// 只声明 CPU 配额时 legacy 档照常工作：CPUQuota= 需要 213，两档都满足。
+	spec.Resources = domain.SpecResources{CPUQuotaPercent: 200}
+	got, err := RenderUnit(spec, TierLegacy, 239)
+	if err != nil {
+		t.Fatalf("legacy 档只声明 CPU 配额时不应当报错: %v", err)
+	}
+	if !strings.Contains(directiveLines(got.Content), "CPUQuota=200%\n") {
+		t.Fatalf("legacy 档应当渲染 CPUQuota=:\n%s", got.Content)
+	}
+	// 语义损失必须能出现在审计里：降级/拒绝这件事不能只存在于这次报错中。
+	refused := false
+	for _, degradation := range TierLegacy.Degradations() {
+		if strings.Contains(degradation, "memoryMaxBytes") {
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatal("legacy 档的语义损失里应当写明无法表达内存上限")
+	}
+}

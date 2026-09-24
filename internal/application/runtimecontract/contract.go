@@ -6,8 +6,12 @@ package runtimecontract
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/application"
 	"github.com/freezeChen/frz-tools/internal/domain"
 )
@@ -65,6 +69,37 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		broken.Exec.Argv = nil // argv 为空，spec.Validate 必然失败
 		if err := (*adapter).Validate(ctx, &broken); err == nil {
 			t.Fatal("非法规格必须被 Validate 拒绝")
+		}
+	})
+
+	// java 的解释器预检（迭代 3c）属于**端口语义**，因此两个实现必须同一条：
+	// 解释器不在时拒绝（且报错要指向那个路径），到位时放行。
+	t.Run("java 解释器不存在时拒绝，到位时放行", func(t *testing.T) {
+		adapter, spec := next(t)
+		ctx := context.Background()
+
+		jvm := *spec
+		jvm.Runtime = domain.RuntimeKindJava
+		missing := filepath.Join(t.TempDir(), "jdk-17.0.1", "bin", "java")
+		jvm.Exec.Argv = []string{missing, "-Xmx512m", "-jar", "app.jar"}
+
+		err := (*adapter).Validate(ctx, &jvm)
+		if domain.CodeOf(err) != v1.CodeManifestInvalid {
+			t.Fatalf("解释器不存在时 want MANIFEST_INVALID, got %v", err)
+		}
+		if !strings.Contains(err.Error(), missing) {
+			t.Fatalf("报错必须带上那个路径，否则运维不知道该改什么: %v", err)
+		}
+
+		// 到位之后必须放行——否则这条检查只是「什么都拦」，而「什么都拦」会让
+		// 所有 java 部署在真机上直接不可用。
+		interpreter := filepath.Join(t.TempDir(), "java")
+		if writeErr := os.WriteFile(interpreter, []byte("#!/bin/sh\n"), 0o755); writeErr != nil {
+			t.Fatalf("写夹具: %v", writeErr)
+		}
+		jvm.Exec.Argv[0] = interpreter
+		if err := (*adapter).Validate(ctx, &jvm); err != nil {
+			t.Fatalf("解释器到位时应当通过: %v", err)
 		}
 	})
 

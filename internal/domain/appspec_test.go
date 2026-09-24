@@ -199,3 +199,32 @@ func validGoSpec() *ApplicationSpec {
 		Logs: SpecLogs{Directory: "/var/log/orders-api"},
 	}
 }
+
+// InReleaseTree 是「谁来建 releases 子树里的目录」这条分工的判据，因此它的边界要钉死：
+// 子树**根**自己算「不在内部」（根由运行时适配器建，unit 的 ReadWritePaths= 指着它），
+// 而 `current` 与任何 release 目录都算「在内部」（由 ReleaseAdapter 建）。
+func TestInReleaseTree(t *testing.T) {
+	const app = "orders-api"
+	root := ReleaseRootDir(app) // /opt/opsd/apps/orders-api/releases
+
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{root, false},
+		{root + "/", false}, // manifest 只保证绝对路径，尾随斜杠不该让前缀比较凭空失败
+		{root + "/current", true},
+		{root + "/current/bin/server", true},
+		{root + "/rel_1", true},
+		{root + "extra/x", false}, // 前缀相同的兄弟目录不是子树内部
+		{ReleaseDir(app, "rel_1"), true},
+		{"/var/lib/" + app, false},
+		{"/opt/opsd/apps/other-app/releases/current", false}, // 别的应用
+		{"/opt/opsd/apps/" + app + "/current", false},        // 1c 的老路径，不是 releases 子树
+	}
+	for _, tc := range cases {
+		if got := InReleaseTree(app, tc.path); got != tc.want {
+			t.Errorf("InReleaseTree(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}

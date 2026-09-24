@@ -12,9 +12,16 @@
 # 也不会影响正在执行的自己）。
 #
 # 主机上会创建并**在结束时删除**：系统用户/组 frz-ops 与 frz-probe、
-# /etc/opsd、/var/lib/opsd、/var/log/opsd、/run/opsd、/opt/frz-ops、
-# /var/lib/frz-probe、/var/log/frz-probe、以及两个 unit 文件。
+# /etc/opsd、/var/lib/opsd、/var/log/opsd、/run/opsd、/opt/frz-ops、/opt/opsd（release
+# 目录树）、/var/lib/frz-probe、/var/log/frz-probe、以及 unit 文件；迭代 3 又加了三个
+# 夹具应用（frz-dep / frz-java / frz-javabad）与它们的用户、unit、目录。
 # 这是生产机，跑完就走比留现场重要。
+#
+# **在那台主机上排查时不要用 `pkill` / `killall` 这类宽匹配的杀进程方式**：它上面跑着
+# 不在 systemd 下、也不在容器里的业务进程（例如 `/home/data/ems/ems-server`，由
+# `nohup ./start.sh` 启动），杀掉之后没有任何东西会把它拉起来。2026-09-24 一次
+# `pkill -x java` 就把那台业务 JVM 杀了（停了约 72 秒才人工恢复）。要停什么就指名道姓：
+# `systemctl stop <unit>`（本脚本与 verify.sh 都只这么做）或者明确的 PID。
 
 set -euo pipefail
 
@@ -47,6 +54,9 @@ for target in "opsd:./cmd/opsd" "opsctl:./cmd/opsctl" "frz-probe:./test/linux/pr
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -C "$REPO_ROOT" -o "$WORK_DIR/bin/$name" "$pkg"
 done
 cp "$REPO_ROOT/test/host/opsd.host.verify.yaml" "$WORK_DIR/"
+# Java 探针的源码跟着上传，**由主机上的真 JDK 编译打包**：那一档要证明的正是
+# 「真 JVM 能跑」，在开发机上交叉编译一个 jar 反而绕开了要验的东西。
+cp "$REPO_ROOT/test/host/JavaProbe.java" "$WORK_DIR/"
 
 # kind=file 凭据的源：多行、含反斜杠与引号、**不以换行结尾**——与容器 harness 同一份
 # 内容，这样两个 harness 在这条断言上比的是同一件事。

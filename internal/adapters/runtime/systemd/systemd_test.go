@@ -16,6 +16,7 @@ import (
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/release/local"
 	"github.com/freezeChen/frz-tools/internal/adapters/runtime/systemd"
 	"github.com/freezeChen/frz-tools/internal/adapters/runtime/unitfile"
 	"github.com/freezeChen/frz-tools/internal/domain"
@@ -897,5 +898,91 @@ func TestEnvironmentFilesAreSorted(t *testing.T) {
 	}
 	if !sort.StringsAreSorted(names) {
 		t.Fatalf("环境文件的键必须有序，got %v", names)
+	}
+}
+
+// Prepare 不得把 releases 子树**内部**的目录建出来（迭代 3c）。
+//
+// 这条测试的存在理由是一个真实的缺陷：`exec.workingDirectory` 的推荐写法就是 release 的
+// `current`（那样 `java -jar app.jar` 才能按工作目录解析到制品里的 JAR），而部署流程是
+// **先 Prepare、后物化/切换**。Prepare 若「顺手」把 `current` 建成实体目录，紧接着的
+// Activate 就会失败——`rename(current.tmp, current)` 的目标是个目录，报出来的是
+// 「改名失败」，与真实原因毫无关系。
+func TestPrepareDoesNotCreateReleaseTreeInternals(t *testing.T) {
+	h := newHarness(t)
+	spec := specFixture(t, "releasepath")
+	spec.Exec.WorkingDirectory = domain.CurrentReleaseDir(spec.Application)
+
+	if err := h.adapter.Prepare(context.Background(), spec); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	releasesRoot := filepath.Join(h.root, domain.ReleaseRootDir(spec.Application))
+	if info, err := os.Stat(releasesRoot); err != nil || !info.IsDir() {
+		t.Fatalf("releases 根必须被建出来（unit 的 ReadWritePaths= 指着它）: %v", err)
+	}
+	currentLink := filepath.Join(h.root, domain.CurrentReleaseDir(spec.Application))
+	if _, err := os.Lstat(currentLink); !os.IsNotExist(err) {
+		t.Fatalf("Prepare 不该建出 %s：那是 Activate 的产物，建成实体目录会让切换失败", currentLink)
+	}
+
+	// 真正的判据不是「目录没被建出来」，而是**切换能成功**——上面那条只是它的前提。
+	// 用真实的 ReleaseAdapter 切换一次：这正是部署流程里紧接着 Prepare 的那一步。
+	releases := local.New(local.WithRoot(h.root))
+	releaseDir := filepath.Join(h.root, domain.ReleaseDir(spec.Application, "rel_1"))
+	if err := os.MkdirAll(releaseDir, 0o750); err != nil {
+		t.Fatalf("建 release 目录: %v", err)
+	}
+	if err := releases.Activate(context.Background(), spec, "rel_1"); err != nil {
+		t.Fatalf("Prepare 之后 Activate 必须成功: %v", err)
+	}
+	if target, err := os.Readlink(currentLink); err != nil || target != "rel_1" {
+		t.Fatalf("current 应当指向 rel_1: target=%q err=%v", target, err)
+	}
+}
+
+// java 的解释器预检（迭代 3c）：它的错误必须**在部署之前**、且指向那个路径；
+// 而解释器从盘上消失之后，stop 仍然必须能停下来。
+func TestJavaInterpreterPreflightAndStopAfterRemoval(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	missing := filepath.Join(t.TempDir(), "jdk-17.0.1", "bin", "java")
+	spec := specFixture(t, "javaapp")
+	spec.Runtime = domain.RuntimeKindJava
+	spec.Exec.Argv = []string{missing, "-Xmx512m", "-jar", "app.jar"}
+
+	err := h.adapter.Validate(ctx, spec)
+	if domain.CodeOf(err) != v1.CodeManifestInvalid {
+		t.Fatalf("解释器不存在时 want MANIFEST_INVALID, got %v", err)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Fatalf("报错必须带上路径，否则运维不知道该改什么: %v", err)
+	}
+
+	// 解释器就位之后，同一个适配器必须放行——否则这条检查只是「什么都拦」。
+	interpreter := filepath.Join(t.TempDir(), "java")
+	if err := os.WriteFile(interpreter, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("写夹具: %v", err)
+	}
+	spec.Exec.Argv[0] = interpreter
+	if err := h.adapter.Validate(ctx, spec); err != nil {
+		t.Fatalf("解释器到位时应当通过: %v", err)
+	}
+	if err := h.adapter.Prepare(ctx, spec); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// 现在把解释器删掉（JDK 被卸载、路径被换掉的现实版本）。
+	if err := os.Remove(interpreter); err != nil {
+		t.Fatalf("删除解释器夹具: %v", err)
+	}
+	if err := h.adapter.Validate(ctx, spec); domain.CodeOf(err) != v1.CodeManifestInvalid {
+		t.Fatalf("解释器消失后 Validate 应当报错, got %v", err)
+	}
+	// stop 走的是不碰 argv[0] 的那一层：**这正是最需要这个工具的时刻**，
+	// 它不能因为解释器不在就拒绝停下来。
+	if err := h.adapter.Stop(ctx, spec); err != nil {
+		t.Fatalf("解释器消失后 Stop 仍必须成功: %v", err)
 	}
 }

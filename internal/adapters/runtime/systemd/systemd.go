@@ -182,12 +182,26 @@ func (a *Adapter) UnitDecision(unitName string) (UnitDecision, bool) {
 	return decision, ok
 }
 
-// Validate 只做检查，不产生副作用：平台能力、规格本身、以及这台主机能不能被本适配器
-// 真正管起来（systemd 是否存在、版本是否在支持范围内）。
+// Validate 在 validateSpec 之上再加一条**主机事实**的检查：java 解释器在不在
+// （迭代 3c）。它不进 validateSpec，是因为 Stop / Status / Health 走 validateSpec
+// ——见那个方法的注释。
+func (a *Adapter) Validate(ctx context.Context, spec *domain.ApplicationSpec) error {
+	if err := a.validateSpec(ctx, spec); err != nil {
+		return err
+	}
+	return unitfile.PreflightInterpreter(spec)
+}
+
+// validateSpec 是「平台 + 规格 + 这台主机能不能被管起来」那一层，**不碰 argv[0]**。
+//
+// Stop / Status / Health 刻意只走这一层：解释器或可执行文件从盘上消失（JDK 被卸载、
+// 制品目录被人手工删了）时，服务仍然必须**能停下来、状态仍然必须问得出来**。
+// 「工具在最需要它的时候拒绝工作」是最坏的一种失败——那时运维手边只有 systemctl，
+// 而他用这个工具正是为了不必手工敲那些命令。
 //
 // 平台检查放在最前：在一台没有 systemd 的机器上讨论 manifest 字段是否合法没有意义，
 // 而「不支持」才是调用方需要立刻知道的事。
-func (a *Adapter) Validate(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) validateSpec(ctx context.Context, spec *domain.ApplicationSpec) error {
 	if a.goos != "linux" {
 		return domain.NewError(v1.CodeRuntimeUnsupport,
 			"systemd 适配器只支持 Linux（当前平台 %s）", a.goos)
@@ -288,7 +302,7 @@ func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error
 
 // Stop 停止 unit。未运行时 systemctl stop 本身成功，所以重复调用是幂等的。
 func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error {
-	if err := a.Validate(ctx, spec); err != nil {
+	if err := a.validateSpec(ctx, spec); err != nil {
 		return err
 	}
 	if err := a.prepared(spec); err != nil {
@@ -305,7 +319,7 @@ func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error 
 // 认不出来的取值一律落到 unknown，绝不落到 active——把未知状态当成「在运行」会让
 // 上层在应用其实没起来的时候继续往下走。
 func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error) {
-	if err := a.Validate(ctx, spec); err != nil {
+	if err := a.validateSpec(ctx, spec); err != nil {
 		return domain.RuntimeUnknown, err
 	}
 	return a.unitStatus(ctx, spec)
@@ -320,7 +334,7 @@ func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec) (dom
 //     返回 RUNTIME_NOT_READY 硬错误，这是确定性失败，再给快照只会让调用方一直等；
 //   - 探活连续通过 consecutiveSuccesses 次：Ready=true。
 func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeHealth, error) {
-	if err := a.Validate(ctx, spec); err != nil {
+	if err := a.validateSpec(ctx, spec); err != nil {
 		return domain.RuntimeHealth{}, err
 	}
 	unitName := spec.Systemd.UnitName

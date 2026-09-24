@@ -104,6 +104,14 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 - `runtime.start`/`stop` 与 `POST /api/v1/operations` 走同一条 `Service.Create`：锁、幂等键、
   请求摘要、审计、日志、取消全部复用，因此 `operation get/logs/cancel/retry` 对它们同样适用。
   `runtime.*` 读的是应用的**当前**规格，不是创建时的快照。
+- **`releases` 子树内部归 `ReleaseAdapter`**（`domain.InReleaseTree`）：根由物化建、release 目录
+  由解包建、`current` 由切换建。运行时适配器的 `Prepare` **不得**把 `current`（或任何子树内的
+  路径）建成实体目录——那样符号链接切换会因为改名目标是目录而失败，而报出来的是「改名失败」。
+  `runtime.*` 的 `Stop`/`Status`/`Health` 只走 `validateSpec`（不查 `argv[0]`）：解释器或可执行
+  文件从盘上消失时，服务仍然必须能停下来、状态仍然必须问得出来。
+- **部署失败时的错误码只说一件事**：`DEPLOY_ROLLED_BACK` = 「改动过线上并且把它撤销了」。
+  什么都没被动过（失败发生在本版本被应用之前）时返回**原因码**；`current` 切过或旧版本被停过
+  都必须撤销，两者是两个独立的标记（`switched` / `stoppedPrevious`）。
 
 ### 版本化信封与迁移
 
@@ -130,20 +138,24 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   **迭代 2a（备份）与 2b（PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
   **2d（保留策略与 `prune`）也已实现并验证**，范围是只用 `keepLast`/`keepDays`；
   **GFS 已移出**并停放在停放区第 2 节（未实现）。
-  **迭代 3 的 3a / 3b 已实现并验证**（制品解包成 release 目录、部署与回滚）；
-  **3c（资源限制与 Java 运行时）未开始**。
+  **迭代 3 的 3a / 3b / 3c 都已实现**（制品解包成 release 目录、部署与回滚、资源限制与
+  Java 运行时的解释器预检）；**3c 的真机复跑与重启验证未完成**（容器与单元/集成证据齐全）。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
-  「`%d` 项通过，`%d` 项失败」；不要引用静态推导值或历史快照当结论。
+  「`%d` 项通过，`%d` 项失败」（迭代 3c 落地后为 **170 项**）；不要引用静态推导值或历史快照当结论。
 - **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、
   sudoers/PAM 实际策略、
   `SudoConfig`（只有模型、零行为）、GFS 保留、store-wide 的备份孤儿回收、
   真实生产库与大库的备份、
-  GTID 开启的 MySQL 8、大容量长时间备份。
+  GTID 开启的 MySQL 8、大容量长时间备份、**迭代 3c 的真机复跑与重启持久化**。
   SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
   本工具**不提供** SELinux 加固——这是「未实现的能力」，不得写成「已支持」。
 - **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
   因此不进 CI）。2026-09-24 在 Rocky Linux 10.2 / systemd 257 / SELinux enforcing 上
   实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），跑完自动清理。
+  迭代 3c 的那一轮实测 **111 项通过 / 1 项失败**（失败项是一个真实缺陷，已修复），
+  **修复后的复跑与重启验证尚未执行**——不得写成已完成。
+  **在那台主机上禁止 `pkill` / `killall` 这类宽匹配的杀进程方式**：上面跑着不在 systemd 下的
+  业务 JVM（`/home/data/ems/ems-server`），一次 `pkill -x java` 把它一起杀了。
   **重启验证**另做了一轮（停机 44 秒、`boot_id` 前后不同、重启后 **21 项通过 / 0 项失败**），
   用 `FRZ_HOST_PHASE=prepare` → 重启 → `FRZ_HOST_PHASE=check`；`check` 阶段**不重新上传**，
   否则会把跨重启状态的记录冲掉。

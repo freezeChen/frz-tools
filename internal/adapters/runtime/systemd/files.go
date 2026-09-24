@@ -58,6 +58,15 @@ func (a *Adapter) ensureUser(ctx context.Context, runUser, home string) error {
 
 // ensureDirectories 建齐规格 §7 要求的目录：工作目录、日志目录、解包目录（0750）
 // 与凭据目录（0700），属主都是运行用户。
+//
+// **releases 子树的内部不归它管**（domain.InReleaseTree）。那里的一切都由
+// ReleaseAdapter 建：根由物化建、release 目录由解包建、`current` 由切换建。
+// 这条分工不是洁癖——`exec.workingDirectory` 的推荐写法就是要写成 release 的
+// `current`（那样 `java -jar app.jar` 才能按工作目录解析到制品里的 JAR），而
+// Prepare 在**第一次部署**时跑在物化之前：它若「顺手」把 `current` 建成实体目录，
+// 紧接着的 Activate 就会因为改名目标是目录而失败，报出来的还是一句与真实原因无关的
+// 「改名失败」。根目录仍然要建：unit 的 ReadWritePaths= 指向它，而路径不存在会让
+// systemd 的命名空间设置直接失败。
 func (a *Adapter) ensureDirectories(spec *domain.ApplicationSpec, owner ownership) error {
 	for _, dir := range []struct {
 		path string
@@ -70,6 +79,9 @@ func (a *Adapter) ensureDirectories(spec *domain.ApplicationSpec, owner ownershi
 		{domain.ReleaseRootDir(spec.Application), appDirMode},
 		{domain.SecretsDir(spec.Application), secretDirMode},
 	} {
+		if domain.InReleaseTree(spec.Application, dir.path) {
+			continue
+		}
 		if err := a.ensureDirectory(dir.path, dir.mode, owner); err != nil {
 			return err
 		}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -121,8 +122,15 @@ func newDeployFixture(t *testing.T, adapter *fakeRuntimeAdapter) *deployFixture 
 // upload 造一个单文件制品并上传（unpack.strategy=none + fileName 是部署最简单的形态）。
 func (f *deployFixture) upload(t *testing.T, name string, content []byte) *domain.Artifact {
 	t.Helper()
+	return f.uploadWith(t, name, "application/octet-stream", content)
+}
+
+// uploadWith 指定 media type 上传一段字节：用来构造「制品本身有问题」的场景
+// （例如声称是 gzip、给的却不是 gzip 的字节）。
+func (f *deployFixture) uploadWith(t *testing.T, name, mediaType string, content []byte) *domain.Artifact {
+	t.Helper()
 	artifact, _, err := f.rt.Artifacts.Put(context.Background(), PutArtifactInput{
-		Name: name, MediaType: "application/octet-stream", Body: bytes.NewReader(content),
+		Name: name, MediaType: mediaType, Body: bytes.NewReader(content),
 	})
 	if err != nil {
 		t.Fatalf("上传制品 %s: %v", name, err)
@@ -608,5 +616,120 @@ func TestDeployRestartsPreviousVersion(t *testing.T) {
 	}
 	if startIndex < stopIndex {
 		t.Fatalf("stop 必须在最后一次 start 之前，调用序列是 %v", calls)
+	}
+}
+
+// Prepare 阶段就失败时，线上**没有被碰过**：报的是原因码，而不是 DEPLOY_ROLLED_BACK。
+//
+// 这条来自真机验证。java 的解释器路径写错时，部署报的是 DEPLOY_ROLLED_BACK
+// （「已回到上一个稳定版本」），可实际上一行都没动过——运维会拿着这句话去查
+// 「为什么回滚了」，而该改的是那份 manifest。`DEPLOY_ROLLED_BACK` 只说一件事：
+// **我们改动过线上，并且把它撤销了**。
+func TestDeployFailureBeforeTouchingLiveStateReportsCauseCode(t *testing.T) {
+	interpreterError := domain.NewError(v1.CodeManifestInvalid,
+		"runtime: java 的解释器 \"/opt/jdk-does-not-exist/bin/java\" 在本机不可用")
+
+	t.Run("第一次部署：本来就没有正在运行的版本", func(t *testing.T) {
+		f := newDeployFixture(t, nil)
+		app := f.app(t, "orders-api")
+		f.adapter.prepareErrWhen = func(*domain.ApplicationSpec) error { return interpreterError }
+
+		artifact := f.upload(t, "orders-1.0.0", []byte("v1"))
+		op := f.deploy(t, app.Name, f.spec(artifact, "1.0.0"))
+		if op.Status != domain.StatusFailed {
+			t.Fatalf("部署应当失败，got %s", op.Status)
+		}
+		if op.ErrorCode != string(v1.CodeManifestInvalid) {
+			t.Fatalf("want MANIFEST_INVALID（原因码），got %s：%s", op.ErrorCode, op.ErrorMessage)
+		}
+		if !strings.Contains(op.ErrorMessage, "线上没有任何变化") {
+			t.Fatalf("失败信息必须说清线上没被碰过，got %q", op.ErrorMessage)
+		}
+		// 一次都不该停：压根没有正在运行的版本可停。
+		if calls := f.adapter.callNames(); containsString(calls, "stop") {
+			t.Fatalf("第一次部署在 Prepare 失败时不该调 Stop，got %v", calls)
+		}
+	})
+
+	t.Run("重新部署：上一个版本没有被停过", func(t *testing.T) {
+		f := newDeployFixture(t, nil)
+		app := f.app(t, "orders-api")
+
+		first := f.upload(t, "orders-1.0.0", []byte("v1"))
+		if op := f.deploy(t, app.Name, f.spec(first, "1.0.0")); op.Status != domain.StatusSucceeded {
+			t.Fatalf("第一次部署应当成功: %s", op.ErrorMessage)
+		}
+		stable := f.activeRelease(t, app.Name)
+		before := len(f.adapter.callNames())
+
+		f.adapter.prepareErrWhen = func(spec *domain.ApplicationSpec) error {
+			if spec.Artifact.Version == "2.0.0" {
+				return interpreterError
+			}
+			return nil
+		}
+		second := f.upload(t, "orders-2.0.0", []byte("v2"))
+		op := f.deploy(t, app.Name, f.spec(second, "2.0.0"))
+		if op.ErrorCode != string(v1.CodeManifestInvalid) {
+			t.Fatalf("want MANIFEST_INVALID（原因码），got %s：%s", op.ErrorCode, op.ErrorMessage)
+		}
+		if !strings.Contains(op.ErrorMessage, "1.0.0") {
+			t.Fatalf("失败信息应当指明上一个版本没有被动过，got %q", op.ErrorMessage)
+		}
+		// 「没被动过」的行为定义：这次失败之后没有任何 Stop——旧版本还在跑着，
+		// 只是新版本没上成。
+		if calls := f.adapter.callNames()[before:]; containsString(calls, "stop") {
+			t.Fatalf("Prepare 失败时不该停掉上一个版本，got %v", calls)
+		}
+		if active := f.activeRelease(t, app.Name); active == nil || active.ID != stable.ID {
+			t.Fatalf("active 应当仍是 %s，got %+v", stable.ID, active)
+		}
+	})
+}
+
+// **停掉上一个版本之后、切成新版本之前**的失败必须把旧版本放回去。
+//
+// 这是真机验证暴露出来的第二个缺陷：`switched` 只在 Activate 成功后才置位，于是
+// 「停了旧的、新的还没切上去就失败」这段窗口里的失败被当成「什么都没发生」——
+// 旧版本停在那里没人管，而 Operation 写着「已回到上一个稳定版本」。服务实际上是停的。
+func TestDeployFailureAfterStoppingPreviousRestoresIt(t *testing.T) {
+	f := newDeployFixture(t, nil)
+	app := f.app(t, "orders-api")
+
+	first := f.upload(t, "orders-1.0.0", []byte("v1"))
+	if op := f.deploy(t, app.Name, f.spec(first, "1.0.0")); op.Status != domain.StatusSucceeded {
+		t.Fatalf("第一次部署应当成功: %s", op.ErrorMessage)
+	}
+	stable := f.activeRelease(t, app.Name)
+
+	// 第二版声称是 tar-gz，给的却是普通字节：Prepare 会过，物化会失败——
+	// 也就是失败点正好落在「已经停掉旧版本、还没切到新版本」那段窗口里。
+	broken := f.uploadWith(t, "orders-2.0.0", "application/gzip", []byte("not-a-gzip"))
+	spec := f.spec(broken, "2.0.0", func(s *domain.ApplicationSpec) {
+		s.Artifact.Unpack = domain.SpecUnpack{Strategy: domain.UnpackTarGz, StrategyExplicit: true}
+		s.Artifact.FileName = ""
+	})
+
+	op := f.deploy(t, app.Name, spec)
+	if op.Status != domain.StatusFailed {
+		t.Fatalf("部署应当失败，got %s", op.Status)
+	}
+	if op.ErrorCode != string(v1.CodeDeployRolledBack) {
+		t.Fatalf("这次**确实**回滚了，want DEPLOY_ROLLED_BACK，got %s：%s", op.ErrorCode, op.ErrorMessage)
+	}
+
+	// 回滚动作真的发生过：最后一次调用是 start，而且是拿**上一个版本**的规格起的。
+	calls := f.adapter.callNames()
+	if len(calls) == 0 || calls[len(calls)-1] != "start" {
+		t.Fatalf("停掉旧版本之后失败，必须把它重新启动，got %v", calls)
+	}
+	if last := f.adapter.lastSpec(); last == nil || last.Artifact.Version != "1.0.0" {
+		t.Fatalf("重新启动的应当是上一个版本，got %+v", last)
+	}
+	if target := f.currentTarget(t, app.Name); target != stable.ID {
+		t.Fatalf("current 应当回到 %s，got %s", stable.ID, target)
+	}
+	if active := f.activeRelease(t, app.Name); active == nil || active.ID != stable.ID {
+		t.Fatalf("active 应当仍是 %s，got %+v", stable.ID, active)
 	}
 }

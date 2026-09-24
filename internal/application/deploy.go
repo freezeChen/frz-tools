@@ -295,15 +295,26 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 	})
 
 	// 失败收尾：把状态收回去，并且**说清楚现在跑的是哪个版本**。
-	var switched bool
+	//
+	// 两个标记，而不是一个：`switched` 说「current 已经切过去了」，`stoppedPrevious`
+	// 说「上一个版本已经被我们停掉了」。**两者之间那段窗口是真实存在的**——停掉旧版本之后、
+	// 切成新版本之前，物化或切换自己就可能失败。只看 `switched` 会把那段窗口里的失败当成
+	// 「什么都没发生」，于是旧版本停在那里没人管，而 Operation 却写着「已回到上一个稳定版本」。
+	var (
+		switched        bool
+		stoppedPrevious bool
+	)
 	fail := func(cause error) error {
 		var rollbackErr error
+		undone := false
 		switch {
-		case switched && previous != nil:
+		case (switched || stoppedPrevious) && previous != nil:
+			undone = true
 			rollbackErr = s.restorePrevious(ctx, spec, previous, previousSpec, logf)
 		case switched:
 			// 这是这台应用上的第一次部署：没有可回退的版本，因此只能把它停下来——
 			// 让一个起不来的 unit 留在那里反复重启，比停下来更难看，也更难排查。
+			undone = true
 			rollbackErr = s.teardownFirstDeploy(ctx, spec, releaseID, logf)
 		}
 		if spec.Materializes() {
@@ -326,6 +337,19 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 				"%s；**回滚也失败了**（%s），当前没有正在运行的版本，需要人工介入",
 				domain.MessageOf(cause), domain.MessageOf(rollbackErr))
 		}
+		if !undone {
+			// **什么都没被动过**：失败发生在改动线上之前（典型是这个新版本的 manifest
+			// 或主机事实不成立，Prepare 阶段就拒了）。
+			//
+			// 这时报 DEPLOY_ROLLED_BACK 是错的：那个码说的是「已经回到上一个稳定版本」，
+			// 会让运维以为发生过一次回滚、进而去查「为什么回滚了」；而真相是线上从头到尾
+			// 没有被碰过，该改的是那份 manifest。原因码（MANIFEST_INVALID 之类）才是他要的。
+			logf("error", domain.PhaseFinalize, action+"失败，线上没有任何变化",
+				map[string]string{"error": domain.MessageOf(cause)})
+			return domain.NewError(domain.CodeOf(cause),
+				"%s；线上没有任何变化（%s），失败发生在本版本被应用之前",
+				domain.MessageOf(cause), runningDescription(previous))
+		}
 		logf("warn", domain.PhaseFinalize, action+"失败，已回到上一个稳定版本", nil)
 		return domain.NewError(v1.CodeDeployRolledBack, "%s", domain.MessageOf(cause))
 	}
@@ -340,6 +364,9 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 		if err := s.runtime.Stop(ctx, previousSpec); err != nil {
 			return fail(err)
 		}
+		// 从这一刻起线上是被动过的：旧版本已经停了。后面任何一步失败都必须把它放回去
+		// ——包括「还没切到新版本就失败」这种（见 fail 里的注释）。
+		stoppedPrevious = true
 	}
 	if spec.Materializes() {
 		// 目录已存在就跳过物化：那是「把某个既有版本再应用一次」（回滚，或者部署一个
@@ -372,6 +399,18 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 
 	s.pruneReleases(ctx, spec, releaseID, logf)
 	return nil
+}
+
+// runningDescription 用一句话说清「这次失败有没有动到线上」，供失败信息使用。
+//
+// 措辞刻意只说**我们确实知道的事**：没有上一个版本，就是「本来就没有」；有，那就是
+// 「没有被停过」——而不是断言「它此刻一定在健康服务」（那可能因为别的原因为假，
+// 而失败信息里的一句想当然，比不说更糟）。
+func runningDescription(previous *domain.Release) string {
+	if previous == nil {
+		return "这是该应用的第一次部署，本来就没有正在运行的版本"
+	}
+	return "上一个版本（" + previous.Version + "）没有被停过"
 }
 
 // materializeIfMissing 在 release 目录不存在时把制品解出来。

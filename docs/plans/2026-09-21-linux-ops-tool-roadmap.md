@@ -801,3 +801,43 @@
 - **仍未验证**：3c 的全部内容（`resources` 与 Java 运行时只有模型、零行为）、真机部署
   （容器里是真实 systemd 但仍是「Linux 容器」证据）、大制品解包（zip 要落临时文件，占双份
   磁盘）、多应用并发部署。
+
+### 2026-09-24（补记十一）迭代 3c：资源限制落进 unit、Java 运行时的解释器预检，以及三个部署缺陷
+
+- **变更原因**：迭代 3 的第三片（3c）。规格与验证记录在
+  `docs/plans/2026-09-24-iteration-3.md` §16–17。
+- **交付**：
+  1. `resources`（`cpuQuotaPercent` / `memoryMaxBytes`）翻译成 unit 的 `CPUQuota=` /
+     `MemoryMax=`，**字节数按原值写**（不写 `512M` 这种后缀，避免单位换算写错）；
+     `0` = 不限制就**不写那一行**。legacy 档（219–239）声明内存上限时**直接拒绝**：
+     `MemoryMax=` 需要 systemd 231，而这一档覆盖的版本里有一部分没有它——被忽略意味着
+     声明的上限静默失效，被拒绝意味着服务起不来，两种都不能接受。
+  2. Java 运行时的**解释器预检**：`runtime: java` 且 `argv[0]` 是绝对路径时，断言它在主机上
+     存在且可执行（`Stat` 跟随符号链接，因为 `/usr/bin/java` 通常是 alternatives 链接）。
+     理由：**java 的 `argv[0]` 是主机上的解释器，不在制品里、部署也不会创建它**——没有这条
+     检查时，写错的 JDK 路径表现为「unit 起来、进程退出、反复重启、最后报就绪超时」。
+     这条预检进 `Validate`，但 **Stop / Status / Health 刻意不走它**：解释器消失时服务仍然
+     必须能停下来。
+- **三个真实缺陷（都是本轮验证抓出来的）**：
+  1. **`Prepare` 会把 `releases/current` 建成实体目录**：`exec.workingDirectory` 的推荐写法
+     就是它（`java -jar app.jar` 要按工作目录解析），而部署是「先 Prepare、后物化/切换」，
+     于是第一次部署时 `current` 被建成真目录、紧接着的符号链接切换以「改名失败」收场。
+     修法：releases 子树内部归 `ReleaseAdapter`，运行时适配器不碰（`domain.InReleaseTree`）。
+  2. **「停掉旧版本之后、切换之前」的失败没有人管**：`switched` 只在 `Activate` 成功后才
+     置位，于是这段窗口里的失败被当成「什么都没发生」——旧版本停着没人管，Operation 却写着
+     「已回到上一个稳定版本」。修法：再加 `stoppedPrevious`，两个标记任一为真就要回滚。
+  3. **什么都被报成 `DEPLOY_ROLLED_BACK`**：失败发生在改动线上之前（新版本的 manifest 或
+     主机事实不成立）时，旧版本从未被碰过。现在这种情况返回**原因码**并在消息里写明
+     「线上没有任何变化」——`DEPLOY_ROLLED_BACK` 只说一件事：**改动过线上并撤销了它**。
+- **与 1c 的一处一致性修正**：proc 适配器从 1c 起就在 `Validate` 里 stat **任意** `argv[0]`，
+  而 systemd 那边什么都不检查——同一个端口上两个实现对「什么算合法规格」判断不同。现在两个
+  实现共用 `unitfile.PreflightInterpreter`，规则统一成「只对 java 的绝对 `argv[0]`」。
+- **验证要求**：`make ci` 全绿；`make verify-linux` **170 项通过 / 0 项失败**（新增
+  `check_resources` 16 项 + `check_deploy` 的「物化失败」3 项）；真机上一轮
+  `make verify-host` 实测 **111 项通过 / 1 项失败**，那一项正是上面第 3 条缺陷。**真机复跑与
+  重启验证未完成**（那台主机在复跑前从本机完全不可达——整个 `192.168.11.0/24` 网段连同网关
+  都不通），因此 **3c 的真机验证不得写成已完成**。
+- **一条操作纪律**：那台测试主机上跑着**不在 systemd 下、也不在容器里**的业务 JVM
+  （`/home/data/ems/ems-server`）。一次 ad-hoc 冒烟测试里的 `pkill -x java` 把它一起杀了
+  （停了约 72 秒才人工恢复）。**在那台主机上停进程必须指名道姓**（`systemctl stop <unit>`
+  或明确的 PID），禁止 `pkill` / `killall` 这类宽匹配；这条已写进 `test/host/run.sh` 头部。

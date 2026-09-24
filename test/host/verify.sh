@@ -14,7 +14,10 @@
 #   · RHEL 系发行版（Rocky Linux）＋真实 systemd 的 unit 生命周期；
 #   · **SELinux 处于 enforcing** 时，文件与进程的实际安全上下文；
 #   · 真实主机上的 useradd / chown / systemctl 落到磁盘上的结果；
-#   · opsd 本身作为 **systemd 服务**运行的部署形态（含 /run 是 tmpfs 这件事）。
+#   · opsd 本身作为 **systemd 服务**运行的部署形态（含 /run 是 tmpfs 这件事）；
+#   · 迭代 3：部署出来的 release 在真机上跑起来、**跨重启存活**（那需要真的重启一台机器）；
+#   · 迭代 3c：用主机上真实的 JDK 跑一个真实的 JAR，并断言资源限制在 systemd 与
+#     内核两侧都是声明的那个值。
 #
 # 刻意**不**重复容器 harness 的哪些断言，以及为什么（避免两套断言各自漂移）：
 #   · 「以非 root 用户运行 opsd」那一组（socket ACL、非授权可执行文件被拒、计划与
@@ -49,14 +52,38 @@ OPSD_UNIT=frz-opsd-verify.service
 OPSCTL="$FRZ_HOST_DIR/bin/opsctl"
 OPSD="$FRZ_HOST_DIR/bin/opsd"
 
+# 迭代 3 的部署夹具。deploy 那个用来验证「部署出来的 release 能在真机上跑、重启后还在」，
+# java 那个用主机上真实的 JDK 跑一个真实的 JAR（并压到资源限制与解释器预检）。
+DEPLOY_APP=frz-dep
+DEPLOY_UNIT=${DEPLOY_APP}.service
+DEPLOY_PORT=${FRZ_DEPLOY_PORT:-28582}
+DEPLOY_VERSION=1.0.0
+JAVA_APP=frz-java
+JAVA_UNIT=${JAVA_APP}.service
+JAVA_PORT=${FRZ_JAVA_PORT:-28583}
+JAVA_BAD_APP=frz-javabad
+JAVA_HOME=${FRZ_HOST_JAVA_HOME:-/opt/jdk-17.0.1}
+JAVA_BUILD_DIR=/opt/frz-ops/java-fixture
+JAVA_MARKER=java-marker-ok
+JAVA_MEMORY_MAX_BYTES=536870912
+
+# 迭代 3 的夹具应用：清理与前置检查都按这张表走，免得新增一个就漏一处。
+HOST_APPS=("$DEPLOY_APP" "$JAVA_APP" "$JAVA_BAD_APP")
+
 START_OP_ID=""
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
+# 前置检查的结论。1 表示「这台机器上本来就有不属于本轮的东西」——此时本轮**既不建也不删**。
+PRECONDITION_FAILED=0
 FINDINGS=()
 
 log()  { printf '\n--- %s\n' "$*"; }
 pass() { PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS  %s\n' "$*"; }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL  %s\n' "$*" >&2; }
+# 跳过必须单独计数、单独打印：它**不是通过**。把「主机上没有 JDK 所以没验」混进
+# 通过数里，等于用数字谎报覆盖面——这条纪律在验证脚本里比在别处更要紧。
+skip() { SKIP_COUNT=$((SKIP_COUNT + 1)); printf 'SKIP  %s\n' "$*"; }
 note() { FINDINGS+=("$*"); printf 'NOTE  %s\n' "$*"; }
 
 assert_eq() { # 描述 期望 实际
@@ -124,9 +151,21 @@ wait_for_ready() { # 就绪要求连续通过 consecutiveSuccesses 次，第一�
 
 # ==== 收尾 ====
 # 一律执行，并报告删了什么。这是生产机，「跑完就走」比「留着现场」重要得多。
+#
+# 例外一条，而且这条很重要：**前置检查失败时什么都不删**。那条路径上的判断是
+# 「这台机器本来就不干净」，而清理的动作是「无条件删掉这些路径」——两者放在一起，
+# 就等于把「别人的东西还在」这件事变成了「那就删掉它」。2026-09-24 真的踩到了：
+# /opt/opsd 存在导致前置失败，紧接着的 cleanup 把它删了。
 cleanup() {
   if [ "${FRZ_HOST_KEEP:-0}" = "1" ]; then
-    printf '\n保留了现场（FRZ_HOST_KEEP=1）：/etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops %s\n' "$FRZ_HOST_DIR"
+    printf '\n保留了现场（FRZ_HOST_KEEP=1）：/etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops /opt/opsd %s\n' "$FRZ_HOST_DIR"
+    return 0
+  fi
+  if [ "${PRECONDITION_FAILED:-0}" = "1" ]; then
+    printf '\n--- 收尾：**跳过**\n'
+    printf '前置检查失败（这台机器上本来就有不属于本轮的东西），因此什么都不删：\n'
+    printf '按定义本轮还没创建任何东西，删下去只会删掉别人的。请先查清那些路径是谁的，\n'
+    printf '再决定要不要手工清理，然后重跑。\n'
     return 0
   fi
 
@@ -136,6 +175,14 @@ cleanup() {
   systemctl disable "$OPSD_UNIT" >/dev/null 2>&1 || true
   systemctl disable "$RUNTIME_UNIT" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/$OPSD_UNIT" "/etc/systemd/system/$RUNTIME_UNIT"
+  for app in "${HOST_APPS[@]}"; do
+    systemctl stop "${app}.service" >/dev/null 2>&1 || true
+    systemctl disable "${app}.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${app}.service"
+    userdel "$app" >/dev/null 2>&1 || true
+    groupdel "$app" >/dev/null 2>&1 || true
+    rm -rf "/var/lib/$app" "/var/log/$app" "/etc/opsd/apps/$app"*
+  done
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed >/dev/null 2>&1 || true
 
@@ -146,14 +193,20 @@ cleanup() {
   groupdel "$OTHER_USER" >/dev/null 2>&1 || true
   groupdel frz-ops >/dev/null 2>&1 || true
 
-  rm -rf /etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops
+  # /opt/opsd 是 release 目录的父目录（domain.ReleaseDir 的约定路径）。它由
+  # RuntimeAdapter 的 Prepare 与 ReleaseAdapter 的物化共同建出来，因此也必须由这里删掉
+  # ——生产机上留一棵没人认领的目录树是最不该发生的事。cleanup 敢直接 rm 是因为
+  # check_preconditions 已经断言过它本轮之前不存在。
+  rm -rf /etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops /opt/opsd
   rm -rf "/var/lib/$RUNTIME_APP" "/var/log/$RUNTIME_APP" "/var/lib/${RUNTIME_APP}-extra"
   rm -rf "$FRZ_HOST_DIR"
 
   printf '已删除：用户/组 frz-ops、%s、%s；unit %s 与 %s；目录 /etc/opsd、/var/lib/opsd、\n' \
     "$RUNTIME_USER" "$OTHER_USER" "$OPSD_UNIT" "$RUNTIME_UNIT"
-  printf '        /var/log/opsd、/run/opsd、/opt/frz-ops、/var/lib/%s、/var/log/%s、%s\n' \
+  printf '        /var/log/opsd、/run/opsd、/opt/frz-ops、/opt/opsd、/var/lib/%s、/var/log/%s、%s\n' \
     "$RUNTIME_APP" "$RUNTIME_APP" "$FRZ_HOST_DIR"
+  printf '        以及迭代 3 的三个夹具应用：%s（用户、unit、/var/lib 与 /var/log 下的目录）\n' \
+    "${HOST_APPS[*]}"
 }
 
 # ==== 环境事实 ====
@@ -174,19 +227,24 @@ check_preconditions() {
 
   assert_eq "运行身份" "root" "$(id -un)"
   local dirty=0
-  for user in frz-ops "$RUNTIME_USER" "$OTHER_USER"; do
+  for user in frz-ops "$RUNTIME_USER" "$OTHER_USER" "${HOST_APPS[@]}"; do
     id "$user" >/dev/null 2>&1 && { fail "$user 用户已存在，无法从「干净主机」开始"; dirty=1; }
   done
-  for path in /etc/opsd /var/lib/opsd /run/opsd /opt/frz-ops "/var/lib/$RUNTIME_APP"; do
+  # /opt/opsd 在列表里是**安全前提**而不是洁癖：cleanup 会删掉整棵 /opt/opsd，因此必须
+  # 先确认它本轮之前不存在——否则我们就在一台有既有 release 的机器上删了别人的目录树。
+  for path in /etc/opsd /var/lib/opsd /run/opsd /opt/frz-ops /opt/opsd "/var/lib/$RUNTIME_APP"; do
     [ -e "$path" ] && { fail "$path 已存在，无法从「干净主机」开始"; dirty=1; }
   done
   [ "$dirty" -eq 0 ] && pass "本轮涉及的用户与目录此时都不存在"
 
-  if ss -lntH "sport = :$RUNTIME_PORT" 2>/dev/null | grep -q .; then
-    fail "端口 $RUNTIME_PORT 已被占用，换 FRZ_PROBE_PORT 再跑"
-  else
-    pass "端口 $RUNTIME_PORT 空闲"
-  fi
+  for port in "$RUNTIME_PORT" "$DEPLOY_PORT" "$JAVA_PORT"; do
+    ss -lntH "sport = :$port" 2>/dev/null | grep -q . && { fail "端口 $port 已被占用"; dirty=1; }
+  done
+  [ "$dirty" -eq 0 ] && pass "三个夹具端口（$RUNTIME_PORT / $DEPLOY_PORT / $JAVA_PORT）都空闲"
+
+  # 这一条让 cleanup 知道「机器不干净」，从而**什么都不删**（见 cleanup 的注释）。
+  PRECONDITION_FAILED=$dirty
+  return 0
 }
 
 # ==== 安装态（模拟安装脚本留下的状态）====
@@ -696,6 +754,318 @@ POLICY
   fi
 }
 
+# ==== 迭代 3：部署（真实主机）====
+#
+# 容器 harness 已经把「部署 / 换版本 / 回滚 / 保留策略」用真 systemd 与真进程验过一遍，
+# 这里**刻意不重复**那些断言，只证明容器给不出的东西：
+#   · release 目录在真实 useradd/chown 下落盘的模式与属主、以及 SELinux 上下文；
+#   · 相对 argv[0] 解析到的确实是 release 里那个文件（不是运维手工放的）；
+#   · 部署出来的版本**跨重启存活**（那需要真的重启一台机器，见 check_post_reboot）。
+check_deploy_host() {
+  log "迭代 3：部署一个 release（真机上的 useradd / chown / SELinux 落盘结果）"
+
+  local app=$DEPLOY_APP port=$DEPLOY_PORT
+  require_ok "注册应用" opsctl app create "$app"
+
+  local uploaded artifact_id
+  uploaded=$(q artifact put /opt/frz-ops/frz-probe --media-type application/octet-stream --json)
+  artifact_id=$(printf '%s' "${uploaded}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "$artifact_id" ]; then
+    fail "制品上传失败：${uploaded}"
+    return 0
+  fi
+
+  # argv[0] 写成**相对路径**：它必须解析到 release 里的那个文件，而不是主机上别处的同名文件。
+  cat > "$FRZ_HOST_DIR/deploy.yaml" <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${app}
+runtime: go
+artifact:
+  id: ${artifact_id}
+  version: ${DEPLOY_VERSION}
+  fileName: bin/frz-probe
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - bin/frz-probe
+    - --report
+    - /var/lib/${app}/probe-report.txt
+    - --listen
+    - 127.0.0.1:${port}
+  workingDirectory: /var/lib/${app}
+  runUser: ${app}
+  ports:
+    - ${port}
+health:
+  readiness:
+    type: tcp
+    target: 127.0.0.1:${port}
+    consecutiveSuccesses: 2
+  startTimeoutSeconds: 30
+  stopTimeoutSeconds: 30
+logs:
+  directory: /var/log/${app}
+release:
+  keepLast: 3
+MANIFEST
+  chmod 0644 "$FRZ_HOST_DIR/deploy.yaml"
+
+  local out id
+  out=$(opsctl app deploy --app "$app" --file "$FRZ_HOST_DIR/deploy.yaml" --json 2>&1) || true
+  id=$(printf '%s' "${out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "$id" ]; then
+    fail "部署没有返回 operation id：${out}"
+    return 0
+  fi
+  if ! wait_for_status "$id" succeeded; then
+    fail "部署未成功：$(q operation logs "$id" --json | sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' | tail -3 | tr '\n' ' ')"
+    return 0
+  fi
+  pass "app deploy 走 Operation 且成功（${DEPLOY_VERSION}）"
+
+  assert_eq "$DEPLOY_UNIT 状态" "active" "$(systemctl is-active "$DEPLOY_UNIT" 2>/dev/null)"
+  # enable 是**部署的一部分**：不 enable，重启后这个版本不会自己起来。
+  assert_eq "$DEPLOY_UNIT 开机自启" "enabled" "$(systemctl is-enabled "$DEPLOY_UNIT" 2>/dev/null)"
+  assert_eq "部署后端口在监听" "yes" "$(ss -lntH "sport = :$port" | grep -q . && printf yes || printf no)"
+
+  local releases="/opt/opsd/apps/$app/releases"
+  local current="$releases/current" resolved
+  resolved=$(readlink -f "$current")
+  assert_eq "current 是符号链接" "yes" "$([ -L "$current" ] && printf yes || printf no)"
+  assert_eq "current 指向该应用的 releases 子树里的一个目录" "yes" \
+    "$(case "$resolved" in "$releases"/rel_*) printf yes ;; *) printf no ;; esac)"
+
+  # release 目录的模式与属主是**真机才有意义**的那一类断言：它经过真实的 useradd/chown。
+  assert_eq "release 目录模式" "750" "$(stat -L -c '%a' "$current" 2>/dev/null || true)"
+  assert_eq "release 目录属主" "${app}:${app}" "$(stat -L -c '%U:%G' "$current" 2>/dev/null || true)"
+  assert_eq "release 根模式" "750" "$(stat -c '%a' "$releases" 2>/dev/null || true)"
+  assert_eq "release 根属主" "${app}:${app}" "$(stat -c '%U:%G' "$releases" 2>/dev/null || true)"
+  # 相对 argv[0] 解析到的那个文件：它就住在 release 里，且是可执行的。
+  assert_eq "argv[0] 解析到的文件在 release 里且可执行" "yes" \
+    "$([ -x "$current/bin/frz-probe" ] && printf yes || printf no)"
+
+  local main_pid
+  main_pid=$(systemctl show "$DEPLOY_UNIT" -p MainPID --value 2>/dev/null)
+  if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
+    assert_eq "托管进程的运行用户" "$app" "$(ps -o user= -p "$main_pid" 2>/dev/null | tr -d ' ')"
+    assert_eq "托管进程的工作目录解析到 release 目录" "yes" \
+      "$([ "$(readlink "/proc/$main_pid/cwd" 2>/dev/null)" = "/var/lib/$app" ] && printf yes || printf no)"
+    printf '      托管进程的 SELinux 上下文: %s\n' \
+      "$(tr -d '\0' < "/proc/$main_pid/attr/current" 2>/dev/null || printf '<不可读>')"
+  else
+    fail "拿不到 $DEPLOY_UNIT 的 MainPID"
+  fi
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+    printf '      release 目录的 SELinux 上下文: %s\n' "$(label_of "$resolved")"
+    printf '      current 链接的 SELinux 上下文: %s\n' "$(label_of "$current")"
+    printf '      unit 文件的 SELinux 上下文   : %s\n' "$(label_of "/etc/systemd/system/$DEPLOY_UNIT")"
+  fi
+  assert_eq "探针在 release 里跑起来了（写出了报告）" "yes" \
+    "$([ -f "/var/lib/$app/probe-report.txt" ] && printf yes || printf no)"
+}
+
+# ==== 迭代 3c：真机上的 JVM 与资源限制 ====
+#
+# 这一节的证据 Go 探针给不出来：`-jar app.jar` 能按工作目录解析到制品，说明 systemd 的
+# WorkingDirectory= 真的交到了 JVM 手里；`Runtime.maxMemory()` 说明 JVM 真的按 `-Xmx` 设了
+# 堆上限；而这两件事同时成立，就说明 argv 里的参数在被改写的情况下根本起不来。
+#
+# 缺 JDK 时**跳过并显式计数**：跳过不是通过。
+check_java_and_resources() {
+  log "迭代 3c：真机上的 JVM 部署、资源限制与解释器预检"
+
+  local java="$JAVA_HOME/bin/java" javac="$JAVA_HOME/bin/javac" jar="$JAVA_HOME/bin/jar"
+  if [ ! -x "$java" ] || [ ! -x "$javac" ] || [ ! -x "$jar" ]; then
+    skip "$JAVA_HOME 下没有可用的 JDK（java/javac/jar 至少缺一个）：java 运行时与资源限制的真机验证本轮**未做**"
+    return 0
+  fi
+  printf '      JDK                      : %s（%s）\n' "$JAVA_HOME" "$("$java" -version 2>&1 | head -1)"
+  pass "主机上有可用的 JDK，java 运行时这一档可以验"
+
+  # 在主机上用真 JDK 编译打包：这一档要证明的正是「真 JVM 能跑起来」，
+  # 在开发机上交叉编译一个 jar 反而绕开了要验的东西。
+  rm -rf "$JAVA_BUILD_DIR"
+  install -d -m 0755 "$JAVA_BUILD_DIR"
+  cp "$FRZ_HOST_DIR/JavaProbe.java" "$JAVA_BUILD_DIR/"
+  if ! (cd "$JAVA_BUILD_DIR" && "$javac" -d classes JavaProbe.java &&
+    "$jar" --create --file app.jar --main-class JavaProbe -C classes .) >"$JAVA_BUILD_DIR/build.log" 2>&1; then
+    fail "在主机上编译打包 JAR 失败：$(tail -3 "$JAVA_BUILD_DIR/build.log" | tr '\n' ' ')"
+    return 0
+  fi
+  pass "用主机上的 javac/jar 构建出制品 app.jar（$(stat -c %s "$JAVA_BUILD_DIR/app.jar") 字节）"
+
+  local app=$JAVA_APP port=$JAVA_PORT
+  require_ok "注册 java 应用" opsctl app create "$app"
+
+  local uploaded artifact_id
+  uploaded=$(q artifact put "$JAVA_BUILD_DIR/app.jar" --media-type application/java-archive --json)
+  artifact_id=$(printf '%s' "${uploaded}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "$artifact_id" ]; then
+    fail "JAR 制品上传失败：${uploaded}"
+    return 0
+  fi
+
+  # workingDirectory 写成 release 的 current —— 这一条既是 Java 的推荐写法（`-jar app.jar`
+  # 按工作目录解析），也顺带压到「Prepare 不得建 releases 子树内部」那条分工：
+  # 真被建成实体目录的话，符号链接切换会失败，这次部署根本到不了 active。
+  cat > "$FRZ_HOST_DIR/java.yaml" <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${app}
+runtime: java
+artifact:
+  id: ${artifact_id}
+  version: 1.0.0
+  fileName: app.jar
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - ${JAVA_HOME}/bin/java
+    - -Xmx256m
+    - -jar
+    - app.jar
+    - --listen
+    - 127.0.0.1:${port}
+  workingDirectory: /opt/opsd/apps/${app}/releases/current
+  runUser: ${app}
+  environment:
+    PROBE_MARKER: ${JAVA_MARKER}
+  ports:
+    - ${port}
+health:
+  readiness:
+    type: tcp
+    target: 127.0.0.1:${port}
+    consecutiveSuccesses: 2
+  startTimeoutSeconds: 60
+  stopTimeoutSeconds: 30
+logs:
+  directory: /var/log/${app}
+resources:
+  cpuQuotaPercent: 200
+  memoryMaxBytes: ${JAVA_MEMORY_MAX_BYTES}
+release:
+  keepLast: 3
+MANIFEST
+  chmod 0644 "$FRZ_HOST_DIR/java.yaml"
+
+  local out id
+  out=$(opsctl app deploy --app "$app" --file "$FRZ_HOST_DIR/java.yaml" --json 2>&1) || true
+  id=$(printf '%s' "${out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "$id" ]; then
+    fail "java 部署没有返回 operation id：${out}"
+    return 0
+  fi
+  if ! wait_for_status "$id" succeeded; then
+    fail "java 部署未成功：$(q operation logs "$id" --json | sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' | tail -3 | tr '\n' ' ')"
+    journalctl -u "$JAVA_UNIT" -n 20 --no-pager >&2 || true
+    return 0
+  fi
+  pass "真 JVM 部署成功（runtime: java，制品是单个 JAR）"
+
+  assert_eq "$JAVA_UNIT 状态" "active" "$(systemctl is-active "$JAVA_UNIT" 2>/dev/null)"
+  assert_eq "java 应用端口在监听" "yes" "$(ss -lntH "sport = :$port" | grep -q . && printf yes || printf no)"
+
+  local current="/opt/opsd/apps/$app/releases/current"
+  local report="$current/java-probe-report.txt"
+  if [ ! -f "$report" ]; then
+    fail "JVM 没有写出报告 $report（WorkingDirectory 不可写，或 app.jar 没被找到）"
+  else
+    pass "JVM 把报告写进了自己的工作目录（= release 的 current）"
+    local line
+    line_of() { sed -n "s/^$1=//p" "$report"; }
+    assert_eq "JVM 报告的运行用户" "$app" "$(line_of user)"
+    # 工作目录必须解析到 current 指向的那个 release 目录——`-jar app.jar` 能成功就是它给的。
+    assert_eq "JVM 报告的工作目录" "$(readlink -f "$current")" "$(line_of dir)"
+    assert_eq "EnvironmentFile 里的非敏感变量到达了 JVM" "$JAVA_MARKER" "$(line_of marker)"
+    printf '      JVM 版本                 : %s\n' "$(line_of java)"
+    # `-Xmx256m` 真的生效：堆上限落在 256 MiB 与它下方一点之间。
+    #
+    # 两侧都要卡：只卡上界的话，「参数被忽略」这种情况会漏掉——JDK 10 起 JVM 会读
+    # cgroup 的内存上限并按 25% 取默认堆，那台机器上的 MemoryMax=512M 会给到 128 MiB，
+    # 于是 `-Xmx` 失效反而看起来「上限更小、更安全」。只卡下界则相反。
+    local max_memory
+    max_memory=$(line_of maxMemory)
+    assert_eq "-Xmx256m 生效（堆上限在 [192 MiB, 256 MiB] 之间）" "yes" \
+      "$([ "${max_memory:-0}" -le 268435456 ] && [ "${max_memory:-0}" -ge 201326592 ] && printf yes || printf no)"
+    printf '      JVM 报告的堆上限         : %s 字节\n' "${max_memory:-<无>}"
+
+    local main_pid
+    main_pid=$(systemctl show "$JAVA_UNIT" -p MainPID --value 2>/dev/null)
+    if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
+      assert_eq "托管 JVM 的运行用户" "$app" "$(ps -o user= -p "$main_pid" 2>/dev/null | tr -d ' ')"
+      # 最强的一条 argv 证据：进程**实际收**到的参数逐个元素与 manifest 一致
+      # （D4：只解析 argv[0]，其余一个字节都不动）。
+      local want_argv got_argv
+      want_argv=$(printf '%s\n' "$JAVA_HOME/bin/java" "-Xmx256m" "-jar" "app.jar" \
+        "--listen" "127.0.0.1:$port")
+      got_argv=$(tr '\0' '\n' < "/proc/$main_pid/cmdline" | sed -e '/^$/d')
+      assert_eq "JVM 收到的 argv 与 manifest 逐元素一致" "$want_argv" "$got_argv"
+      printf '      托管 JVM 的 SELinux 上下文: %s\n' \
+        "$(tr -d '\0' < "/proc/$main_pid/attr/current" 2>/dev/null || printf '<不可读>')"
+    else
+      fail "拿不到 $JAVA_UNIT 的 MainPID"
+    fi
+  fi
+
+  # 资源限制：systemd 采纳了，内核按它限制。
+  assert_eq "unit 里的 CPUQuota" "CPUQuota=200%" \
+    "$(grep -x 'CPUQuota=200%' "/etc/systemd/system/$JAVA_UNIT" || true)"
+  assert_eq "unit 里的 MemoryMax 写的是原始字节数" "MemoryMax=${JAVA_MEMORY_MAX_BYTES}" \
+    "$(grep -x "MemoryMax=${JAVA_MEMORY_MAX_BYTES}" "/etc/systemd/system/$JAVA_UNIT" || true)"
+  assert_eq "systemctl show 报告的 MemoryMax" "$JAVA_MEMORY_MAX_BYTES" \
+    "$(systemctl show "$JAVA_UNIT" -p MemoryMax --value 2>/dev/null)"
+  assert_eq "systemctl show 报告的 CPUQuotaPerSecUSec" "2s" \
+    "$(systemctl show "$JAVA_UNIT" -p CPUQuotaPerSecUSec --value 2>/dev/null)"
+  local cgroup
+  cgroup=$(systemctl show "$JAVA_UNIT" -p ControlGroup --value 2>/dev/null)
+  if [ -z "$cgroup" ]; then
+    fail "拿不到 unit 的 cgroup 路径（ControlGroup 为空）"
+  else
+    assert_eq "cgroup 的 memory.max（限制真正生效的地方）" "$JAVA_MEMORY_MAX_BYTES" \
+      "$(cat "/sys/fs/cgroup${cgroup}/memory.max" 2>/dev/null || true)"
+    assert_eq "cgroup 的 cpu.max（200% = 200000/100000）" "200000 100000" \
+      "$(cat "/sys/fs/cgroup${cgroup}/cpu.max" 2>/dev/null || true)"
+  fi
+
+  # 解释器预检：JDK 路径写错时必须在**部署之前**、以 MANIFEST_INVALID 失败，
+  # 而不是等到 unit 起来、进程退出、报「就绪超时」。后者是这条检查存在前的表现。
+  log "解释器预检：JDK 路径写错时部署应当立刻失败，且不留下任何副作用"
+
+  local bad_app=$JAVA_BAD_APP
+  require_ok "注册应用" opsctl app create "$bad_app"
+  sed -e "s#application: ${JAVA_APP}\$#application: ${bad_app}#" \
+    -e "s#${JAVA_HOME}/bin/java#/opt/jdk-does-not-exist/bin/java#" \
+    -e "s#/var/log/${JAVA_APP}#/var/log/${bad_app}#" \
+    -e "s#runUser: ${JAVA_APP}\$#runUser: ${bad_app}#" \
+    -e "s#/opt/opsd/apps/${JAVA_APP}/#/opt/opsd/apps/${bad_app}/#" \
+    "$FRZ_HOST_DIR/java.yaml" > "$FRZ_HOST_DIR/java-bad.yaml"
+  chmod 0644 "$FRZ_HOST_DIR/java-bad.yaml"
+
+  local bad_out bad_id
+  bad_out=$(opsctl app deploy --app "$bad_app" --file "$FRZ_HOST_DIR/java-bad.yaml" --json 2>&1) || true
+  bad_id=$(printf '%s' "${bad_out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "$bad_id" ]; then
+    fail "解释器写错的部署没有返回 operation id：${bad_out}"
+  elif wait_for_status "$bad_id" failed; then
+    assert_eq "解释器写错时的错误码" "MANIFEST_INVALID" \
+      "$(q operation get "$bad_id" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p')"
+    assert_eq "报错里带上了那个解释器路径" "yes" \
+      "$(q operation logs "$bad_id" --json | grep -q '/opt/jdk-does-not-exist/bin/java' && printf yes || printf no)"
+    # 「在部署之前失败」的判据：连运行用户都还没建出来。否则说明这条检查跑在
+    # 一堆副作用之后，而那样的失败会把机器留在一个半套状态里。
+    assert_eq "预检失败没有留下副作用（运行用户没被创建）" "yes" \
+      "$(id "$bad_app" >/dev/null 2>&1 && printf no || printf yes)"
+    assert_eq "预检失败没有建出 unit" "yes" \
+      "$([ -f "/etc/systemd/system/${bad_app}.service" ] && printf no || printf yes)"
+  else
+    fail "解释器指向不存在的路径，部署本该失败却没有（$(q operation get "$bad_id" --json | head -c 200)）"
+  fi
+}
+
 # ==== 重启验证：记录重启前的主机身份 ====
 record_boot_identity() {
   log "记录重启前的主机身份（用来证明真的重启过，而不是在检查一台没重启的机器）"
@@ -706,9 +1076,14 @@ record_boot_identity() {
     printf 'boot_time=%s\n' "$(uptime -s)"
     printf 'recorded_at=%s\n' "$(date -Is)"
     printf 'start_op=%s\n' "$start_op"
+    # 迭代 3：把「重启前跑的是哪个 release」记下来。重启后的断言要拿它比对，
+    # 而不是拿一个「现在看起来对」的值——那种断言证明不了任何跨重启的事情。
+    printf 'deploy_dir=%s\n' "$(readlink -f "/opt/opsd/apps/$DEPLOY_APP/releases/current" 2>/dev/null)"
+    printf 'deploy_current=%s\n' "$(readlink "/opt/opsd/apps/$DEPLOY_APP/releases/current" 2>/dev/null)"
+    printf 'deploy_port=%s\n' "$DEPLOY_PORT"
   } > "$FRZ_HOST_DIR/boot-before.txt"
   sed 's/^/      /' "$FRZ_HOST_DIR/boot-before.txt"
-  pass "已记录重启前的 boot_id、开机时刻与 start 操作的 ID"
+  pass "已记录重启前的 boot_id、开机时刻、start 操作的 ID 与部署的 release"
 }
 
 # ==== 重启验证：重启之后的断言 ====
@@ -790,6 +1165,36 @@ check_post_reboot() {
     fail "重启后探针没有写出报告——托管应用其实没起来"
   fi
 
+  log "重启后：部署出来的那个 release 仍然在跑（迭代 3）"
+  # 这一节是 3b 留下的「未验证」里最有分量的一条：容器里能验 unit 的 enabled，
+  # 但只有真重启才能证明「部署出来的版本自己回来了，而且回来的还是同一个 release」。
+  local deploy_dir deploy_current deploy_port
+  deploy_dir=$(sed -n 's/^deploy_dir=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  deploy_current=$(sed -n 's/^deploy_current=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  deploy_port=$(sed -n 's/^deploy_port=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  if [ -z "$deploy_dir" ]; then
+    fail "重启前的记录里没有部署信息——prepare 阶段那一节没跑完"
+  else
+    local releases="/opt/opsd/apps/$DEPLOY_APP/releases"
+    assert_eq "$DEPLOY_UNIT 重启后的状态" "active" "$(systemctl is-active "$DEPLOY_UNIT" 2>/dev/null)"
+    assert_eq "current 仍指向重启前那个 release" "$deploy_current" \
+      "$(readlink "$releases/current" 2>/dev/null)"
+    assert_eq "current 解析后仍是同一个目录" "$deploy_dir" "$(readlink -f "$releases/current" 2>/dev/null)"
+    assert_eq "那个 release 目录还在" "yes" "$([ -d "$deploy_dir" ] && printf yes || printf no)"
+    assert_eq "部署的端口重启后自己在监听" "yes" \
+      "$(ss -lntH "sport = :$deploy_port" | grep -q . && printf yes || printf no)"
+    local deploy_pid
+    deploy_pid=$(systemctl show "$DEPLOY_UNIT" -p MainPID --value 2>/dev/null)
+    if [ -n "$deploy_pid" ] && [ "$deploy_pid" != "0" ]; then
+      assert_eq "重启后托管进程的工作目录仍在那个 release 上" "yes" \
+        "$([ "$(readlink "/proc/$deploy_pid/cwd" 2>/dev/null)" = "/var/lib/$DEPLOY_APP" ] && printf yes || printf no)"
+    fi
+    # 重启后**不许**再出现一次部署：那条路径走的是「运维敲命令」，不是 systemd 的
+    # enabled。这里只断言事实（目录数没变多），不去推断中间发生了什么。
+    printf '      重启后 releases 下的目录数: %s\n' \
+      "$(find "$releases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+
   log "重启后：主机上的业务没有被牵连"
   local running
   running=$(docker ps -q | wc -l | tr -d ' ')
@@ -801,6 +1206,20 @@ check_post_reboot() {
   fi
 }
 
+# 前置失败就停在这里：本轮**不建也不删**。
+#
+# 之前的行为是「照建不误，最后靠 cleanup 收干净」，而 cleanup 是无条件的——于是
+# 「别人的东西还在」会被处理成「那就删掉它」。停下来的代价只是重跑一次。
+stop_if_preconditions_failed() {
+  if [ "${PRECONDITION_FAILED}" != "1" ]; then
+    return 0
+  fi
+  printf '\n前置检查未通过：这台机器上本来就有不属于本轮的东西。\n' >&2
+  printf '本轮**没有创建任何东西，也没有删除任何东西**。请先查清上面那些路径是谁的，\n' >&2
+  printf '再决定怎么处理，然后重跑。\n' >&2
+  exit 1
+}
+
 report() {
   printf '\n--- 观察到的、不属于断言结果的部署事实\n'
   if [ "${#FINDINGS[@]}" -eq 0 ]; then
@@ -808,7 +1227,11 @@ report() {
   else
     printf '%s\n' "${FINDINGS[@]}"
   fi
-  printf '\n%d 项通过，%d 项失败\n' "$PASS_COUNT" "$FAIL_COUNT"
+  printf '\n%d 项通过，%d 项失败' "$PASS_COUNT" "$FAIL_COUNT"
+  if [ "$SKIP_COUNT" -gt 0 ]; then
+    printf '，%d 节跳过（跳过不是通过）' "$SKIP_COUNT"
+  fi
+  printf '\n'
   [ "$FAIL_COUNT" -eq 0 ]
 }
 
@@ -823,11 +1246,16 @@ main() {
       # 不清场：这一阶段留下的东西正是要跨重启存活的那个状态。
       env_facts
       check_preconditions
+      stop_if_preconditions_failed
       provision
       check_install_state
       install_opsd_unit
       check_prepare
       check_lifecycle
+      # 迭代 3：部署一个 release 并留下它。它的跨重启存活由 check 阶段断言。
+      check_deploy_host
+      # 迭代 3c：真 JVM + 资源限制 + 解释器预检。
+      check_java_and_resources
       record_boot_identity
       printf '\n--- 重启前的一切就绪\n'
       printf '接下来重启这台机，然后跑：FRZ_HOST_PHASE=check bash test/host/run.sh\n'
@@ -844,6 +1272,7 @@ main() {
       trap cleanup EXIT
       env_facts
       check_preconditions
+      stop_if_preconditions_failed
       provision
       check_install_state
       install_opsd_unit
@@ -851,6 +1280,10 @@ main() {
       check_lifecycle
       check_stop
       check_database
+      # 迭代 3：部署（放在 stop 之后，因为它要的正是「应用没在跑」的起点）。
+      check_deploy_host
+      # 迭代 3c：真 JVM + 资源限制 + 解释器预检。
+      check_java_and_resources
       report
       ;;
   esac

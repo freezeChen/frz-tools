@@ -25,8 +25,11 @@ type fakeRuntimeAdapter struct {
 	prepareErr  error
 	startErr    error
 	stopErr     error
-	health      domain.RuntimeHealth
-	healthErr   error
+	// prepareErrWhen 非 nil 时先问它，用来构造「只让某一版失败」的场景：回滚要成功，
+	// 就必须让上一个版本的 Prepare 照常通过，否则测的就成了「回滚也失败」那条路径。
+	prepareErrWhen func(*domain.ApplicationSpec) error
+	health         domain.RuntimeHealth
+	healthErr      error
 
 	// startEntered 非 nil 时 Start 会先关闭它再阻塞到 ctx 结束，用于驱动取消路径。
 	startEntered chan struct{}
@@ -58,6 +61,11 @@ func (f *fakeRuntimeAdapter) Validate(_ context.Context, spec *domain.Applicatio
 
 func (f *fakeRuntimeAdapter) Prepare(_ context.Context, spec *domain.ApplicationSpec) error {
 	f.record("prepare", spec)
+	if f.prepareErrWhen != nil {
+		if err := f.prepareErrWhen(spec); err != nil {
+			return err
+		}
+	}
 	return f.prepareErr
 }
 

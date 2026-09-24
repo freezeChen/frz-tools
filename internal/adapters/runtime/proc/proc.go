@@ -69,20 +69,18 @@ func New(root string, resolver application.SecretResolver) *Adapter {
 	}
 }
 
+// Validate 做与 systemd 适配器同一条规则的检查：规格本身，加上 java 解释器在不在
+// （迭代 3c，见 unitfile.PreflightInterpreter）。
+//
+// 它**曾经**在这里 stat 任意 argv[0]（含 go），而 systemd 那边没有——同一个端口上两个
+// 实现对「什么算合法规格」的判断不同，正是合约包要防的那种漂移。现在两边共用同一个
+// 判据、同一个函数。不再检查 go 的绝对 argv[0] 是有意的：那属于**收紧** 1c 起就存在的
+// 形态（绝对路径在夹具里被广泛使用），需要单独判断兼容性影响，已记入停放区。
 func (a *Adapter) Validate(_ context.Context, spec *domain.ApplicationSpec) error {
 	if err := spec.Validate(); err != nil {
 		return err
 	}
-	info, err := os.Stat(spec.Exec.Argv[0])
-	if err != nil {
-		return domain.NewError(v1.CodeManifestInvalid,
-			"exec.argv[0] %q 在本机不可用: %v", spec.Exec.Argv[0], err)
-	}
-	if info.IsDir() || info.Mode()&0o111 == 0 {
-		return domain.NewError(v1.CodeManifestInvalid,
-			"exec.argv[0] %q 不是可执行文件", spec.Exec.Argv[0])
-	}
-	return nil
+	return unitfile.PreflightInterpreter(spec)
 }
 
 func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) error {
@@ -90,11 +88,21 @@ func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) err
 		return err
 	}
 
-	for _, dir := range []string{a.appRoot(spec), a.mapPath(spec, spec.Exec.WorkingDirectory),
-		a.mapPath(spec, spec.Logs.Directory)} {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return domain.NewError(v1.CodeInternal, "创建目录 %q 失败: %v", dir, err)
+	// 判据用**规格里的原始路径**（而不是 mapPath 之后的沙箱路径）：releases 子树是
+	// 「我们管理的生产路径」，沙箱前缀只是测试手段，拿沙箱路径去比对必然匹配不上。
+	for _, absolute := range []string{spec.Exec.WorkingDirectory, spec.Logs.Directory} {
+		// releases 子树的内部由 ReleaseAdapter 建，与 systemd 适配器同一条分工：
+		// Prepare 若把 `current` 建成实体目录，之后的符号链接切换就会失败
+		// （见 domain.InReleaseTree）。
+		if domain.InReleaseTree(spec.Application, absolute) {
+			continue
 		}
+		if err := os.MkdirAll(a.mapPath(spec, absolute), 0o750); err != nil {
+			return domain.NewError(v1.CodeInternal, "创建目录 %q 失败: %v", absolute, err)
+		}
+	}
+	if err := os.MkdirAll(a.appRoot(spec), 0o750); err != nil {
+		return domain.NewError(v1.CodeInternal, "创建应用目录 %q 失败: %v", a.appRoot(spec), err)
 	}
 
 	// 凭据目录单独处理并要求 0700：MkdirAll 对已存在的目录不改权限，
@@ -176,7 +184,10 @@ func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error
 }
 
 func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error {
-	if err := a.Validate(ctx, spec); err != nil {
+	// 与 systemd 适配器同一条：Stop 只校验规格本身，**不校验 argv[0] 还在不在**
+	// （见 systemd.Adapter.validateSpec 的注释）。解释器被卸载、制品被人删掉时，
+	// 服务仍然必须能停下来——那正是最需要这个工具的时刻。
+	if err := spec.Validate(); err != nil {
 		return err
 	}
 

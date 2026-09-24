@@ -1322,6 +1322,228 @@ MANIFEST
     assert_eq "release 目录数不超过 keepLast" "yes" \
       "$(q sh -c "test \$(find /opt/opsd/apps/${app}/releases -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) -le 2 && echo yes || echo no")"
   fi
+
+  # 6) 一次**物化阶段**的失败：制品声称是 tar-gz，内容却不是 gzip。
+  #
+  # 它比上面那次失败更靠前——流程已经**停掉了旧版本**，还没切到新版本就炸了。
+  # 这段窗口里的失败必须把旧版本放回去：不然服务是停的，而 Operation 却写着
+  # 「已回到上一个稳定版本」。这是真机验证暴露出来的缺陷，这里用真 systemd 钉住它。
+  q sh -c "printf '这不是 gzip' > /opt/frz-ops/not-a-gzip" >/dev/null
+  local bad_artifact
+  bad_artifact=$(rq artifact put /opt/frz-ops/not-a-gzip --media-type application/gzip --json |
+    sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${bad_artifact}" ]; then
+    fail "坏制品上传失败"
+    return 0
+  fi
+
+  local dirs_before_materialize_failure
+  dirs_before_materialize_failure=$(count_release_dirs)
+  cat > "$WORK_DIR/deploy-4.0.0-broken.yaml" <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${app}
+runtime: go
+artifact:
+  id: ${bad_artifact}
+  version: 4.0.0
+  unpack:
+    strategy: tar-gz
+exec:
+  argv:
+    - bin/frz-probe
+    - --report
+    - /var/lib/${app}/probe-report.txt
+    - --listen
+    - 127.0.0.1:${port_v1}
+  workingDirectory: /var/lib/${app}
+  runUser: ${app}
+  ports:
+    - ${port_v1}
+health:
+  readiness:
+    type: tcp
+    target: 127.0.0.1:${port_v1}
+    consecutiveSuccesses: 2
+  startTimeoutSeconds: 15
+  stopTimeoutSeconds: 15
+logs:
+  directory: /var/log/${app}
+release:
+  keepLast: 2
+MANIFEST
+  docker cp "$WORK_DIR/deploy-4.0.0-broken.yaml" "$CID:/opt/frz-ops/deploy-4.0.0-broken.yaml"
+
+  local broken_out broken_id
+  broken_out=$(rq app deploy --app "${app}" --file /opt/frz-ops/deploy-4.0.0-broken.yaml --json)
+  broken_id=$(printf '%s' "${broken_out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "${broken_id}" ]; then
+    fail "物化失败的部署没有返回 operation id：${broken_out}"
+  elif wait_for_status "${broken_id}" "failed" "${RUNTIME_SOCK}"; then
+    assert_eq "物化失败的错误码" "DEPLOY_ROLLED_BACK" \
+      "$(rq operation get "${broken_id}" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p' | head -1)"
+  else
+    fail "坏制品本该让部署失败，却成功了"
+  fi
+  assert_eq "物化失败之后旧版本仍在监听（它被停过，必须被放回去）" "yes" \
+    "$(q sh -c "ss -lnt | grep -q ':${port_v2} ' && echo yes || echo no")"
+  assert_eq "物化失败之后没有多出 release 目录" "${dirs_before_materialize_failure}" "$(count_release_dirs)"
+}
+
+# 迭代 3c：资源限制落进 unit，并且**真的被内核采纳**。
+check_resources() {
+  log "迭代 3c：资源限制（CPUQuota= / MemoryMax=）与 java 解释器预检"
+
+  local app=frz-res
+  local port=28611
+  require_ok "注册应用" runtimectl app create "${app}"
+
+  local uploaded artifact_id
+  uploaded=$(rq artifact put /opt/frz-ops/frz-probe --media-type application/octet-stream --json)
+  artifact_id=$(printf '%s' "${uploaded}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${artifact_id}" ]; then
+    fail "制品上传失败：${uploaded}"
+    return 0
+  fi
+
+  # workingDirectory 刻意写成 release 的 current（文档推荐的写法）。这同时压到一条分工：
+  # Prepare 跑在物化之前，**不得**把 releases 子树内部建出来，否则 current 会变成一个实体
+  # 目录，紧接着的符号链接切换就会以「改名失败」收场。
+  cat > "$WORK_DIR/res.yaml" <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${app}
+runtime: go
+artifact:
+  id: ${artifact_id}
+  version: 1.0.0
+  fileName: bin/frz-probe
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - bin/frz-probe
+    - --report
+    - /opt/opsd/apps/${app}/releases/current/probe-report.txt
+    - --listen
+    - 127.0.0.1:${port}
+    - --allow-write
+    - /opt/opsd/apps/${app}/releases/current/probe-writable
+  workingDirectory: /opt/opsd/apps/${app}/releases/current
+  runUser: ${app}
+  ports:
+    - ${port}
+health:
+  readiness:
+    type: tcp
+    target: 127.0.0.1:${port}
+    consecutiveSuccesses: 2
+  startTimeoutSeconds: 15
+  stopTimeoutSeconds: 15
+logs:
+  directory: /var/log/${app}
+resources:
+  cpuQuotaPercent: 200
+  memoryMaxBytes: 536870912
+release:
+  keepLast: 2
+MANIFEST
+  docker cp "$WORK_DIR/res.yaml" "$CID:/opt/frz-ops/res.yaml"
+
+  local out id
+  out=$(rq app deploy --app "${app}" --file /opt/frz-ops/res.yaml --json)
+  id=$(printf '%s' "${out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "${id}" ]; then
+    fail "带资源限制的部署未返回 operation id：${out}"
+    return 0
+  fi
+  if ! wait_for_status "${id}" "succeeded" "${RUNTIME_SOCK}"; then
+    fail "带资源限制的部署未成功：$(rq operation logs "${id}" --json | sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' | tail -3 | tr '\n' ' ')"
+    return 0
+  fi
+  pass "带资源限制的部署成功（workingDirectory 指向 release 的 current）"
+  assert_eq "部署后端口在监听" "yes" "$(q sh -c "ss -lnt | grep -q ':${port} ' && echo yes || echo no")"
+  # 上面那条同时说明 Prepare 没有把 current 建成实体目录：真建成的话切换会失败，
+  # 这次部署根本不会 succeeded。
+  # 报告落在 current 里面（运行用户写自己的 release 目录），因此这一条同时是
+  # 「current 解析正确」与「release 目录对运行用户可写」的证据。
+  assert_eq "release 目录对运行用户可写" "yes" \
+    "$(q sh -c "grep -q '^allow-write .* writable=yes$' /opt/opsd/apps/${app}/releases/current/probe-report.txt && echo yes || echo no")"
+
+  assert_eq "unit 里的 CPUQuota" "CPUQuota=200%" "$(q grep -x 'CPUQuota=200%' "/etc/systemd/system/${app}.service")"
+  assert_eq "unit 里的 MemoryMax 写的是原始字节数" "MemoryMax=536870912" \
+    "$(q grep -x 'MemoryMax=536870912' "/etc/systemd/system/${app}.service")"
+
+  # 「真的生效」的判据分两层：systemd 采纳了它，内核按它限制。
+  assert_eq "systemctl show 报告的 MemoryMax" "536870912" \
+    "$(q systemctl show "${app}.service" -p MemoryMax --value)"
+  # CPUQuota=200% 在 systemctl show 里是时间量写法「每秒 2 秒 CPU 时间」。
+  assert_eq "systemctl show 报告的 CPUQuotaPerSecUSec" "2s" \
+    "$(q systemctl show "${app}.service" -p CPUQuotaPerSecUSec --value)"
+
+  # cgroup v2 是限制**真正生效**的地方。路径不写死 /system.slice/...：容器里的
+  # systemd 跑在自己的 cgroup 命名空间里（/docker/<id>/system.slice/...），
+  # 由 systemd 自己报出来的 ControlGroup 才是可移植的那个来源。
+  local cgroup
+  cgroup=$(q systemctl show "${app}.service" -p ControlGroup --value)
+  if [ -z "${cgroup}" ]; then
+    fail "拿不到 unit 的 cgroup 路径（ControlGroup 为空）"
+  else
+    # cpu.max 的格式是 "<quota> <period>"：200% = 每 100ms 周期里 200ms 的 CPU 时间。
+    assert_eq "cgroup 的 memory.max" "536870912" "$(q cat "/sys/fs/cgroup${cgroup}/memory.max")"
+    assert_eq "cgroup 的 cpu.max（200% = 200000/100000）" "200000 100000" \
+      "$(q cat "/sys/fs/cgroup${cgroup}/cpu.max")"
+  fi
+
+  # java 的解释器预检：指向不存在的 JDK 时，`runtime validate` 必须在**部署之前**
+  # 以 MANIFEST_INVALID 失败，而不是等到 unit 起来、进程退出、报「就绪超时」。
+  local japp=frz-res-java
+  require_ok "注册 java 应用" runtimectl app create "${japp}"
+  cat > "$WORK_DIR/res-java.yaml" <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${japp}
+runtime: java
+artifact:
+  id: ${artifact_id}
+  version: 1.0.0
+  fileName: app.jar
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - /no/such/jdk/bin/java
+    - -Xmx256m
+    - -jar
+    - app.jar
+  workingDirectory: /opt/opsd/apps/${japp}/releases/current
+  runUser: ${japp}
+health:
+  readiness:
+    type: tcp
+    target: 127.0.0.1:28612
+  startTimeoutSeconds: 15
+logs:
+  directory: /var/log/${japp}
+MANIFEST
+  docker cp "$WORK_DIR/res-java.yaml" "$CID:/opt/frz-ops/res-java.yaml"
+  require_ok "java manifest 本身合法（磁盘上还没有那个 JDK，因此这一步必须过）" \
+    runtimectl spec put --app "${japp}" --file /opt/frz-ops/res-java.yaml
+
+  local jout jrc
+  jout=$(runtimectl runtime validate --app "${japp}" 2>&1) && jrc=0 || jrc=$?
+  assert_eq "解释器不存在时 runtime validate 的退出码" "17" "${jrc}"
+  assert_eq "报错里带上了那个解释器路径" "yes" \
+    "$(printf '%s' "${jout}" | grep -q '/no/such/jdk/bin/java' && echo yes || echo no)"
+
+  # 反例的另一半：解释器**存在**时同一条命令必须放行——否则这条检查只是「什么都拦」，
+  # 而那会让所有 java 部署在真机上直接不可用。容器里没有 JDK，因此拿一个真实存在的
+  # 可执行文件当解释器：这里验的是预检与「argv 原样送达」，javac/JAR 那一层由真机覆盖。
+  sed 's#/no/such/jdk/bin/java#/bin/sleep#' "$WORK_DIR/res-java.yaml" > "$WORK_DIR/res-java-ok.yaml"
+  docker cp "$WORK_DIR/res-java-ok.yaml" "$CID:/opt/frz-ops/res-java-ok.yaml"
+  require_ok "解释器换成存在的路径" \
+    runtimectl spec put --app "${japp}" --file /opt/frz-ops/res-java-ok.yaml
+  require_ok "解释器存在时 runtime validate 通过" runtimectl runtime validate --app "${japp}"
 }
 
 main() {
@@ -1369,6 +1591,8 @@ main() {
   check_prune
   # 迭代 3：部署与回滚（真 systemd、真进程、真切换）。
   check_deploy
+  # 迭代 3c：资源限制落进 unit 并被内核采纳，java 解释器预检。
+  check_resources
   # 放在最后：它会故意让探针 unit 停在 failed 状态（验证缺凭据必须起不来）。
   check_runtime
 
