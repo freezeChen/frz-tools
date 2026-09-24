@@ -1111,3 +1111,83 @@ macOS 目录——后者对权限断言不保真，是 AGENTS.md 已记录的坑
   （reboot 后 unit 持久化、SELinux/AppArmor、sudoers/PAM）。
 - **本节的数字口径**：断言数一律以运行时输出为准 = **89**；`40`（1b 时点）与 `87`
   （A7 落地时的静态推导）只作历史快照。
+
+## 18. 真实 Linux 主机验证 2026-09-24
+
+**证据类型：Linux 主机**（不是 Linux 容器）。这是第 14 节与第 15 节一直挂着的那一项的第一次落地。
+
+### 背景：同一台机器，用途不同
+
+第 15 节记录过：用户曾提供 `root@192.168.11.101`，**只读探测后排除**，理由有二——
+它是生产机（MES/MySQL/Redis/TDengine/EMQX/OpenResty，1Panel 管理），用户明确要求只隔离部署、
+不碰 `/etc`、不建系统用户、不写 unit；且它是 systemd 257，比容器里的 255 还新，**证明不了
+`legacy` 档**。
+
+2026-09-24 用户重新确认该机「可以作为测试使用」，并在被明确问到时授权**允许在主机上安装**
+（建专用系统用户、写 unit、装 opsd，不动既有业务文件）。因此本轮用途与上次不同：不是去
+验证 `legacy` 档（那一条**仍未落实**），而是拿**真实主机**这一档的证据——RHEL 系发行版、
+真实 systemd、**SELinux enforcing**、以及真实主机上的用户与权限落盘结果。
+
+### 做法
+
+| 文件 | 作用 |
+| --- | --- |
+| `test/host/run.sh` | 工作站侧：交叉编译 linux/amd64 的 `opsd`/`opsctl`/探针 → 上传 → 把断言脚本经 stdin 送进主机以 root 执行 |
+| `test/host/verify.sh` | 主机侧（root）的断言脚本；**结尾把自己创建的一切删干净并逐项报告**（用户/组、unit、目录、数据库），`FRZ_HOST_KEEP=1` 可保留现场 |
+| `test/host/opsd.host.verify.yaml` | 生产形态的 opsd 配置（`/etc/opsd`、`/run/opsd`、`/var/lib/opsd`） |
+
+脚本经 stdin 送入是刻意的：它在结尾会删掉自己所在的那个目录，从文件执行会读到一半就没了。
+
+opsd 本身在这轮里**以 systemd 服务运行**（harness 写一个测试用 unit），因为真机的部署形态
+就是这样；`RuntimeDirectory=opsd` 是必需的——`/run` 是 tmpfs、开机即空，socket 的父目录必须
+由 systemd 每次启动时建。**这一点在容器 harness 里被 `install -d` 掩盖了**。
+
+### 环境事实（证据的一部分）
+
+| 项 | 值 |
+| --- | --- |
+| 发行版 | Rocky Linux 10.2 (Red Quartz) |
+| 内核 | 6.12.0-211.54.1.el10_2.x86_64 |
+| systemd | 257 (257-23.el10_2.2.rocky.0.1-gb237c67) |
+| SELinux | **Enforcing** |
+| cgroup | cgroup2fs |
+| 架构 | x86_64 |
+
+### 结果：71 项通过 / 0 项失败
+
+| 分组 | 断言数 |
+| --- | --- |
+| 前置（干净主机、端口空闲） | 3 |
+| 安装态（模式、属主、SELinux 上下文） | 8 |
+| opsd 以 systemd 服务运行（socket、RuntimeDirectory） | 6 |
+| RuntimeAdapter Prepare（unit 落盘与内容、用户、权限收敛、幂等） | 17 |
+| 凭据与环境的落盘（模式、属主、内容、副本逐字节一致） | 16 |
+| 凭据路径的穿越链（运行用户可读、无关用户被拒） | 4 |
+| start / health（真实 systemd 的 unit 生命周期、凭据逐字节到达进程、ProtectSystem=strict 的实际约束） | 14 |
+| stop | 3 |
+
+命令与结果：`bash test/host/run.sh` → **71 项通过，0 项失败**（上面的数字由脚本运行时打印，
+分段计数由此得出）。
+
+### 发现（三条都是真机才暴露得出来的）
+
+1. **本工具在 SELinux 下能装能跑，但没有任何 SELinux 加固。** 实测上下文：unit 文件是
+   `system_u:object_r:systemd_unit_file_t:s0`（正确），而 **opsd 进程与托管的应用进程都是
+   `unconfined_service_t`**——我们不为托管应用装策略模块，于是它们落在默认的非受限域里。
+   **结论要写在明处：SELinux 对托管应用的约束等于未生效。** 这不是缺陷而是**未实现的能力**，
+   因此第 14 节那条「SELinux 未验证」从现在起改写成：**enforcing 下的实际行为已观测
+   （不加固），提供 SELinux 策略模块属于未实现**。
+2. **以 root 运行的 opsd 建出的 socket 是 `root:root 0660`**，非 root 用户用不了 `opsctl`；
+   配置里**没有** socket 属组项。真机暴露的部署缺口，本轮不修，记为待定（今天的权宜做法是
+   用 root 跑 opsctl）。
+3. **端口的 `Status` 没有对外暴露。** `RuntimeAdapter.Status`（「进程本身的状态」）已实现、
+   内部也在用（启动超时判定），但 **CLI 与 HTTP API 都只有 `health`**——运维问不出
+   「进程活着但没就绪」这个状态，而端口注释里恰恰写着这两者「刻意不合并」。记为待定。
+
+### 仍未验证（本轮**没有**触碰的两项）
+
+- **`legacy` 档（systemd 219–239）**：本机 systemd 257 比容器里的 255 还新，仍然证明不了它。
+  这一档继续标注**未验证**，不得声称「已支持」。
+- **reboot 后的 unit 持久化**：需要重启这台生产机（上面跑着 MES），本轮**没有**重启。
+  `systemctl is-enabled` 与 unit 文件的持久化位置只能证明「配置上是持久的」，不能替代
+  一次真实重启。AppArmor（RHEL 系没有）与 sudoers/PAM 实际策略同样仍未验证。

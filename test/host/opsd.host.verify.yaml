@@ -1,0 +1,62 @@
+apiVersion: ops.frz.io/v1alpha1
+kind: OpsdConfig
+
+# 真实 Linux 主机验证（test/host/verify.sh）专用的 opsd 配置。
+#
+# 与 test/linux/opsd.root.verify.yaml 的区别：路径一律用**生产形态**的
+# （/etc/opsd、/run/opsd、/var/lib/opsd、/var/log/opsd），因为真机这轮要证明的
+# 正是「按生产形态装上去能不能用」。harness 会在结束时把这些目录、用户与 unit
+# 全部删掉（见 verify.sh 的 cleanup）。
+#
+# 只跑**一个**实例且以 root 运行：真机的部署形态就是这样——RuntimeAdapter 要
+# useradd/chown/systemctl，没有 root 就什么都做不了。容器 harness 里那个
+# 「以 frz-ops 运行 opsd」的实例覆盖的是不需要权限的那部分语义（socket ACL、
+# 非授权可执行文件），那部分**留在容器 harness**，这里不重复。
+socket:
+  path: /run/opsd/opsd.sock
+  mode: "0660"
+
+database:
+  path: /var/lib/opsd/opsd.db
+
+runtime:
+  workDirectory: /var/lib/opsd/work
+  logDirectory: /var/log/opsd
+  workers: 2
+
+execution:
+  defaultTimeoutSeconds: 60
+  maxOutputBytes: 65536
+  # mysqldump / mysql 在真机上由 dnf 装在 /usr/bin（mysql8.4 客户端包），
+  # 因此这里必须有 /usr/bin——适配器把工具名解析成绝对路径，而执行器按绝对路径
+  # 校验。这条本身就是「真机部署要把客户端目录放进 allowedPaths」的证据。
+  allowedPaths:
+    - /bin
+    - /usr/bin
+    - /usr/local/bin
+    - /opt/frz-ops
+  sensitiveEnvKeys:
+    - TOKEN
+    - MYSQL_PWD
+
+artifactStore:
+  root: /var/lib/opsd/artifacts
+  fileMode: "0640"
+  dirMode: "0750"
+  # 探针二进制本体约 3.5 MiB。
+  maxUploadBytes: 8388608
+  quotaBytes: 33554432
+
+# 备份用**独立的**存储根（迭代 2 规格 D5）。
+backupStore:
+  root: /var/lib/opsd/backups
+  fileMode: "0640"
+  dirMode: "0750"
+  quotaBytes: 134217728
+
+secrets:
+  allowedFileDirectories:
+    - /etc/opsd/secrets
+
+sudo:
+  allowedCommands: []

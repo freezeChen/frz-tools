@@ -654,3 +654,39 @@
 - **未验证**：真实 Linux 主机上的数据库备份（本地 socket、版本组合差异、生产账号的真实权限
   边界、长时间大库与磁盘将满）、GTID 开启的 MySQL 8（适配器刻意不传 `--set-gtid-purged=OFF`，
   因为 MariaDB 的 mysqldump 不认它）、`prune`（属 2d，未实现）。
+
+### 2026-09-24（补记六）第一类「Linux 主机」证据：真机上的 runtime 与数据库备份
+
+- **变更原因**：用户确认 `root@192.168.11.101` 可作为测试机，并在被明确问到时授权
+  「允许在主机上安装」（建专用系统用户、写 unit、装 opsd，不动既有业务文件）与
+  「新建独立库与专用账号」。这台机在第 15 节（1c）曾被**只读探测后排除**——它是生产机、
+  且 systemd 257 证明不了 `legacy` 档。本轮用途不同：不是去验证 `legacy` 档，而是拿
+  **真实主机**这一档的证据。**排除的那两条理由依然成立**：`legacy` 档仍未落实、
+  生产业务未被触碰。
+- **交付**：`test/host/{run.sh,verify.sh,opsd.host.verify.yaml}` 与 `make verify-host`。
+  工作站侧交叉编译并上传，断言脚本经 stdin 送进主机以 root 执行，**结束时删干净自己创建的
+  一切**（用户/组、unit、目录、临时库）并逐项报告。
+- **证据**：环境 **Rocky Linux 10.2 / 内核 6.12 / systemd 257 / SELinux Enforcing / x86_64**；
+  `make verify-host` 实跑 **93 项通过 / 0 项失败**（1c 的 runtime 与 unit 生命周期 71 项 +
+  2b 的真实 MySQL 8.4 备份闭环 22 项）。数据库那一轮用**加密开启**的策略跑完了
+  「备份 → 校验（含存储摘要核对）→ 隔离恢复 → 删表 → 原地恢复 → 内容指纹逐字一致」。
+  详细断言表见 `2026-09-21-iteration-1c.md` 第 18 节与 `2026-09-21-iteration-2.md` 第 21 节。
+- **三条真机才暴露得出的事实**：
+  1. **本工具不提供 SELinux 加固**：opsd 与托管进程都落在 `unconfined_service_t`，
+     等于 SELinux 对托管应用的约束**未生效**。这是**未实现的能力**，不得写成「已支持」。
+     第 14 节那条「SELinux 未验证」据此改写为「enforcing 下的行为已观测」。
+  2. 以 root 运行的 opsd 建出的 socket 是 `root:root 0660`，非 root 用户用不了 `opsctl`，
+     而配置里没有 socket 属组项——真机暴露的部署缺口，记为待定。
+  3. MySQL 的隔离恢复对备份账号的权限要求**不只是 CREATEDB**：MySQL 里建库的人不会自动
+     获得该库的权限，因此还需要临时库上的权限；只给全局 `CREATE` 会让每次隔离恢复都在
+     对端留下一个临时库。最小权限配方已写进 `iteration-2.md` 第 21 节（`CREATE ON *.*` +
+     `ALL ON \`frz\_restore\_%\`.*`），不需要 `*.*` 全权。
+- **一处 harness 自身的缺陷（更该记住的一条）**：`test/dbbackup` 里给 MySQL/MariaDB 写的
+  「内容指纹」用了 `||`——而 MySQL 里 `||` 是**逻辑或**，那个表达式永远返回 1，于是合约里
+  最核心的往返断言退化成「表里有至少一行」并一路绿着通过。真实主机上才发现。已改用
+  `CONCAT`，并新增元断言 `TestFingerprintIsContentSensitive`（改一行的值指纹必须变），
+  让「断言本身没有分辨力」这种事再也骗不过去。修好后 `make verify-db` 三家实例仍 **12/0**：
+  **产品没问题，是测试在空转**。
+- **仍未验证**：`legacy` 档（systemd 219–239）、**reboot 后的 unit 持久化**（本轮没有重启
+  那台生产机）、sudoers/PAM 实际策略、真实生产库与大库的备份、GTID 开启的 MySQL 8、
+  `prune`（2d 未实现）。

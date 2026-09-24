@@ -97,6 +97,7 @@ make build         # 构建两个二进制到 output/
 make cross         # 交叉编译 linux/amd64 与 linux/arm64 到 output/
 make verify-linux  # Linux 容器验证：文件模式、属组、Unix Socket ACL、systemd（需要 docker）
 make verify-db     # 真实 PostgreSQL / MySQL / MariaDB 实例上的备份适配器共享合约（需要 docker）
+make verify-host   # **真实 Linux 主机**上的验证（需要一个能 ssh 的目标主机，不可能进 CI）
 make ci            # fmt + vet + test + test-race + cross，提交前必须通过
 ```
 
@@ -132,8 +133,18 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 **不是**容器验证。
 
 **边界没有变**：以上都是「**Linux 容器**」证据（Ubuntu 24.04 / systemd 255），
-**不等于「Linux 主机」**——reboot 后的 unit 持久化、SELinux/AppArmor、sudoers/PAM，
-以及 `legacy` 档（systemd 219–239，容器只有 255）都仍是**未验证**。
+**不等于「Linux 主机」**——reboot 后的 unit 持久化、sudoers/PAM，以及 `legacy` 档
+（systemd 219–239，容器只有 255）都仍是**未验证**。
+
+`make verify-host`（`test/host/run.sh` + `test/host/verify.sh`）是**第一类「Linux 主机」证据**：
+在一台真实主机（2026-09-24：**Rocky Linux 10.2 / 内核 6.12 / systemd 257 / SELinux Enforcing** /
+x86_64）上把 opsd 装成 systemd 服务、跑完 RuntimeAdapter 的生命周期与真实的 MySQL 8.4 备份闭环，
+实跑 **93 项通过 / 0 项失败**（1c 的 71 项 + 2b 的 22 项），结束时把主机上创建的一切删干净。
+它**不进 CI**（需要一个能 ssh 的目标主机），细节见 `docs/plans/2026-09-21-iteration-1c.md` 第 18 节
+与 `iteration-2.md` 第 21 节。三条真机才暴露得出的事实：**SELinux enforcing 下 opsd 与托管进程
+都落在 `unconfined_service_t`——本工具不提供 SELinux 加固，这一条是「未实现」而不是「已支持」**；
+以 root 运行的 opsd 建出的 socket 是 `root:root 0660`，非 root 用户用不了 opsctl（配置里没有
+socket 属组项）；MySQL 的隔离恢复对备份账号的权限要求不只是 CREATEDB（见 `iteration-2.md` 第 21 节）。
 
 `make verify-db`（`test/linux/verify-db.sh`）是**另一类**容器证据：它在真实的
 PostgreSQL / MySQL / MariaDB 实例上跑备份适配器的共享合约（`test/dbbackup`，由
@@ -173,10 +184,13 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 ## 验证约定
 
 - 每个迭代的验收标准必须给出「命令 / 结果 / 证据类型」。
-- 证据类型必须显式区分：静态检查、单元测试、集成测试、**Linux 容器**、Linux 主机、真实服务。
+- 证据类型必须显式区分：静态检查、单元测试、集成测试、**Linux 容器**、**Linux 主机**、真实服务。
 - 「Linux 容器」与「Linux 主机」是两类不同证据，不得混用。容器只验证内核级语义（文件模式、
-  Unix Socket ACL、用户/属组、`runuser` 行为）；真实 reboot 后的 unit 持久化、SELinux/AppArmor、
-  sudoers/PAM 实际策略、真实主机安装规范仍需 Linux 主机验证。
+  Unix Socket ACL、用户/属组、`runuser` 行为）；**真实 reboot 后的 unit 持久化**与
+  **sudoers/PAM 实际策略**仍需 Linux 主机验证——到 2026-09-24 为止这两项**仍未验证**。
+- SELinux 的措辞必须精确：enforcing 下的实际行为**已观测**（进程落在 `unconfined_service_t`，
+  本工具不安装策略模块），因此只能说「能装能跑、**不提供** SELinux 加固」，
+  不得写成「已支持 SELinux」或「SELinux 已加固」。AppArmor 未在 RHEL 系上存在，仍未验证。
 - 源码检查不能替代真实 Linux 主机、systemd、Nginx、数据库实例的验证；未验证内容要显式
   标注为「未验证」。
 - 若修改 API、状态机、数据表或错误码，先更新对应迭代文档并记录兼容性影响。

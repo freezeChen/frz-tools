@@ -28,6 +28,7 @@ make build         # 构建 opsctl/opsd 到 output/
 make cross         # 交叉编译 linux/amd64 与 linux/arm64
 make verify-linux  # Linux 容器验证（需要 docker，不纳入 ci）
 make verify-db     # 真实 PostgreSQL/MySQL/MariaDB 实例上的备份适配器验证（需要 docker）
+make verify-host   # **真实 Linux 主机**上的验证（需要一个能 ssh 的主机，不进 CI）
 make ci            # fmt + vet + test + test-race + cross，提交前必须通过
 ```
 
@@ -127,15 +128,26 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   2d（保留策略与 prune）待做。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」；不要引用静态推导值或历史快照当结论。
-- **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、真实主机的
-  reboot 后 unit 持久化、SELinux/AppArmor、sudoers/PAM 实际策略、`SudoConfig`（只有模型、零行为）、
-  `prune`（2d 未实现）、真实 Linux 主机上的数据库备份（版本组合、权限边界、长时间大库）、
-  GTID 开启的 MySQL 8。
+- **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、
+  **reboot 后的 unit 持久化**（真机验证时没有重启那台生产机）、sudoers/PAM 实际策略、
+  `SudoConfig`（只有模型、零行为）、`prune`（2d 未实现）、真实生产库与大库的备份、
+  GTID 开启的 MySQL 8、大容量长时间备份。
+  SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
+  本工具**不提供** SELinux 加固——这是「未实现的能力」，不得写成「已支持」。
+- **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
+  因此不进 CI）。2026-09-24 在 Rocky Linux 10.2 / systemd 257 / SELinux enforcing 上
+  实跑 **93 项通过 / 0 项失败**（1c 的 71 项 + 2b 的 22 项），跑完自动清理。
 - 备份适配器的真实实例验证用 `make verify-db`（`test/linux/verify-db.sh` + `test/dbbackup`，
   由 `FRZ_TEST_*_DSN` 控制，未设置时跳过）。它跑的是 `internal/application/backupcontract`
   的共享合约——**新增任何 `BackupAdapter` 实现都必须过同一套**。
 
 ## 已知的坑
+
+- **MySQL/MariaDB 里 `||` 是逻辑或，不是字符串拼接**（PostgreSQL 里才是拼接）。测试夹具
+  里写「内容指纹」时用了 `||`，指纹就**永远是 1**，于是「备份 → 清空 → 恢复 → 内容一致」
+  这条断言退化成「表里有至少一行」，还会一路绿着通过。用 `CONCAT(...)`。`test/dbbackup`
+  里有一条元断言（`TestFingerprintIsContentSensitive`）专门钉这件事：**断言测不出东西
+  比断言失败更危险**。
 
 Linux 容器 harness 的固定配方与两个坑见 AGENTS.md「Linux 容器验证的固定配方」。补充两条：
 

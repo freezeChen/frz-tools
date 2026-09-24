@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= output
 PKGS := ./...
 
-.PHONY: all fmt vet test test-race build cross verify-linux verify-db ci clean
+.PHONY: all fmt vet test test-race build cross verify-linux verify-db verify-host ci clean
 
 all: fmt vet test
 
@@ -42,6 +42,13 @@ verify-linux:
 ## 需要 docker 与网络（要拉三个数据库镜像），因此不纳入 ci；CI 中作为独立 job 运行。
 verify-db:
 	bash test/linux/verify-db.sh
+
+## verify-host 在**真实 Linux 主机**上验证（证据类型：Linux 主机）。
+## 需要一个能 ssh 的目标主机（默认 root@192.168.11.101），因此不可能进 CI。
+## 会在主机上临时建用户/unit/目录并在结束时全部删除；需要跑数据库那一段时另行给出
+## FRZ_HOST_MYSQL_DSN。详见 test/host/verify.sh 的头部注释。
+verify-host:
+	bash test/host/run.sh
 
 ci: fmt vet test test-race cross
 
