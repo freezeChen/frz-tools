@@ -118,6 +118,23 @@ mode_of()  { stat -c '%a' "$1" 2>/dev/null || true; }
 owner_of() { stat -c '%U:%G' "$1" 2>/dev/null || true; }
 label_of() { stat -c '%C' "$1" 2>/dev/null || true; }
 
+# business_java_count 数一数**主机自有的** JVM（排除本轮夹具用户启动的那些）。
+#
+# 它只数、只读，绝不按名字杀任何进程：那台主机上跑着不在 systemd 下、也不在容器里的业务
+# JVM，而「名字匹配」是最容易误伤它们的动作（2026-09-24 的一次 `pkill -x java` 就误杀过）。
+# 重启前后的这个数字要相等，是「重启没有牵连业务」这句话的判据。
+business_java_count() {
+  local pid user count=0
+  for pid in $(pgrep -x java 2>/dev/null || true); do
+    user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+    case " frz-ops ${HOST_APPS[*]} " in
+      *" $user "*) continue ;;
+    esac
+    count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+
 opsctl() { "$OPSCTL" --socket /run/opsd/opsd.sock "$@"; }
 q()      { "$OPSCTL" --socket /run/opsd/opsd.sock "$@" 2>/dev/null || true; }
 
@@ -1081,9 +1098,12 @@ record_boot_identity() {
     printf 'deploy_dir=%s\n' "$(readlink -f "/opt/opsd/apps/$DEPLOY_APP/releases/current" 2>/dev/null)"
     printf 'deploy_current=%s\n' "$(readlink "/opt/opsd/apps/$DEPLOY_APP/releases/current" 2>/dev/null)"
     printf 'deploy_port=%s\n' "$DEPLOY_PORT"
+    # 主机自有的业务负载（容器数与 JVM 数）：重启后要和这两个数字对上。
+    printf 'containers_before=%s\n' "$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'business_java_before=%s\n' "$(business_java_count)"
   } > "$FRZ_HOST_DIR/boot-before.txt"
   sed 's/^/      /' "$FRZ_HOST_DIR/boot-before.txt"
-  pass "已记录重启前的 boot_id、开机时刻、start 操作的 ID 与部署的 release"
+  pass "已记录重启前的 boot_id、开机时刻、start 操作的 ID、部署的 release 与业务负载计数"
 }
 
 # ==== 重启验证：重启之后的断言 ====
@@ -1196,13 +1216,23 @@ check_post_reboot() {
   fi
 
   log "重启后：主机上的业务没有被牵连"
-  local running
-  running=$(docker ps -q | wc -l | tr -d ' ')
-  printf '      当前在跑的容器数: %s\n' "$running"
-  if [ "$running" -ge 9 ]; then
-    pass "业务容器都回来了（${running} 个）"
-  else
-    fail "业务容器只有 ${running} 个（重启前是 9 个）"
+  # 与重启**前记录的值**比，而不是与一个写死的数字比：那台机器上有几个容器是它自己的
+  # 事实，换一台主机（或同一台机器上业务变了）写死的数字就变成一句假话。
+  local containers_before containers_now
+  containers_before=$(sed -n 's/^containers_before=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  containers_now=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+  printf '      容器数：重启前 %s，现在 %s\n' "${containers_before:-未记录}" "$containers_now"
+  if [ -n "$containers_before" ]; then
+    assert_eq "业务容器数与重启前一致" "$containers_before" "$containers_now"
+  fi
+  # JVM 单独数一遍：这台主机上有**不在容器里、也不在 systemd 下**的业务 JVM（迭代 3c 的
+  # 那次误杀就是它们）。这里只数，绝不按名字杀（见 run.sh 头部的纪律）。
+  local java_before java_now
+  java_before=$(sed -n 's/^business_java_before=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  java_now=$(business_java_count)
+  printf '      主机自有的 JVM 数：重启前 %s，现在 %s\n' "${java_before:-未记录}" "$java_now"
+  if [ -n "$java_before" ]; then
+    assert_eq "主机自有的 JVM 数与重启前一致" "$java_before" "$java_now"
   fi
 }
 
