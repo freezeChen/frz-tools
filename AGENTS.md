@@ -12,14 +12,14 @@ Makefile、CI 配置），以及 Git 提交信息。
 
 ## 项目概览
 
-`frz-tools` 是一个 Go 实现的 Linux 运维工具。迭代 0（工程基础与设计冻结）已实现并验证，
-判为可冻结；**迭代 1c（Linux 适配）已实现完成**：`RuntimeAdapter` 端口、共享合约测试、
-manifest 领域模型、systemd 适配器本体、unit 双档渲染与版本探测、Host/Spec 持久化与自举、
-spec/hosts/environments/制品下载与 `runtime/*` 的 API+CLI+client、以及 `test/linux/` 的
-1c 容器断言全部落地（工作树，**尚未提交**），并已在 **Linux 容器**中实跑通过
-（`make verify-linux` 第 5 轮 89 通过 / 0 失败）。**仍缺 `legacy` 档（systemd 219–239）与
-真实 Linux 主机的证据**，这两项不得写成已验证。进度与逐条证据见
-`docs/plans/2026-09-21-iteration-1c.md` 第 13、16、17 节。
+`frz-tools` 是一个 Go 实现的 Linux 运维工具。迭代 0（工程基础与设计冻结）已冻结；
+**迭代 1 的四个里程碑 1a / 1b / 1c / 1d 均已实现并提交**——资源模型与制品管理、调度器、
+Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与退避。容器断言在本地与
+干净 runner 上均为 **106 通过 / 0 失败**。
+
+**迭代 2（数据库与资源备份）的规格已冻结、实现未开始**；迭代 3–5 未开始。
+**仍缺 `legacy` 档（systemd 219–239）与真实 Linux 主机的证据**，这两项不得写成已验证。
+进度与逐条证据见 `docs/plans/` 下对应迭代文档的第 13 节之后（实现记录与验证记录）。
 
 - `opsd`：目标主机上的守护进程，负责执行需要权限的操作。
 - `opsctl`：用户 CLI，负责发起操作、查询状态与日志。
@@ -31,8 +31,9 @@ spec/hosts/environments/制品下载与 `runtime/*` 的 API+CLI+client、以及 
 - `docs/plans/2026-09-21-iteration-0.md`：迭代 0 设计、实现记录与验证记录（已实现并验证）
 - `docs/plans/2026-09-21-iteration-1a.md`：资源模型、制品管理与配置版本化（已实现并提交）
 - `docs/plans/2026-09-21-iteration-1b.md`：调度器（已实现并提交）
-- `docs/plans/2026-09-21-iteration-1c.md`：Linux 适配（**部分实现，进行中**）
-- 迭代 1d（任务引擎重试与并发策略）规格待编写，`docs/plans/` 下暂无对应文件
+- `docs/plans/2026-09-21-iteration-1c.md`：Linux 适配（已实现并提交）
+- `docs/plans/2026-09-21-iteration-1d.md`：任务引擎的重试、退避与并发策略（已实现并提交）
+- `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（**规格已冻结，实现未开始**）
 
 ## 代码规范
 
@@ -135,7 +136,8 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 两个 job 在干净的 ubuntu-latest runner 上均通过。**2026-09-24 起 1c 的容器断言已跑全**：
 `1168f29` 之后的运行是干净 runner 上的 **89 项通过 / 0 项失败**（此前 CI 那份只有迭代 0/1b
 的 40 项，`check_runtime` 尚未进入）；迭代 1d 又补了 `check_retry`（17 项），总数到 **106**
-（本地实跑 106/0）。该证据因此同时覆盖 **arm64**（本地 OrbStack）与
+（本地实跑 106/0，并已在干净 runner 上复现：run `35949920348` 的 `linux-verify` 106/0）。
+该证据因此同时覆盖 **arm64**（本地 OrbStack）与
 **amd64**（CI runner）两种架构。
 **`/etc/opsd` 的两条断言不是矛盾而是时序**：`check_filesystem` 里的「模式 = `750`」在
 `Prepare` **之前**（安装脚本状态），`check_runtime` 里的「`0751`」在 `Prepare` **之后**

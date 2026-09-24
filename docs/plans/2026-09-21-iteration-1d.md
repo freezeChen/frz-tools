@@ -553,6 +553,15 @@ CREATE INDEX ix_operations_retry_of ON operations (retry_of) WHERE retry_of IS N
 
 夹具 1 与夹具 3 合起来就是 D6 的正反两面：**该重试的地方重试了，不该重试的地方没有重试**。
 
+### 干净 runner 上的复现（2026-09-24）
+
+`48a7163` 之后的 CI run `35949920348`：`test` 与 `linux-verify` 两个 job 均通过，其中
+`linux-verify` 在干净 ubuntu-latest runner 上 **106 项通过 / 0 项失败**（含 `check_retry` 的
+三个夹具，`NRestarts=1` 等断言逐条 PASS）。
+
+至此 1d 的容器断言同时覆盖 **arm64**（本地 OrbStack）与 **amd64**（CI runner）两种架构——
+与 1c 的结论一致：这些断言没有架构相关的偶然性。
+
 ### 仍未验证
 
 - **真实 Linux 主机**上的重试行为：长退避（分钟级）在长时间运行下的表现、与不同发行版
