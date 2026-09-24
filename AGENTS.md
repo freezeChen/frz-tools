@@ -117,8 +117,10 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 以及 `legacy` 档（systemd 219–239，容器只有 255）都仍是**未验证**。
 仓库位于 <https://github.com/freezeChen/frz-tools>，module path 为
 `github.com/freezeChen/frz-tools`；CI 于 2026-09-22 起真实执行，`test` 与 `linux-verify`
-两个 job 在干净的 ubuntu-latest runner 上均通过（当时总数为 40 项，尚未包含 1c 断言；
-`check_runtime` 会在下一次运行中自动被覆盖）。
+两个 job 在干净的 ubuntu-latest runner 上均通过。**2026-09-24 起 1c 的容器断言已跑全**：
+`1168f29` 之后的运行是干净 runner 上的 **89 项通过 / 0 项失败**（此前 CI 那份只有迭代 0/1b
+的 40 项，`check_runtime` 尚未进入）。该证据因此同时覆盖 **arm64**（本地 OrbStack）与
+**amd64**（CI runner）两种架构。
 **`/etc/opsd` 的两条断言不是矛盾而是时序**：`check_filesystem` 里的「模式 = `750`」在
 `Prepare` **之前**（安装脚本状态），`check_runtime` 里的「`0751`」在 `Prepare` **之后**
 （`kind: file` 凭据要能被运行用户穿越，见 `docs/plans/2026-09-21-iteration-1c.md` 第 7 节）。

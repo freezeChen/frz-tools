@@ -1082,6 +1082,22 @@ macOS 目录——后者对权限断言不保真，是 AGENTS.md 已记录的坑
 测试挡不住部署形态差异」是同一类问题的两个面——**断言里凡是用到「本机如何」的前提，都要先
 问它在另一个受支持平台上是否成立**。
 
+### 2026-09-24（补记）：1c 的容器断言首次在干净 runner 上跑全，89/0
+
+修复提交（`3c7376e`）后 CI run `35944393593` 两个 job 均通过：
+
+- `test` job：`make ci`（fmt / vet / test / test-race / 交叉编译）在干净 ubuntu-latest
+  runner 上通过，其中 `test/e2e` 走的是本次修正后的平台分支。
+- `linux-verify` job：容器内 **89 项通过 / 0 项失败**（含 `check_runtime` 的 49 项），
+  证据类型仍是「Linux 容器」。
+
+**这是一条新证据，不只是复现**：1c 的容器断言此前只在本地 OrbStack（Apple Silicon，
+**arm64**）上跑过，这是第一次在干净 runner 的 **amd64** 上执行。也就是说该证据现在覆盖
+两种架构——容器断言里的路径、权限与 systemd 行为没有架构相关的偶然性。
+
+**边界不变**：GitHub runner 同样是 cgroup v2 的虚拟环境，仍**不是**「Linux 主机」证据；
+`legacy` 档与真机项（reboot 持久化、SELinux/AppArmor、sudoers/PAM）继续挂起并标注未验证。
+
 ### 结论汇总（2026-09-23，含本次修订）
 
 - 第 13 节的 12 条验收标准：**11 条达成、1 条部分达成（第 8 条的 `legacy` 档）**。
