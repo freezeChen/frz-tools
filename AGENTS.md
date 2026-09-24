@@ -17,8 +17,9 @@ Makefile、CI 配置），以及 Git 提交信息。
 Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与退避。容器断言在本地与
 干净 runner 上均为 **106 通过 / 0 失败**。
 
-**迭代 2a（备份：端口、策略模型、文件适配器、传输编码、API+CLI）已实现并验证**；
-2b（PostgreSQL/MySQL 适配器）与 2d（GFS 保留与 prune）未开始；迭代 3–5 未开始。
+**迭代 2a（备份：端口、策略模型、文件适配器、传输编码、API+CLI）与 2b
+（PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
+2d（GFS 保留与 prune）未开始；迭代 3–5 未开始。
 **仍缺 `legacy` 档（systemd 219–239）与真实 Linux 主机的证据**，这两项不得写成已验证。
 进度与逐条证据见 `docs/plans/` 下对应迭代文档的第 13 节之后（实现记录与验证记录）。
 
@@ -34,7 +35,7 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 - `docs/plans/2026-09-21-iteration-1b.md`：调度器（已实现并提交）
 - `docs/plans/2026-09-21-iteration-1c.md`：Linux 适配（已实现并提交）
 - `docs/plans/2026-09-21-iteration-1d.md`：任务引擎的重试、退避与并发策略（已实现并提交）
-- `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（**规格已冻结，实现未开始**）
+- `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b 已实现并验证，2d 未开始）
 
 ## 代码规范
 
@@ -95,6 +96,7 @@ make test-race     # 竞态检测
 make build         # 构建两个二进制到 output/
 make cross         # 交叉编译 linux/amd64 与 linux/arm64 到 output/
 make verify-linux  # Linux 容器验证：文件模式、属组、Unix Socket ACL、systemd（需要 docker）
+make verify-db     # 真实 PostgreSQL / MySQL / MariaDB 实例上的备份适配器共享合约（需要 docker）
 make ci            # fmt + vet + test + test-race + cross，提交前必须通过
 ```
 
@@ -132,6 +134,16 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 **边界没有变**：以上都是「**Linux 容器**」证据（Ubuntu 24.04 / systemd 255），
 **不等于「Linux 主机」**——reboot 后的 unit 持久化、SELinux/AppArmor、sudoers/PAM，
 以及 `legacy` 档（systemd 219–239，容器只有 255）都仍是**未验证**。
+
+`make verify-db`（`test/linux/verify-db.sh`）是**另一类**容器证据：它在真实的
+PostgreSQL / MySQL / MariaDB 实例上跑备份适配器的共享合约（`test/dbbackup`，由
+`FRZ_TEST_*_DSN` 控制，未设置时整包跳过）。服务端跑在容器里，**客户端工具也从容器里跑**
+——通过一组 `docker exec -i` 的包装脚本放进 PATH，因此用的是与服务端同版本的客户端，
+且测试进程的 PATH 被替换成「只有包装脚本 + 系统目录」，跑的是哪一家的客户端是确定的。
+当前实跑：**13 项通过 / 0 失败**（三家各 9 条合约子用例 + 就绪/账号/收尾 4 项）。
+**它同样不等于「Linux 主机」**：容器里是**同版本**客户端与**同机**实例，本地 socket 连接、
+版本组合差异（如 pg_dump 16 备 12 的库）、生产账号的真实权限边界、长时间大库备份都没覆盖；
+**GTID 开启的 MySQL 8** 与 `prune`（属 2d）也是**未验证**。
 仓库位于 <https://github.com/freezeChen/frz-tools>，module path 为
 `github.com/freezeChen/frz-tools`；CI 于 2026-09-22 起真实执行，`test` 与 `linux-verify`
 两个 job 在干净的 ubuntu-latest runner 上均通过。**2026-09-24 起 1c 的容器断言已跑全**：

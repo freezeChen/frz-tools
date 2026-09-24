@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= output
 PKGS := ./...
 
-.PHONY: all fmt vet test test-race build cross verify-linux ci clean
+.PHONY: all fmt vet test test-race build cross verify-linux verify-db ci clean
 
 all: fmt vet test
 
@@ -37,6 +37,11 @@ cross:
 ## 需要 docker，因此不纳入 ci；CI 中作为独立 job 运行。
 verify-linux:
 	bash test/linux/verify.sh
+
+## verify-db 在真实的 PostgreSQL / MySQL / MariaDB 实例上跑备份适配器的共享合约。
+## 需要 docker 与网络（要拉三个数据库镜像），因此不纳入 ci；CI 中作为独立 job 运行。
+verify-db:
+	bash test/linux/verify-db.sh
 
 ci: fmt vet test test-race cross
 

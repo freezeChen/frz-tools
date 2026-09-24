@@ -89,14 +89,14 @@ func (c conninfo) env() map[string]string {
 // sensitiveEnvKeys 是与 env 配套的脱敏名单。
 func (c conninfo) sensitiveEnvKeys() []string { return []string{"MYSQL_PWD"} }
 
-// connectionArgs 是连接相关的公共参数，**不含密码**。
+// connectionArgs 是**两个工具都认**的连接参数，不含密码。
+//
+// 刻意只放最小的公共子集：`mysqldump` 并不接受 mysql 客户端的全部选项——
+// 例如 `--connect-timeout` 只有 `mysql` 认，给了 mysqldump 就是
+// `unknown variable 'connect-timeout=15'` 并直接退出 7（这是真实实例跑出来的，
+// 不是文档里读来的）。所以客户端特有的选项放在 clientArgs 里。
 func (c conninfo) connectionArgs() []string {
-	args := []string{
-		"--host=" + c.host,
-		// 不设它的话，网络不可达时客户端会一直挂着直到操作超时（默认 1 小时），
-		// 期间一个 worker 被白占。
-		"--connect-timeout=15",
-	}
+	args := []string{"--host=" + c.host}
 	if c.port != "" {
 		args = append(args, "--port="+c.port)
 	}
@@ -104,6 +104,14 @@ func (c conninfo) connectionArgs() []string {
 		args = append(args, "--user="+c.username)
 	}
 	return args
+}
+
+// clientArgs 是 `mysql` 客户端的连接参数：公共子集再加上它独有的建连超时。
+//
+// 不设它的话，网络不可达时客户端会一直挂着直到操作超时（默认 1 小时），
+// 期间一个 worker 被白占。
+func (c conninfo) clientArgs() []string {
+	return append(c.connectionArgs(), "--connect-timeout=15")
 }
 
 // endpoint 是给日志与断言看的一行摘要，**不含**密码。

@@ -27,6 +27,7 @@ make test-race     # go test -race ./...
 make build         # 构建 opsctl/opsd 到 output/
 make cross         # 交叉编译 linux/amd64 与 linux/arm64
 make verify-linux  # Linux 容器验证（需要 docker，不纳入 ci）
+make verify-db     # 真实 PostgreSQL/MySQL/MariaDB 实例上的备份适配器验证（需要 docker）
 make ci            # fmt + vet + test + test-race + cross，提交前必须通过
 ```
 
@@ -110,7 +111,7 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 可选字段是兼容的；**删除字段、改名、改变语义或必填性，必须提升 `apiVersion` 并登记一段迁移**。
 不要修改历史版本的语义或直接删历史决策。
 
-SQL 迁移在仓库根 `migrations/`（`0001`…`0005`），由 `migrations` 包的 `go:embed` 导出，
+SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出，
 `internal/adapters/sqlite` 按文件名排序执行并记录到 `schema_migrations`。
 
 ## 验证纪律
@@ -122,11 +123,17 @@ SQL 迁移在仓库根 `migrations/`（`0001`…`0005`），由 `migrations` 包
 - 设计文档在 `docs/plans/`：`2026-09-21-linux-ops-tool-roadmap.md` 是总路线图（追加式变更记录，
   不删历史决策），`2026-09-21-iteration-{0,1a,1b,1c,1d,2}.md` 是各迭代规格与验证记录。验收标准
   必须给出「命令 / 结果 / 证据类型」。**1d（重试与并发策略）已于 2026-09-24 实现并提交**；
-  **迭代 2a（备份）已实现并验证**；2b（PostgreSQL/MySQL 适配器）与 2d（保留策略与 prune）待做。
+  **迭代 2a（备份）与 2b（PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
+  2d（保留策略与 prune）待做。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」；不要引用静态推导值或历史快照当结论。
 - **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、真实主机的
-  reboot 后 unit 持久化、SELinux/AppArmor、sudoers/PAM 实际策略、`SudoConfig`（只有模型、零行为）。
+  reboot 后 unit 持久化、SELinux/AppArmor、sudoers/PAM 实际策略、`SudoConfig`（只有模型、零行为）、
+  `prune`（2d 未实现）、真实 Linux 主机上的数据库备份（版本组合、权限边界、长时间大库）、
+  GTID 开启的 MySQL 8。
+- 备份适配器的真实实例验证用 `make verify-db`（`test/linux/verify-db.sh` + `test/dbbackup`，
+  由 `FRZ_TEST_*_DSN` 控制，未设置时跳过）。它跑的是 `internal/application/backupcontract`
+  的共享合约——**新增任何 `BackupAdapter` 实现都必须过同一套**。
 
 ## 已知的坑
 

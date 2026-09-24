@@ -32,3 +32,19 @@ jobs:
       # 不等于「Linux 主机」（见 AGENTS.md）。
       - name: Verify Linux-only semantics in a container
         run: bash test/linux/verify.sh
+
+  db-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # 在真实的 PostgreSQL / MySQL / MariaDB 实例上跑备份适配器的共享合约：
+      # argv 与工具的真实行为是否一致、恢复出来的内容是否等于归档、隔离恢复会不会
+      # 碰真实数据、临时库有没有被收尾。数据库服务端跑在容器里，客户端工具也从
+      # 容器里跑（同版本），因此证据类型是「Linux 容器」承载的**真实数据库实例**，
+      # 不等于「Linux 主机」（见 AGENTS.md）。
+      - name: Verify backup adapters against real database instances
+        run: bash test/linux/verify-db.sh

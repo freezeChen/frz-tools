@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,19 +26,50 @@ import (
 	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
-// Tool 是写进备份元数据的工具名。
+// Tool 是默认写进备份元数据的工具名。
+//
+// 它**不是**固定的：MariaDB 的对应工具叫 mariadb-dump，元数据里记的必须是实际
+// 用到的那一个（`tool` 列存在的意义就是「这份备份是谁备的」）。
 const Tool = "mysqldump"
 
+// dumpToolNames / clientToolNames 是按优先级排的名字。
+//
+// MariaDB 从 10.5 起把 mysqldump / mysql 改名成 mariadb-dump / mariadb，且有些
+// 客户端包不再提供旧名字——官方 `mariadb:11` 镜像里就只有 mariadb-dump。
+// 两个工具的参数集在我们的用法上是一致的，所以按顺序取第一个找得到的即可。
+var (
+	dumpToolNames   = []string{"mysqldump", "mariadb-dump"}
+	clientToolNames = []string{"mysql", "mariadb"}
+)
+
+// tools 是一次操作需要的客户端工具。
+type tools struct {
+	dump   string // dump 工具的可执行路径
+	client string // 查询/恢复用的客户端路径
+}
+
 const (
-	// headerMarker 是 mysqldump 输出的开头标志（MariaDB 的 mysqldump 同样是这一行）。
-	headerMarker = "-- MySQL dump"
-	// completionMarker 是 mysqldump 跑完时写的最后一行。它**不是**我们编的格式，
-	// 是工具自己的语义：没跑完就没有它。
-	completionMarker = "-- Dump completed"
 	// windowSize 是校验时保留的头部/尾部窗口大小。结束行是最后一行，
 	// 尾巴留 8 KiB 足够容纳它以及它前面的一小段。
 	windowSize = 8 << 10
 )
+
+// headerMarkers 是备份流开头的标志。
+//
+// 两个都要认，而且是**实测**出来的：MySQL 8.0 写 `-- MySQL dump ...`，
+// MariaDB 11.8 写 `-- MariaDB dump ...`。只认前者会让每一份 MariaDB 的备份
+// 都校验不通过——而那是「校验把好备份判成坏的」，比漏检更让人不敢用。
+var headerMarkers = [][]byte{
+	[]byte("-- MySQL dump"),
+	[]byte("-- MariaDB dump"),
+}
+
+// completionMarker 是备份流最后一行。
+//
+// 它**不是**我们编的格式，是工具自己的语义：没跑完就没有它。实测 MySQL 8.0.46
+// 与 MariaDB 11.8.9 都会写，且 `--skip-comments` 会把它去掉——因此 dump 的
+// 参数里绝不能出现那个选项。
+const completionMarker = "-- Dump completed"
 
 // Adapter 实现 application.BackupAdapter，负责 kind=mysql。
 type Adapter struct {
@@ -79,18 +111,18 @@ func (a *Adapter) Preflight(ctx context.Context, policy *domain.BackupPolicy) (d
 		report.Checks = append(report.Checks, domain.PreflightCheck{Name: name, OK: true, Detail: detail})
 	}
 
-	dump, _, toolErr := locateTools()
+	found, toolErr := locateTools()
 	if toolErr != nil {
 		return fail("clientTools", toolErr.Error()), toolErr
 	}
-	clientVersion, versionErr := version(ctx, a.exec, dump, "--version")
+	clientVersion, versionErr := version(ctx, a.exec, found.dump, "--version")
 	if versionErr != nil {
 		return fail("clientVersion", "读取客户端版本失败: "+versionErr.Error()), versionErr
 	}
 	report.ToolVersion = clientVersion
 	// 客户端是 MySQL 还是 MariaDB 会写进预检：两者的 mysqldump 参数集并不完全相同，
 	// 而「备得上、恢复不了」的排查第一步就是这个。
-	ok("clientTools", "mysqldump 与 mysql 均已找到（"+flavor(clientVersion)+"）")
+	ok("clientTools", "备份与恢复客户端均已找到（"+flavor(clientVersion)+"）")
 
 	conn, connErr := a.resolveConnection(ctx, policy)
 	if connErr != nil {
@@ -142,11 +174,11 @@ func (a *Adapter) Backup(ctx context.Context, policy *domain.BackupPolicy, w io.
 	if err := ensureDatabaseMatches(policy, conn); err != nil {
 		return domain.BackupMetadata{}, err
 	}
-	dump, _, err := locateTools()
+	found, err := locateTools()
 	if err != nil {
 		return domain.BackupMetadata{}, err
 	}
-	clientVersion, err := version(ctx, a.exec, dump, "--version")
+	clientVersion, err := version(ctx, a.exec, found.dump, "--version")
 	if err != nil {
 		return domain.BackupMetadata{}, err
 	}
@@ -155,7 +187,7 @@ func (a *Adapter) Backup(ctx context.Context, policy *domain.BackupPolicy, w io.
 		return domain.BackupMetadata{}, err
 	}
 
-	argv := []string{dump}
+	argv := []string{found.dump}
 	argv = append(argv, conn.connectionArgs()...)
 	argv = append(argv,
 		// 一致性快照：不加锁（--single-transaction 会关掉 --lock-tables），
@@ -183,12 +215,12 @@ func (a *Adapter) Backup(ctx context.Context, policy *domain.BackupPolicy, w io.
 	result, runErr := a.exec.RunStream(ctx, spec, nil, w)
 	if runErr != nil {
 		// 保留执行器的错误码，理由与 postgres 相同：重试白名单认的是那些码。
-		return domain.BackupMetadata{}, dbtools.ToolFailure(Tool, result, runErr, "")
+		return domain.BackupMetadata{}, dbtools.ToolFailure(found.toolName(), result, runErr, "")
 	}
 
 	return domain.BackupMetadata{
 		ResourceKind:  domain.BackupResourceMySQL,
-		Tool:          Tool,
+		Tool:          found.toolName(),
 		ClientVersion: clientVersion,
 		ServerVersion: serverVersion,
 	}, nil
@@ -221,9 +253,10 @@ func (a *Adapter) Verify(ctx context.Context, policy *domain.BackupPolicy, r io.
 	if window.total == 0 {
 		return domain.NewError(v1.CodeBackupVerifyFailed, "备份流是空的")
 	}
-	if !bytes.Contains(window.head, []byte(headerMarker)) {
+	if !hasAnyPrefixMarker(window.head) {
 		return domain.NewError(v1.CodeBackupVerifyFailed,
-			"备份流的开头不是 %q，这不是 mysqldump 的输出", headerMarker)
+			"备份流的开头既不是 %q 也不是 %q，这不是 mysqldump/mariadb-dump 的输出",
+			headerMarkers[0], headerMarkers[1])
 	}
 	if !bytes.Contains(window.tail, []byte(completionMarker)) {
 		// 最常见的成因是流被截断，其次是有人在参数里加了 --skip-comments。
@@ -273,13 +306,13 @@ func (a *Adapter) Restore(ctx context.Context, policy *domain.BackupPolicy, r io
 
 // restoreInto 把 SQL 流喂给 `mysql <库>`。
 func (a *Adapter) restoreInto(ctx context.Context, policy *domain.BackupPolicy, conn conninfo, database string, r io.Reader) error {
-	client, err := dbtools.Locate("mysql")
+	found, err := locateTools()
 	if err != nil {
 		return err
 	}
 
-	argv := []string{client}
-	argv = append(argv, conn.connectionArgs()...)
+	argv := []string{found.client}
+	argv = append(argv, conn.clientArgs()...)
 	argv = append(argv, database)
 
 	spec := domain.CommandSpec{
@@ -384,15 +417,20 @@ func (a *Adapter) resolveConnection(ctx context.Context, policy *domain.BackupPo
 }
 
 // locateTools 把工具解析成绝对路径（执行器按绝对路径做 allowedPaths 校验）。
-func locateTools() (dump, client string, err error) {
-	if dump, err = dbtools.Locate("mysqldump"); err != nil {
-		return "", "", err
+func locateTools() (tools, error) {
+	dump, _, err := dbtools.LocateAny(dumpToolNames...)
+	if err != nil {
+		return tools{}, err
 	}
-	if client, err = dbtools.Locate("mysql"); err != nil {
-		return "", "", err
+	client, _, err := dbtools.LocateAny(clientToolNames...)
+	if err != nil {
+		return tools{}, err
 	}
-	return dump, client, nil
+	return tools{dump: dump, client: client}, nil
 }
+
+// toolName 是元数据里记的工具名。
+func (t tools) toolName() string { return filepath.Base(t.dump) }
 
 func version(ctx context.Context, exec application.Executor, tool string, args ...string) (string, error) {
 	result, err := exec.Run(ctx, domain.CommandSpec{Argv: append([]string{tool}, args...)})
@@ -431,12 +469,12 @@ func (a *Adapter) databaseSize(ctx context.Context, conn conninfo) (string, erro
 
 // query 跑一条只读 SQL 并返回结果。
 func (a *Adapter) query(ctx context.Context, conn conninfo, sql string) (string, error) {
-	client, err := dbtools.Locate("mysql")
+	found, err := locateTools()
 	if err != nil {
 		return "", err
 	}
-	argv := []string{client}
-	argv = append(argv, conn.connectionArgs()...)
+	argv := []string{found.client}
+	argv = append(argv, conn.clientArgs()...)
 	argv = append(argv,
 		"--skip-column-names", // 只要值，不要在输出里掺列名
 		"--batch",             // 制表符分隔、不画表格边框
@@ -457,12 +495,12 @@ func (a *Adapter) query(ctx context.Context, conn conninfo, sql string) (string,
 
 // execSQL 跑一条会改状态的 SQL（建/删临时库）。
 func (a *Adapter) execSQL(ctx context.Context, conn conninfo, sql string, timeout time.Duration) error {
-	client, err := dbtools.Locate("mysql")
+	found, err := locateTools()
 	if err != nil {
 		return err
 	}
-	argv := []string{client}
-	argv = append(argv, conn.connectionArgs()...)
+	argv := []string{found.client}
+	argv = append(argv, conn.clientArgs()...)
 	argv = append(argv, "--execute", sql)
 
 	result, runErr := a.exec.Run(ctx, domain.CommandSpec{
@@ -502,6 +540,16 @@ func majorVersion(value string) int {
 		major = major*10 + int(r-'0')
 	}
 	return major
+}
+
+// hasAnyPrefixMarker 报告开头窗口里是否出现了任一自我标识。
+func hasAnyPrefixMarker(head []byte) bool {
+	for _, marker := range headerMarkers {
+		if bytes.Contains(head, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // streamWindow 是 io.Writer，记住流的**开头**与**结尾**各一小段。

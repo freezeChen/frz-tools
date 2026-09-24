@@ -30,6 +30,16 @@ func stubTools(t *testing.T, names ...string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+// stubToolsOnly 把 PATH 换成**只有桩**的一个目录。
+//
+// 用于「某个名字必须解析不到」的用例：本机可能真的装着 mysqldump（比如
+// Homebrew 的 mysql-client），只往前插是遮不住它的。
+func stubToolsOnly(t *testing.T, names ...string) {
+	t.Helper()
+	stubTools(t, names...)
+	t.Setenv("PATH", strings.SplitN(os.Getenv("PATH"), string(os.PathListSeparator), 2)[0])
+}
+
 type fakeSecrets struct {
 	values map[string]string
 	err    error
@@ -135,6 +145,17 @@ func (e *scriptedExec) specForArg(name, marker string) (domain.CommandSpec, bool
 	return domain.CommandSpec{}, false
 }
 
+func (e *scriptedExec) argvFor(name string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, spec := range e.calls {
+		if toolName(spec) == name {
+			return strings.Join(spec.Argv, " ")
+		}
+	}
+	return ""
+}
+
 func (e *scriptedExec) callsNamed(name string) []domain.CommandSpec {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -235,6 +256,11 @@ func TestBackupArgvIsSafeAndComplete(t *testing.T) {
 		// 于是「隔离」恢复直接写到生产上。见 Restore 的注释。
 		t.Fatalf("绝不能用 --databases（会让隔离恢复写到生产库）：%s", joined)
 	}
+	if strings.Contains(joined, "--connect-timeout") {
+		// 真实实例跑出来的：mysqldump 不认这个选项（它是 mysql 客户端独有的），
+		// 给了就是 `unknown variable 'connect-timeout=15'` 并直接退出 7。
+		t.Fatalf("mysqldump 不接受 --connect-timeout：%s", joined)
+	}
 	if strings.Contains(joined, "--skip-comments") {
 		// 加了它，结束行就没了，Verify 的判据会静默失效（规格 D15 的实测）。
 		t.Fatalf("绝不能用 --skip-comments（会让校验判据失效）：%s", joined)
@@ -303,6 +329,22 @@ func TestVerifyRejectsTruncatedStream(t *testing.T) {
 	}
 }
 
+// MariaDB 的输出开头是 `-- MariaDB dump`，不是 `-- MySQL dump`（实测 11.8.9）。
+// 只认前者会让每一份 MariaDB 的备份都校验不通过——「校验把好备份判成坏的」
+// 比漏检更让人不敢用这个功能。
+func TestVerifyAcceptsMariaDBDump(t *testing.T) {
+	stubTools(t, "mysqldump", "mysql")
+	adapter, _ := newAdapter()
+
+	mariadbStream := strings.Replace(dumpStream,
+		"-- MySQL dump 10.13  Distrib 8.0.46, for Linux (aarch64)",
+		"-- MariaDB dump 10.20-11.8.9-MariaDB, for debian-linux-gnu (aarch64)", 1)
+	if err := adapter.Verify(context.Background(), testPolicy(t, "orders-nightly"),
+		strings.NewReader(mariadbStream)); err != nil {
+		t.Fatalf("MariaDB 的输出必须通过校验: %v", err)
+	}
+}
+
 func TestVerifyRejectsForeignStream(t *testing.T) {
 	stubTools(t, "mysqldump", "mysql")
 	adapter, _ := newAdapter()
@@ -313,7 +355,7 @@ func TestVerifyRejectsForeignStream(t *testing.T) {
 	if domain.CodeOf(err) != v1.CodeBackupVerifyFailed {
 		t.Fatalf("want BACKUP_VERIFY_FAILED, got %v", err)
 	}
-	if !strings.Contains(err.Error(), headerMarker) {
+	if !strings.Contains(err.Error(), "MariaDB dump") {
 		t.Fatalf("错误信息要指明开头不对，got %v", err)
 	}
 }
@@ -399,6 +441,43 @@ func TestRestoreIsolatedDropsTempDatabaseEvenWhenRestoreFails(t *testing.T) {
 	drops := exec.callsNamed("mysql")
 	if len(drops) != 3 || !strings.Contains(strings.Join(drops[2].Argv, " "), "DROP DATABASE") {
 		t.Fatal("恢复失败也必须删掉临时库")
+	}
+}
+
+// MariaDB 的客户端包里可能没有 mysqldump / mysql 这两个名字（官方 mariadb:11
+// 镜像就只有 mariadb-dump / mariadb）。只认 MySQL 的名字，会让「支持 MariaDB」
+// 在真实主机上落空，还伪装成「工具没装」。
+func TestMariaDBToolNamesAreAccepted(t *testing.T) {
+	stubToolsOnly(t, "mariadb-dump", "mariadb")
+	adapter, exec := newAdapter()
+	exec.stdout["mariadb-dump"] = "mariadb-dump  Ver 10.19 Distrib 10.11.6-MariaDB, for debian-linux-gnu"
+	exec.stdout["mariadb"] = "10.11.6-MariaDB"
+	exec.streamData = []byte(dumpStream)
+
+	var out bytes.Buffer
+	metadata, err := adapter.Backup(context.Background(), testPolicy(t, "orders-nightly"), &out)
+	if err != nil {
+		t.Fatalf("MariaDB 的工具名必须被接受: %v", err)
+	}
+	// 元数据里记的必须是**实际用到**的那个工具：`tool` 列存在的意义就是
+	// 「这份备份是谁备的」。
+	if metadata.Tool != "mariadb-dump" {
+		t.Fatalf("tool 应当记成实际用到的名字，got %q", metadata.Tool)
+	}
+}
+
+// mysql 客户端**要**带上建连超时：没有它，网络不可达时会一直挂着直到操作超时。
+func TestClientArgsCarryConnectTimeout(t *testing.T) {
+	stubTools(t, "mysqldump", "mysql")
+	adapter, exec := newAdapter()
+
+	if err := adapter.Restore(context.Background(), testPolicy(t, "orders-nightly"),
+		strings.NewReader(dumpStream), domain.RestoreInPlace); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	joined := exec.argvFor("mysql")
+	if !strings.Contains(joined, "--connect-timeout=15") {
+		t.Fatalf("mysql 客户端必须带建连超时：%s", joined)
 	}
 }
 

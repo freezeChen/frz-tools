@@ -611,3 +611,42 @@
   后者在干净 runner 上打印 106 项通过 / 0 项失败——本次没有新增容器断言，数字不变）。
   **未验证**：没有在 Linux 容器或真实主机上跑过「带数据的旧库升级」——容器 harness 用的是
   全新库，迁移在空库上是恒等变换；也未在真实生产库规模上评估过迁移耗时。
+
+### 2026-09-24（补记五）迭代 2b 实现并验证：数据库备份适配器
+
+- **变更原因**：按第 5 节「数据库与资源备份」的范围实现 PostgreSQL 与 MySQL/MariaDB
+  适配器，以及数据库的隔离恢复。设计与实现记录见
+  `docs/plans/2026-09-21-iteration-2.md` 第 17–20 节。
+- **交付**：`internal/adapters/backup/{postgres,mysql,dbtools}`、`test/dbbackup`、
+  `test/linux/verify-db.sh`（新增 `make verify-db` 与 CI job `db-verify`）。
+- **对既有结构的三处改动**（都在迭代 2 文档里记了理由与兼容性影响）：
+  1. **`Executor` 端口新增 `RunStream`**。这不是新功能而是修一个正确性缺陷：
+     `Run` 把 stdout 收进**有上限**的缓冲，超限部分被丢弃而命令照常退出 0——拿它跑
+     `pg_dump` 会得到一份「记录为成功、内容却残缺」的备份。`api/v1` 不变，不提升
+     apiVersion，不涉及数据表。
+  2. **新增错误码 `BACKUP_RESTORE_FAILED`**（HTTP 409 / 退出码 28）。规格的错误码表里
+     没有它，而恢复失败原本只能借 `EXEC_EXIT_NONZERO` 表达——那会把「这次恢复没成功」
+     和「一条命令跑失败了」混成一个码。刻意**不**加入 1d 的重试白名单：恢复会覆盖真实
+     数据，自动重试该由人看着做。
+  3. **`resource.database` 增加字符集约束**（字母/数字/下划线/`$`，不以数字开头）。
+     这是**安全边界**：库名会进命令行（mysql 的位置参数），一个以 `-` 开头的库名会被
+     MySQL 客户端当成旗标解析。执行器只接受 argv、挡得住 shell 注入，挡不住旗标注入。
+- **补上 2a 的两处遗留**：①`backup verify` 现在核对存储摘要与 `backups.storage_digest`
+  （路线图的验收标准写的是「备份文件可通过 checksum 验证」，而 2a 只问了适配器
+  「你读得动吗」）；②端口的 `Cleanup` 终于在产品路径上被调用——在此之前它只有合约测试
+  在调，「被中断的恢复留下的临时资源」在生产上没有任何出口。
+- **三处只有真实数据库实例才能发现的坑**（单测用假实现永远发现不了）：
+  `mysqldump` 不认 `--connect-timeout`（它是 `mysql` 客户端独有的选项，给了直接退出 7）；
+  MariaDB 的客户端包里可能**没有** `mysqldump` 这个名字（官方 `mariadb:11` 镜像里只有
+  `mariadb-dump`），因此按优先级解析两个名字；MariaDB 的备份流开头是 `-- MariaDB dump`
+  而不是 `-- MySQL dump`，只认后者会让每一份 MariaDB 备份都校验不通过。
+- **验证要求**：证据是**单元测试**（两个适配器各 19 / 16 个用例，覆盖 argv 形状、密码不进
+  argv、库名一致性、版本倒挂、临时库收尾、校验判据）、**集成测试**（篡改存储字节后校验必须
+  失败、未注册 kind 在提交期与执行期都被拒、产品路径真的会调 `Cleanup`）、**Linux 容器**
+  （`make verify-linux` 118/0 回归不变）与**Linux 容器承载的真实数据库实例**
+  （`make verify-db` 13/0：PostgreSQL 16、MySQL 8.0、MariaDB 11 各跑一遍共享合约，
+  测试账号是非超级用户 + 建库权限，并检查三个实例上都没有残留的临时库）。
+  `make ci` 全绿。
+- **未验证**：真实 Linux 主机上的数据库备份（本地 socket、版本组合差异、生产账号的真实权限
+  边界、长时间大库与磁盘将满）、GTID 开启的 MySQL 8（适配器刻意不传 `--set-gtid-purged=OFF`，
+  因为 MariaDB 的 mysqldump 不认它）、`prune`（属 2d，未实现）。

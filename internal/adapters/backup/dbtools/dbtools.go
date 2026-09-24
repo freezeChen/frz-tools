@@ -144,6 +144,24 @@ func Locate(name string) (string, error) {
 	return path, nil
 }
 
+// LocateAny 按优先级解析工具名，返回解析到的路径与**实际用到的名字**。
+//
+// 需要它是因为同一件工具在不同发行版上叫不同的名字：MariaDB 从 10.5 起把
+// mysqldump / mysql 改名为 mariadb-dump / mariadb，而且**有些客户端包不再提供旧名字**
+// ——官方 `mariadb:11` 镜像里只有 `mariadb-dump`，没有 `mysqldump`。
+// 只认 MySQL 的名字，会让「支持 MariaDB」这句话在真实的 MariaDB 主机上落空，
+// 而且表现成「工具没装」——那是个会把排查带偏的报错。
+func LocateAny(names ...string) (path, used string, err error) {
+	for _, name := range names {
+		if resolved, lookupErr := exec.LookPath(name); lookupErr == nil {
+			return resolved, name, nil
+		}
+	}
+	return "", "", domain.NewError(v1.CodeBackupPreflightFailed,
+		"找不到 %s 中的任何一个（需要安装 MySQL 或 MariaDB 的客户端工具包）",
+		strings.Join(names, " / "))
+}
+
 // ResolveSecret 解析一次凭据引用。
 //
 // 明文只在**使用时刻**出现，不落库、不落日志——与 1a 的凭据约定一致
