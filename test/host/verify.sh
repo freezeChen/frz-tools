@@ -136,7 +136,9 @@ label_of() { stat -c '%C' "$1" 2>/dev/null || true; }
 # unitStatus 的注释），harness 这里跟上同一条规则：解析 `Prop=value` 那一行。
 # 这个写法在 219 与 255 上都能用（两边都实测过）。
 unit_prop() { # unit 属性名
-  systemctl show "$1" -p "$2" 2>/dev/null | sed -n "s/^$2=//p" | head -1
+  # 结尾的 `|| true` 是必需的：脚本开着 pipefail，systemctl 失败时整条管道会返回非零，
+  # 而调用点几乎都是赋值语句——那会让整个脚本在 set -e 下退出。
+  systemctl show "$1" -p "$2" 2>/dev/null | sed -n "s/^$2=//p" | head -1 || true
 }
 
 # memory_limit_of / cpu_quota_of：**内核侧**真正生效的那个值。
@@ -167,6 +169,31 @@ cpu_quota_of() { # unit —— 输出 "<quota> <period>"，两代的语义与数
   fi
 }
 
+# container_count 报告本机在跑的容器数；**没有 docker（或守护进程不可用）时返回一个说明性
+# 字符串**，而不是 0。
+#
+# 三个刻意写法：①不必用管道——脚本开着 `set -o pipefail`，`docker` 不存在时
+# `docker ps -q | wc -l` 整条管道返回 127，而调用点是赋值语句，**整个 check 阶段会因此退出**
+# （2026-09-24 在一台没装 docker 的 CentOS 7 上真的踩到了：跨重启的那些断言全绿，脚本却以
+# 127 收场，日志里只剩收尾那几行，看起来像「有断言没跑」）；②`docker ps` 失败（守护进程没跑）
+# 与「没有 docker」都不是数字，不能拿去和数字比；③循环计数而不是 `wc -l`，因为管道正是要避开的。
+container_count() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '无 docker'
+    return 0
+  fi
+  local listing
+  if ! listing=$(docker ps -q 2>/dev/null); then
+    printf 'docker 不可用'
+    return 0
+  fi
+  local count=0 line
+  while IFS= read -r line; do
+    [ -n "$line" ] && count=$((count + 1))
+  done <<< "$listing"
+  printf '%s' "$count"
+}
+
 # business_java_count 数一数**主机自有的** JVM（排除本轮夹具用户启动的那些）。
 #
 # 它只数、只读，绝不按名字杀任何进程：那台主机上跑着不在 systemd 下、也不在容器里的业务
@@ -175,7 +202,7 @@ cpu_quota_of() { # unit —— 输出 "<quota> <period>"，两代的语义与数
 business_java_count() {
   local pid user count=0
   for pid in $(pgrep -x java 2>/dev/null || true); do
-    user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+    user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     case " frz-ops ${HOST_APPS[*]} " in
       *" $user "*) continue ;;
     esac
@@ -1206,7 +1233,7 @@ record_boot_identity() {
     printf 'deploy_current=%s\n' "$(readlink "/opt/opsd/apps/$DEPLOY_APP/releases/current" 2>/dev/null)"
     printf 'deploy_port=%s\n' "$DEPLOY_PORT"
     # 主机自有的业务负载（容器数与 JVM 数）：重启后要和这两个数字对上。
-    printf 'containers_before=%s\n' "$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'containers_before=%s\n' "$(container_count)"
     printf 'business_java_before=%s\n' "$(business_java_count)"
   } > "$FRZ_HOST_DIR/boot-before.txt"
   sed 's/^/      /' "$FRZ_HOST_DIR/boot-before.txt"
@@ -1327,7 +1354,7 @@ check_post_reboot() {
   # 事实，换一台主机（或同一台机器上业务变了）写死的数字就变成一句假话。
   local containers_before containers_now
   containers_before=$(sed -n 's/^containers_before=//p' "$FRZ_HOST_DIR/boot-before.txt")
-  containers_now=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+  containers_now=$(container_count)
   printf '      容器数：重启前 %s，现在 %s\n' "${containers_before:-未记录}" "$containers_now"
   if [ -n "$containers_before" ]; then
     assert_eq "业务容器数与重启前一致" "$containers_before" "$containers_now"

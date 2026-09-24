@@ -13,6 +13,17 @@
 # 在主机上以 root 执行断言脚本（脚本经 stdin 送入，因此它结尾把自己所在的目录删掉
 # 也不会影响正在执行的自己）。
 #
+# **重启验证怎么编排**（两阶段，`check` 阶段不重新上传，否则会把跨重启的记录冲掉）：
+#
+#   FRZ_HOST_PHASE=prepare bash test/host/run.sh   # 建状态并记录重启前的身份
+#   # 重启那台机
+#   FRZ_HOST_PHASE=check bash test/host/run.sh     # 断言「真的重启过」以及状态还在
+#
+# 如果由脚本自动重启，**必须等它先下线、再等它上线**：开机命令发出后 ssh 往往几秒内仍然
+# 可用（还在关机流程里），此时直接跑 `check` 会因为 `boot_id` 没变而（正确地）判定「这台机
+# 没有重启，后面的断言证明不了任何事」。2026-09-24 就这么白跑了一轮——harness 拦住了它，
+# 这是它该有的行为，但编排脚本要多做这一步。
+#
 # 主机上会创建并**在结束时删除**：系统用户/组 frz-ops 与 frz-probe、
 # /etc/opsd、/var/lib/opsd、/var/log/opsd、/run/opsd、/opt/frz-ops、/opt/opsd（release
 # 目录树）、/var/lib/frz-probe、/var/log/frz-probe、以及 unit 文件；迭代 3 又加了三个

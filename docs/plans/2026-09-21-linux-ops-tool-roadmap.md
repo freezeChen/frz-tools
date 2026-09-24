@@ -865,6 +865,19 @@
 - **这台机上还装了 JDK**（Temurin 17.0.20.1，sha256 与 Adoptium 官方发布值一致），因此迭代 3c
   的 Java 那一档也在这台 legacy 主机上验完了：真 JAR、真 JVM、`/proc/<pid>/cmdline` 逐元素
   一致、`-Xmx256m` 生效、解释器预检在部署**之前**以 `MANIFEST_INVALID` 拦下写错的 JDK 路径。
+- **重启验证也做了**（用户授权重启那台 VM）：`FRZ_HOST_PHASE=prepare` → 重启 →
+  `FRZ_HOST_PHASE=check`，**116 项 + 28 项通过 / 0 项失败**。`boot_id` 前后不同（`db908686…`
+  → `2ba0c1cf…`）、`/run/opsd` 由 `RuntimeDirectory=` 重建、两个 unit 都自己回到 active、
+  凭据仍逐字节一致、重启前创建的 Operation 仍可查，
+  **部署出来的 release 自己回来了：`current` 仍指向重启前那个 release、端口自己在监听、
+  进程的工作目录仍在那个 release 上**——迭代 3 的「跨重启存活」至此有了真机证据。
+  （第一次自动重启时我的编排只等「ssh 恢复」，关机过程中 ssh 几秒内仍可用，于是 `check`
+  跑在同一代 boot 上；harness **正确拒绝**了：「`boot_id` 没变：这台机没有重启，后面的断言
+  证明不了任何事」。改成「先等下线、再等上线」后全绿。）
+- **又修掉一个 harness 的 shell 陷阱**：`set -o pipefail` 下
+  `containers_now=$(docker ps -q | wc -l | tr -d ' ')` 在这台**没装 docker** 的主机上让整条
+  管道返回 127，而调用点是赋值语句 → `set -e` 直接终止，跨重启那些断言全绿、脚本却以 127
+  收场（日志里只剩收尾那几行）。改成不带管道、并且区分「没有 docker」与「有 docker 但 0 个
+  容器」的 `container_count()`。
 - **仍未验证**：`legacy` 档的 **232～239 那一段**（无对应版本的主机，不得写成「整档已验证」）、
-  **重启验证**（`prepare → 重启 → check` 那一轮没做）、以及 strict 档上「修复后的 3c 复跑」
-  （那台主机 `192.168.11.101` 在复跑前整段网段从本机不可达）。
+  以及 strict 档上「修复后的 3c 复跑」（那台主机 `192.168.11.101` 复跑前整段网段从本机不可达）。

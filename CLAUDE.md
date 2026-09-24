@@ -139,7 +139,7 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   **2d（保留策略与 `prune`）也已实现并验证**，范围是只用 `keepLast`/`keepDays`；
   **GFS 已移出**并停放在停放区第 2 节（未实现）。
   **迭代 3 的 3a / 3b / 3c 都已实现并验证**（制品解包成 release 目录、部署与回滚、资源限制与
-  Java 运行时的解释器预检）；**仍未做的只有「部署出来的 release 跨重启存活」那一轮**。
+  Java 运行时的解释器预检），含「部署出来的 release 跨重启存活」的真机证据。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」（迭代 3c 落地后为 **170 项**）；不要引用静态推导值或历史快照当结论。
 - **不得把未验证项写成已验证**。当前明确未验证：`legacy` 档的 **232～239 那一段**
@@ -147,12 +147,16 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   sudoers/PAM 实际策略、
   `SudoConfig`（只有模型、零行为）、GFS 保留、store-wide 的备份孤儿回收、
   真实生产库与大库的备份、
-  GTID 开启的 MySQL 8、大容量长时间备份、**「部署出来的 release 跨重启存活」**（两档都没做）。
+  GTID 开启的 MySQL 8、大容量长时间备份、**strict 档上修复后的 3c 复跑**（那台主机不可达）。
   SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
   本工具**不提供** SELinux 加固——这是「未实现的能力」，不得写成「已支持」。
 - **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
   因此不进 CI）。2026-09-24 在 Rocky Linux 10.2 / systemd 257 / SELinux enforcing 上
   实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），跑完自动清理。
+  **legacy 档（CentOS 7 / systemd 219 / cgroup v1）也验完了**：`full` 118/0，
+  重启验证 `prepare` 116/0 + `check` 28/0（`boot_id` 前后不同、`/run/opsd` 重建、
+  **部署出来的 release 自己回来且 `current` 未变**）。自动重启的编排**必须等它先下线再上线**，
+  否则 `check` 会跑在同一代 boot 上——那条断言会（正确地）拒绝。
   迭代 3c 在 strict 档上那一轮实测 **111 项通过 / 1 项失败**（失败项是一个真实缺陷，已修复）。
   **legacy 档（CentOS 7 / systemd 219 / cgroup v1）另跑一轮：118 项通过 / 0 项失败**，
   含 3c 整段（真 JAR、真 JVM、`MemoryLimit=` 落到 cgroup v1、解释器预检）；

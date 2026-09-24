@@ -1285,7 +1285,25 @@ systemd 与 **cgroup v1** 两侧都是声明的值、解释器路径写错时以
 
 - **`legacy` 档的 232～239 那一段**：与 219 共享同一套 unit 模板，但没有那个版本段的主机跑过。
   措辞上不得写成「整档已验证」——代码里的 `tierLegacyNote` 就是这么写的。
-- **重启验证**：这一轮只跑了 `full` 阶段，`prepare → 重启 → check` 那一轮（部署出来的 release
-  跨重启存活）**没有做**。
+### 重启验证（同一个 219 主机）
+
+`FRZ_HOST_PHASE=prepare` → 重启 → `FRZ_HOST_PHASE=check`：prepare **116 项通过 / 0 项失败**，
+check **28 项通过 / 0 项失败**。观察到的时序：发出重启后**第 2 次探测（约 8 秒）确认下线**，
+再**第 2 次探测（约 10 秒）恢复**。
+
+| 断言 | 结果 |
+| --- | --- |
+| `boot_id` 变了（`db908686…` → `2ba0c1cf…`）——「真的重启过」的硬证据 | PASS |
+| `frz-opsd-verify.service` 重启后 active、`/run/opsd` 被 `RuntimeDirectory=` 重建（模式 750）、socket 重建（660） | PASS |
+| 重启前创建的 Operation 仍可查且终态仍是 `succeeded` | PASS |
+| 凭据副本仍逐字节一致；`/etc/opsd` 的 751 与凭据的 600/700 一字未变 | PASS |
+| **部署出来的 release 自己回来了**：`frz-dep.service` active、`current` 仍指向重启前那个 release（`rel_WLXEUZTWG7XFBFG7CHSQTKTZE4`）、解析后仍是同一目录、部署的端口自己在监听、进程的工作目录仍在那个 release 上 | PASS |
+| 主机业务负载未被牵连（这台机没有 docker 与业务 JVM，断言比对的是重启前后记录的值） | PASS |
+
+**上一轮编排错误，以及 harness 正确拦住了它**：第一次自动重启时，我的等待逻辑只等「ssh 恢复」，
+而开机命令发出后 ssh 在关机过程中几秒内仍然可用，于是 `check` 跑在**同一代 boot** 上——
+它直接判定「`boot_id` 没变：这台机没有重启，后面的断言证明不了任何事」并以非零退出。
+这条断言的价值就在这里：**它不让人在不成立的现场上写出通过的结论**。编排脚本改成
+「先等下线、再等上线」后本轮全绿。
 - SELinux：这台机是 Disabled，enforcing 下的行为只在 Rocky Linux 那台机上观测过。
 - AppArmor 与 sudoers/PAM 的实际策略：仍未验证。

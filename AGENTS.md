@@ -22,9 +22,9 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 **2d（保留策略与 `prune`）已实现并验证**——范围是**只用 `keepLast` / `keepDays`**，
 **GFS 已按用户指示移出并停放为未来迭代目标**
 （见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）。
-**迭代 3（Go/Java 通用进程部署）的 3a / 3b / 3c 都已实现**（解包与 release 目录、部署与回滚、
-资源限制与 Java 运行时的解释器预检）；3c 的真机验证已在 legacy 档主机上完成，
-**仍未做的只有「部署出来的 release 跨重启存活」那一轮**，迭代 4–5 未开始。
+**迭代 3（Go/Java 通用进程部署）的 3a / 3b / 3c 都已实现并验证**（解包与 release 目录、
+部署与回滚、资源限制与 Java 运行时的解释器预检），3c 的真机验证（含**重启后部署版本仍存活**）
+在 legacy 档主机上完成，迭代 4–5 未开始。
 **真实 Linux 主机的证据已于 2026-09-24 取得**，而且**两档都拿到了**：
 Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真实重启）与
 **CentOS 7 / systemd 219 / cgroup v1（legacy 档，118 项通过 / 0 项失败）**，见 `test/host/`。
@@ -279,3 +279,10 @@ docker run -d --privileged --cgroupns=host \
 
 shell 脚本中变量名后紧跟中文全角字符时，必须写成 `${var}`。macOS 自带的 bash 3.2 会把
 多字节字符的前几个字节算进变量名，报 `unbound variable`；CI 上的 bash 5 不会暴露这个问题。
+
+**`set -o pipefail` × 可能不存在的命令 = 赋值语句静默终止脚本**（2026-09-24 踩到）：
+`x=$(docker ps -q | wc -l)` 在没装 docker 的主机上，管道整体返回 127（不是 wc 的 0），
+而 `x=$(...)` 会把那个状态交给 `set -e`——脚本当场退出。现场的样子很有迷惑性：大部分断言
+都打印了 PASS，只有最后那节的断言**一条都没出现**。规避方式：不要用管道取计数，或者把它
+包进函数并让函数在任何路径上都返回 0。同样的坑适用于 `systemctl`、`pgrep` 等任何可能失败的
+命令出现在赋值右侧的管道里。
