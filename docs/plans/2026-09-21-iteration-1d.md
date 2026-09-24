@@ -527,7 +527,7 @@ CREATE INDEX ix_operations_retry_of ON operations (retry_of) WHERE retry_of IS N
   （用定宽格式）。影响面是同一秒内提交的操作可能被乱序领取，不影响正确性、只影响顺序。
   已作为独立事项记录，待单独处理。
 
-> **2026-09-24 已修复**（同一个提交，独立于 1d 的功能范围）：`timeLayout` 改为定宽
+> **2026-09-24 已修复**（提交 `7d15880`，独立于 1d 的功能范围）：`timeLayout` 改为定宽
 > `2006-01-02T15:04:05.000000000Z`（写入侧统一），读回改用 `time.RFC3339Nano`——它能接受
 > 任意小数位数（含没有小数部分），因此新旧值都读得动，**宽读窄写**。1d 里为 `not_before`
 > 单独加的 `notBeforeLayout` / `formatNotBefore` 是同一处理的局部特例，推广后删除，所有时间
