@@ -22,21 +22,40 @@ import (
 var appSpecMigrations = map[string]func(doc map[string]any) error{}
 
 type wireSpec struct {
-	APIVersion  string       `yaml:"apiVersion"`
-	Kind        string       `yaml:"kind"`
-	Application string       `yaml:"application"`
-	Runtime     string       `yaml:"runtime"`
-	Artifact    wireArtifact `yaml:"artifact"`
-	Exec        wireExec     `yaml:"exec"`
-	Health      wireHealth   `yaml:"health"`
-	Logs        wireLogs     `yaml:"logs"`
-	Systemd     wireSystemd  `yaml:"systemd"`
+	APIVersion  string         `yaml:"apiVersion"`
+	Kind        string         `yaml:"kind"`
+	Application string         `yaml:"application"`
+	Runtime     string         `yaml:"runtime"`
+	Artifact    wireArtifact   `yaml:"artifact"`
+	Exec        wireExec       `yaml:"exec"`
+	Health      wireHealth     `yaml:"health"`
+	Logs        wireLogs       `yaml:"logs"`
+	Systemd     wireSystemd    `yaml:"systemd"`
+	Resources   *wireResources `yaml:"resources"`
+	Release     *wireRelease   `yaml:"release"`
+}
+
+// wireResources 是资源限制。指针类型用来区分「没写」与「写了全 0」——两者语义相同
+// （不限制），因此这里其实只需要能表达「没有这一段」。
+type wireResources struct {
+	CPUQuotaPercent int   `yaml:"cpuQuotaPercent"`
+	MemoryMaxBytes  int64 `yaml:"memoryMaxBytes"`
+}
+
+// wireRelease 是发布策略。
+//
+// keepLast 用指针：**没写**要走默认值，而 `keepLast: 0` 是非法值（制品永远在制品库里，
+// 「永不清理 release 目录」没有真实价值）。指针才能把这两件事分开说清楚。
+type wireRelease struct {
+	KeepLast *int `yaml:"keepLast"`
 }
 
 type wireArtifact struct {
-	ID     string      `yaml:"id"`
-	Digest string      `yaml:"digest"`
-	Unpack *wireUnpack `yaml:"unpack"`
+	ID       string      `yaml:"id"`
+	Digest   string      `yaml:"digest"`
+	Version  string      `yaml:"version"`
+	FileName string      `yaml:"fileName"`
+	Unpack   *wireUnpack `yaml:"unpack"`
 }
 
 type wireUnpack struct {
@@ -111,8 +130,17 @@ func convert(wire *wireSpec, doc map[string]any) *domain.ApplicationSpec {
 		Application: strings.TrimSpace(wire.Application),
 		Runtime:     domain.RuntimeKind(wire.Runtime),
 		Artifact: domain.SpecArtifact{
-			ID:     strings.TrimSpace(wire.Artifact.ID),
-			Digest: strings.TrimSpace(wire.Artifact.Digest),
+			ID:       strings.TrimSpace(wire.Artifact.ID),
+			Digest:   strings.TrimSpace(wire.Artifact.Digest),
+			Version:  strings.TrimSpace(wire.Artifact.Version),
+			FileName: strings.TrimSpace(wire.Artifact.FileName),
+		},
+		Release: domain.SpecRelease{
+			KeepLast: keepLastOrZero(wire.Release),
+		},
+		Resources: domain.SpecResources{
+			CPUQuotaPercent: resourcesOrZero(wire.Resources).CPUQuotaPercent,
+			MemoryMaxBytes:  resourcesOrZero(wire.Resources).MemoryMaxBytes,
 		},
 		Exec: domain.SpecExec{
 			Argv:             wire.Exec.Argv,
@@ -176,4 +204,22 @@ func seconds(value int) time.Duration {
 		return 0
 	}
 	return time.Duration(value) * time.Second
+}
+
+// resourcesOrZero 把可能缺失的 resources 段折叠成零值——零值就是「不限制」，与「没写」
+// 语义相同，因此这里不需要指针一路传到领域模型。
+func resourcesOrZero(wire *wireResources) wireResources {
+	if wire == nil {
+		return wireResources{}
+	}
+	return *wire
+}
+
+// keepLastOrZero 返回声明的 keepLast；没写时返回 0，交由领域层的校验补默认值
+// （校验发生在 applyDefaults 之前，因此「没写」必须走默认值这条路径）。
+func keepLastOrZero(wire *wireRelease) int {
+	if wire == nil || wire.KeepLast == nil {
+		return 0
+	}
+	return *wire.KeepLast
 }

@@ -188,6 +188,26 @@ type BackupAdapter interface {
 	Cleanup(ctx context.Context, policy *domain.BackupPolicy, operationID string) error
 }
 
+// ReleaseAdapter 把一份制品物化成一个可运行的 release 目录，并管理版本的切换与清理。
+//
+// 它刻意与 RuntimeAdapter 分开：解包是「归档格式 + 路径安全」的逻辑，与「进程管理」正交，
+// 而两个运行时实现（systemd / proc）都要用它——放进 RuntimeAdapter 就得各写一遍，
+// 那正是「不允许各自实现一份」要避免的事。
+//
+// 与 RuntimeAdapter 一样，所有方法都不得假设调用方已经校验过规格：实现方必须在内部先校验。
+type ReleaseAdapter interface {
+	// Materialize 把制品字节解到该 release 的目录里（模式与属主按 1c 的约定：0750、
+	// runUser:runUser）。**已存在的目录必须被拒绝**——制品不可变，复用一个目录等于允许
+	// 「同一个版本号下换了内容」。
+	Materialize(ctx context.Context, spec *domain.ApplicationSpec, releaseID string, artifact io.Reader) error
+	// Activate 把 current 指针切到该 release（原子替换符号链接）。
+	Activate(ctx context.Context, spec *domain.ApplicationSpec, releaseID string) error
+	// Remove 删掉一个 release 目录；实现必须**拒绝删除 current 指向的那个**。
+	Remove(ctx context.Context, spec *domain.ApplicationSpec, releaseID string) error
+	// List 列出磁盘上实际存在的 release 目录，供发现「库里有记录、盘上没目录」这类不一致。
+	List(ctx context.Context, spec *domain.ApplicationSpec) ([]string, error)
+}
+
 // RuntimePrepareReporter 让装配层把适配器独有的 Prepare 决策（systemd 的 unit 档位与
 // 探测到的版本）交给 Operation 的日志与审计。
 //

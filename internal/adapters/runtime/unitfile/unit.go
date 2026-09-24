@@ -83,6 +83,12 @@ type Rendered struct {
 	Tier           Tier
 	SystemdVersion int
 	Degradations   []string
+	// Argv 是**解析之后**的 argv（相对路径已拼到 release 的 current 之下）。
+	//
+	// 它随渲染结果一起交出去，是为了让「实际会执行什么」只有一个来源：proc 适配器要
+	// 记录它、审计想看它、断言要钉它。让调用方各自再解析一遍，就是把这件既有安全含义
+	// （argv 会变成 ExecStart=）又容易写错的事复制成多份。
+	Argv []string
 }
 
 // RenderUnit 按 tier 渲染 spec 对应的 unit 文件正文。
@@ -110,10 +116,19 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 		return Rendered{}, err
 	}
 
+	// argv 在这里解析（迭代 3 规格 D4）：绝对路径原样、相对路径相对 release 的
+	// current 目录。**这是 argv 最后一次被使用的地方**，把解析放在这里而不是散在调用点，
+	// 是因为「怎么解析」与「谁来执行」是同一条信息——分开就会漂移，而漂移的后果是
+	// 启动一个不该启动的东西。
+	resolvedArgv, err := domain.ResolveArgv(spec.Application, spec.Exec.Argv)
+	if err != nil {
+		return Rendered{}, err
+	}
+
 	writable := []string{
 		spec.Exec.WorkingDirectory,
 		spec.Logs.Directory,
-		ReleaseRootDir(spec.Application),
+		domain.ReleaseRootDir(spec.Application),
 	}
 	for _, p := range writable {
 		if err := checkRenderablePath("unit 中的路径", p); err != nil {
@@ -148,7 +163,7 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 	// 敏感文件缺失必须让 unit 启动失败，否则应用会在缺凭据的状态下起来。
 	fmt.Fprintf(&b, "EnvironmentFile=-%s\n", domain.EnvFilePath(spec.Application))
 	fmt.Fprintf(&b, "EnvironmentFile=%s\n", domain.SecretsEnvFilePath(spec.Application))
-	fmt.Fprintf(&b, "ExecStart=%s\n", EscapeArgs(spec.Exec.Argv))
+	fmt.Fprintf(&b, "ExecStart=%s\n", EscapeArgs(resolvedArgv))
 	fmt.Fprintf(&b, "Restart=%s\n", spec.Systemd.RestartPolicy)
 	fmt.Fprintf(&b, "RestartSec=%d\n", int(RestartSec/time.Second))
 	fmt.Fprintf(&b, "TimeoutStartSec=%d\n", startSeconds)
@@ -193,6 +208,7 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 		Tier:           tier,
 		SystemdVersion: systemdVersion,
 		Degradations:   tier.Degradations(),
+		Argv:           resolvedArgv,
 	}, nil
 }
 

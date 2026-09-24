@@ -41,7 +41,7 @@ func TestProcAdapterContract(t *testing.T) {
 					Application: name,
 					Runtime:     domain.RuntimeKindGo,
 					Artifact: domain.SpecArtifact{
-						Digest: "sha256:" + name,
+						Digest: contractDigest(name),
 					},
 					Exec: domain.SpecExec{
 						Argv:             []string{"/bin/sleep", "300"},
@@ -92,7 +92,7 @@ func TestPrepareWritesSandboxedFilesWithExpectedModes(t *testing.T) {
 	spec := &domain.ApplicationSpec{
 		Application: "modes",
 		Runtime:     domain.RuntimeKindGo,
-		Artifact:    domain.SpecArtifact{Digest: "sha256:x"},
+		Artifact:    domain.SpecArtifact{Digest: contractDigest("x")},
 		Exec: domain.SpecExec{
 			Argv:             []string{"/bin/sleep", "1"},
 			WorkingDirectory: "/var/lib/modes",
@@ -194,7 +194,7 @@ func TestPrepareRejectsMultilineEnvSecret(t *testing.T) {
 	spec := &domain.ApplicationSpec{
 		Application: "multiline",
 		Runtime:     domain.RuntimeKindGo,
-		Artifact:    domain.SpecArtifact{Digest: "sha256:x"},
+		Artifact:    domain.SpecArtifact{Digest: contractDigest("x")},
 		Exec: domain.SpecExec{
 			Argv:             []string{"/bin/sleep", "1"},
 			WorkingDirectory: "/var/lib/multiline",
@@ -213,4 +213,27 @@ func TestPrepareRejectsMultilineEnvSecret(t *testing.T) {
 	if domain.CodeOf(err) != v1.CodeSecretUnresolved {
 		t.Fatalf("want SECRET_UNRESOLVED, got %v", err)
 	}
+}
+
+// contractDigest 把任意名字映射成一个**合法**的 sha256 摘要。
+//
+// 摘要从迭代 3 起是严格校验的（前缀对、长度不对的写法在提交期就被拒），因此夹具不能再
+// 用 "sha256:x" 这种"看起来像摘要"的字符串。这里用十六进制的名字填充到 64 位：同一名字
+// 永远得到同一个摘要，不同名字几乎不可能相同。
+func contractDigest(name string) string {
+	var b strings.Builder
+	for i := 0; i < 64; i++ {
+		b.WriteByte(hexDigits[hashByte(name, i)%16])
+	}
+	return "sha256:" + b.String()
+}
+
+const hexDigits = "0123456789abcdef"
+
+func hashByte(name string, index int) int {
+	sum := index + 7
+	for i := 0; i < len(name); i++ {
+		sum = (sum*31 + int(name[i])) % 251
+	}
+	return sum
 }

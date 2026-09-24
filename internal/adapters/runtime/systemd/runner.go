@@ -5,11 +5,6 @@ import (
 	"context"
 	"errors"
 	"os/exec"
-	"os/user"
-	"strconv"
-
-	v1 "github.com/freezeChen/frz-tools/api/v1"
-	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
 // Result 是一条外部命令的结果。退出码单独返回、不压进 error，是因为 systemctl
@@ -53,27 +48,4 @@ func CommandRunner(ctx context.Context, argv []string) (Result, error) {
 	// 命令没跑起来：退出码标成 -1，避免调用方把它当成一次「正常退出」。
 	result.ExitCode = -1
 	return result, err
-}
-
-// OwnerResolver 把 runUser 解析成 uid/gid。
-//
-// 做成可注入的，是因为测试进程通常不是 root，无法把文件 chown 给别的用户；
-// 测试注入当前进程的 uid/gid，从而仍能断言「chown 真的被调用过、模式真的落实了」。
-type OwnerResolver func(name string) (uid, gid int, err error)
-
-// OSUserOwner 是生产实现：查系统用户数据库——useradd 写进去的就是同一份数据。
-func OSUserOwner(name string) (int, int, error) {
-	account, err := user.Lookup(name)
-	if err != nil {
-		return 0, 0, domain.NewError(v1.CodeInternal, "解析用户 %q 失败: %v", name, err)
-	}
-	uid, err := strconv.Atoi(account.Uid)
-	if err != nil {
-		return 0, 0, domain.NewError(v1.CodeInternal, "用户 %q 的 uid 不是数字: %q", name, account.Uid)
-	}
-	gid, err := strconv.Atoi(account.Gid)
-	if err != nil {
-		return 0, 0, domain.NewError(v1.CodeInternal, "用户 %q 的 gid 不是数字: %q", name, account.Gid)
-	}
-	return uid, gid, nil
 }

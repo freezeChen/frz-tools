@@ -6,6 +6,7 @@ import (
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/runtime/unitfile"
 	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
@@ -103,7 +104,7 @@ kind: ApplicationSpec
 application: minimal
 runtime: java
 artifact:
-  digest: sha256:abc
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000001
 exec:
   argv: [/opt/minimal/bin/run]
   workingDirectory: /var/lib/minimal
@@ -134,6 +135,21 @@ logs:
 	}
 	if spec.Health.Readiness.ConsecutiveSuccesses != 1 {
 		t.Fatalf("consecutiveSuccesses 默认应为 1，got %d", spec.Health.Readiness.ConsecutiveSuccesses)
+	}
+}
+
+// 相对 argv 是迭代 3 新增的用法（规格 D4）：解析到 release 的 current 之下。
+// 它**不是**非法形态——把 1c 起就允许的绝对 argv 收紧成唯一形态属于破坏性变更。
+func TestParseAcceptsRelativeArgv(t *testing.T) {
+	manifest := strings.Replace(validManifest,
+		"  argv: [/opt/billing-api/bin/billing-api]",
+		"  argv: [bin/billing-api, --config, /etc/billing/config.yaml]", 1)
+	spec, err := parse(t, manifest)
+	if err != nil {
+		t.Fatalf("相对 argv 应当被接受: %v", err)
+	}
+	if spec.Exec.Argv[0] != "bin/billing-api" {
+		t.Fatalf("argv 应当原样保留（解析发生在渲染 unit 时）: %v", spec.Exec.Argv)
 	}
 }
 
@@ -169,7 +185,10 @@ func TestParseRejectsInvalidManifest(t *testing.T) {
 			return strings.Replace(s, "runtime: go", "runtime: rust", 1)
 		}},
 		{"artifact 同时给 id 与 digest", func(s string) string {
-			return strings.Replace(s, "  id: art_XXXX", "  id: art_XXXX\n  digest: sha256:abc", 1)
+			// 用**合法**摘要，好让这条用例只钉「id 与 digest 不能同时给」这一件事；
+			// 摘要格式本身由另一条用例覆盖。
+			return strings.Replace(s, "  id: art_XXXX",
+				"  id: art_XXXX\n  digest: sha256:"+strings.Repeat("a", 64), 1)
 		}},
 		{"artifact 两者都不给", func(s string) string {
 			return strings.Replace(s, "  id: art_XXXX\n", "", 1)
@@ -189,8 +208,10 @@ func TestParseRejectsInvalidManifest(t *testing.T) {
 		{"argv 为空", func(s string) string {
 			return strings.Replace(s, "  argv: [/opt/billing-api/bin/billing-api]", "  argv: []", 1)
 		}},
-		{"argv[0] 是相对路径", func(s string) string {
-			return strings.Replace(s, "/opt/billing-api/bin/billing-api]", "bin/billing-api]", 1)
+		// 相对 argv 现在**合法**了（迭代 3 规格 D4：相对路径解析到 release 的 current
+		// 之下），但相对元素里出现 .. 就是逃出 release 目录的直接手段——那一条必须被拒。
+		{"argv 的相对元素含 ..", func(s string) string {
+			return strings.Replace(s, "/opt/billing-api/bin/billing-api]", "bin/../../etc/shadow]", 1)
 		}},
 		{"workingDirectory 是相对路径", func(s string) string {
 			return strings.Replace(s, "  workingDirectory: /var/lib/billing-api", "  workingDirectory: var/lib/x", 1)
@@ -340,5 +361,130 @@ func TestLayoutPaths(t *testing.T) {
 		if got != want {
 			t.Fatalf("want %q, got %q", want, got)
 		}
+	}
+}
+
+// 迭代 3 新增的字段：artifact.version / fileName、resources、release。
+//
+// 这条用例的意义在于**钉住 wire 名字**：YAML 里的键名一旦写错，严格解码会拒绝它
+// （那是好事），但如果我们自己在文档里写错了名字，用户就会照着错的写。
+func TestParseIteration3Fields(t *testing.T) {
+	text := `apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: orders-api
+runtime: java
+artifact:
+  id: art_1
+  version: 1.4.2-rc1
+  unpack:
+    strategy: tar-gz
+    stripComponents: 1
+exec:
+  argv: [/opt/jdk-17.0.1/bin/java, -Xmx512m, -jar, app.jar]
+  workingDirectory: /var/lib/orders-api
+  runUser: orders-api
+health:
+  readiness:
+    type: tcp
+    target: "127.0.0.1:8080"
+logs:
+  directory: /var/log/orders-api
+resources:
+  cpuQuotaPercent: 250
+  memoryMaxBytes: 1073741824
+release:
+  keepLast: 7
+`
+	spec := mustParse(t, text)
+
+	if spec.Artifact.Version != "1.4.2-rc1" {
+		t.Fatalf("artifact.version 没解析出来: %q", spec.Artifact.Version)
+	}
+	if spec.Resources.CPUQuotaPercent != 250 {
+		t.Fatalf("resources.cpuQuotaPercent 没解析出来: %d", spec.Resources.CPUQuotaPercent)
+	}
+	if spec.Resources.MemoryMaxBytes != 1073741824 {
+		t.Fatalf("resources.memoryMaxBytes 没解析出来: %d", spec.Resources.MemoryMaxBytes)
+	}
+	if spec.Release.KeepLast != 7 {
+		t.Fatalf("release.keepLast 没解析出来: %d", spec.Release.KeepLast)
+	}
+	if got := spec.Artifact.VersionOrDerived(); got != "1.4.2-rc1" {
+		t.Fatalf("写了版本号就该用它，got %q", got)
+	}
+}
+
+// artifact.fileName 的相容性：它**可选**（缺省取相对的 argv[0]）。
+//
+// 把它判成必填会破坏 1c 起就合法的 manifest——`unpack` 省略时策略默认就是 none，
+// 于是所有既有 manifest 都会提交不了。
+func TestParseAllowsMissingFileNameForSingleFile(t *testing.T) {
+	// 把 unpack 整段去掉：策略默认 none，argv[0] 又是绝对路径——这就是 1c 的形态，
+	// 表示「跑一个住在发布目录之外的既有程序」，物化没有意义。
+	withoutUnpack := strings.Replace(validManifest,
+		"  unpack:\n    strategy: tar\n    stripComponents: 1\n", "", 1)
+	spec, err := parse(t, withoutUnpack)
+	if err != nil {
+		t.Fatalf("1c 形态的 manifest 必须仍然合法: %v", err)
+	}
+	if spec.Materializes() {
+		t.Fatal("argv[0] 是绝对路径且没给 fileName 时，不该声称需要物化")
+	}
+
+	relative := strings.Replace(withoutUnpack,
+		"  argv: [/opt/billing-api/bin/billing-api]", "  argv: [bin/billing-api]", 1)
+	spec, err = parse(t, relative)
+	if err != nil {
+		t.Fatalf("相对 argv[0] 的 manifest 必须合法: %v", err)
+	}
+	if got := spec.MaterializedFileName(); got != "bin/billing-api" {
+		t.Fatalf("缺省应当取相对的 argv[0]，got %q", got)
+	}
+	if !spec.Materializes() {
+		t.Fatal("有落点时应当声称需要物化")
+	}
+}
+
+func TestParseRejectsMismatchedFileName(t *testing.T) {
+	tarWithName := strings.Replace(validManifest,
+		"    strategy: tar\n", "    fileName: server\n    strategy: tar\n", 1)
+	if _, err := parse(t, tarWithName); err == nil {
+		t.Fatal("归档制品给了 fileName 必须被拒（它不会生效）")
+	}
+
+	singleFile := strings.Replace(validManifest,
+		"  unpack:\n    strategy: tar\n    stripComponents: 1\n",
+		"  unpack:\n    strategy: none\n  fileName: bin/server\n", 1)
+	spec, err := parse(t, singleFile)
+	if err != nil {
+		t.Fatalf("strategy=none + fileName 应当被接受: %v", err)
+	}
+	if spec.Artifact.FileName != "bin/server" {
+		t.Fatalf("fileName 没解析出来: %q", spec.Artifact.FileName)
+	}
+}
+
+// 相对 argv[0] 必须被解析成 current 之下的路径——**解析发生在渲染 unit 时**，
+// 因此这里断言的是渲染结果，而不是 spec（spec 里保留用户写的样子）。
+func TestRenderUnitResolvesRelativeArgv(t *testing.T) {
+	text := strings.Replace(validManifest,
+		"  argv: [/opt/billing-api/bin/billing-api]",
+		"  argv: [bin/billing-api, --config, /etc/billing-api/config.yaml]", 1)
+	spec := mustParse(t, text)
+
+	rendered, err := unitfile.RenderUnit(spec, unitfile.TierStrict, 255)
+	if err != nil {
+		t.Fatalf("RenderUnit: %v", err)
+	}
+	want := domain.CurrentReleaseDir(spec.Application) + "/bin/billing-api"
+	if !strings.Contains(rendered.Content, "ExecStart="+want+" --config /etc/billing-api/config.yaml") {
+		t.Fatalf("ExecStart 里应当出现解析后的路径 %q：\n%s", want, rendered.Content)
+	}
+	if len(rendered.Argv) == 0 || rendered.Argv[0] != want {
+		t.Fatalf("渲染结果应当带回解析后的 argv: %v", rendered.Argv)
+	}
+	// 绝对参数一个字节都不能动。
+	if rendered.Argv[2] != "/etc/billing-api/config.yaml" {
+		t.Fatalf("绝对参数被改了: %v", rendered.Argv)
 	}
 }

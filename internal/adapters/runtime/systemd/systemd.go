@@ -37,6 +37,7 @@ import (
 	"github.com/freezeChen/frz-tools/internal/adapters/runtime/unitfile"
 	"github.com/freezeChen/frz-tools/internal/application"
 	"github.com/freezeChen/frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/sysuser"
 )
 
 const (
@@ -87,7 +88,7 @@ func WithGOOS(goos string) Option {
 }
 
 // WithOwnerResolver 替换属主解析。
-func WithOwnerResolver(resolver OwnerResolver) Option {
+func WithOwnerResolver(resolver sysuser.Resolver) Option {
 	return func(a *Adapter) { a.owner = resolver }
 }
 
@@ -123,7 +124,7 @@ type Adapter struct {
 	root     string
 	runner   Runner
 	resolver application.SecretResolver
-	owner    OwnerResolver
+	owner    sysuser.Resolver
 	goos     string
 	now      func() time.Time
 	probe    time.Duration
@@ -147,7 +148,7 @@ func New(root string, resolver application.SecretResolver, opts ...Option) *Adap
 		root:        root,
 		runner:      CommandRunner,
 		resolver:    resolver,
-		owner:       OSUserOwner,
+		owner:       sysuser.OSLookup,
 		goos:        runtime.GOOS,
 		now:         func() time.Time { return time.Now().UTC() },
 		probe:       readiness.DefaultTimeout,

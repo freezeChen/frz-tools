@@ -60,6 +60,9 @@ var (
 	applicationNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	runUserPattern         = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 	unitNamePattern        = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
+	// versionPattern 描述**版本标签**：允许 semver（1.2.3-rc1+build.5），不允许斜杠
+	// ——它是标签不是路径，而带斜杠的版本号进日志与回滚引用都没有意义。
+	versionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
 )
 
 type ApplicationSpec struct {
@@ -72,12 +75,76 @@ type ApplicationSpec struct {
 	Health      SpecHealth
 	Logs        SpecLogs
 	Systemd     SpecSystemd
+	Resources   SpecResources
+	Release     SpecRelease
 }
+
+// SpecResources 是资源限制。字段是**运行时的意图**而不是 systemd 指令：翻译成
+// CPUQuota= / MemoryMax= 是适配器的事（同一套意图将来要能落到别的运行时上）。
+type SpecResources struct {
+	// CPUQuotaPercent 是 CPU 配额，按百分比（100 = 一个核）。0 表示不限制。
+	CPUQuotaPercent int
+	// MemoryMaxBytes 是内存上限。0 表示不限制。
+	MemoryMaxBytes int64
+}
+
+// SpecRelease 是发布策略。
+type SpecRelease struct {
+	// KeepLast 是保留最近多少个 release 目录（0 = 不自动清理）。
+	KeepLast int
+}
+
+// 资源限制与发布保留的边界。放在这里而不是各调用点，是因为「多大算不合理」只有一处判断。
+const (
+	MaxCPUQuotaPercent = 10000
+	MinMemoryMaxBytes  = 16 << 20
+	MaxMemoryMaxBytes  = 1 << 40
+	DefaultKeepLast    = 5
+	MaxKeepReleases    = 100
+)
 
 type SpecArtifact struct {
 	ID     string
 	Digest string
-	Unpack SpecUnpack
+	// Version 是**人类可读的版本号**，成为 Release.Version 的来源。可选：省略时由制品
+	// digest 派生（见 DeriveVersion），因此本字段是在同一 apiVersion 内**新增的可选
+	// 字段**（兼容）。把它做成必填会改变必填性，那要提升 apiVersion——而派生值同样唯一，
+	// 不值得为它付一次破坏性变更。
+	Version string
+	// FileName 是 **unpack.strategy=none 时**制品字节在 release 目录里的文件名。
+	//
+	// 为什么需要它：单文件制品（Go 二进制、单个 JAR）没有归档自带的名字，而「叫什么」
+	// 决定了 argv 里怎么写它。用 `argv[0]` 去猜文件名看着省事，但 Java 的 `argv[0]` 是
+	// 解释器（绝对路径），猜不出 jar 该叫什么——而「单个 JAR」正是路线图点名要支持的形态。
+	FileName string
+	Unpack   SpecUnpack
+}
+
+// DeriveVersion 在 manifest 没写 artifact.version 时给出一个稳定的版本号。
+//
+// 用 digest 的前 12 位：同一个制品永远得到同一个版本号（这正是「版本号不可复用」想要
+// 的性质），而不同制品几乎不可能撞上前 12 位十六进制（48 bit）。
+func DeriveVersion(artifact SpecArtifact) string {
+	source := artifact.Digest
+	if source == "" {
+		source = artifact.ID
+	}
+	source = strings.TrimPrefix(source, "sha256:")
+	if len(source) > 12 {
+		source = source[:12]
+	}
+	if source == "" {
+		return "unversioned"
+	}
+	return "sha256-" + source
+}
+
+// VersionOrDerived 返回 manifest 声明的版本号，没写时用派生值。
+func (a SpecArtifact) VersionOrDerived() string {
+	if strings.TrimSpace(a.Version) != "" {
+		return a.Version
+	}
+	return DeriveVersion(a)
 }
 
 type SpecUnpack struct {
@@ -152,6 +219,12 @@ func (s *ApplicationSpec) Validate() error {
 	if err := s.Systemd.validate(); err != nil {
 		return err
 	}
+	if err := s.Resources.validate(); err != nil {
+		return err
+	}
+	if err := s.Release.validate(); err != nil {
+		return err
+	}
 
 	s.applyDefaults()
 	return nil
@@ -163,8 +236,26 @@ func (a *SpecArtifact) validate() error {
 	if hasID == hasDigest {
 		return NewError(v1.CodeManifestInvalid, "artifact 必须且只能提供 id 或 digest 之一")
 	}
-	if hasDigest && !strings.HasPrefix(a.Digest, "sha256:") {
-		return NewError(v1.CodeManifestInvalid, "artifact.digest 只支持 sha256: 前缀（got %q）", a.Digest)
+	if hasDigest {
+		// 声明了摘要就要是**合法**的摘要：前缀对、长度不对的写法今天能过校验、
+		// 到部署时才以「找不到制品」失败，那是个把人带偏的报错。
+		if _, err := ParseDigest(a.Digest); err != nil {
+			return NewError(v1.CodeManifestInvalid, "artifact.digest 不是合法的摘要（got %q）", a.Digest)
+		}
+	}
+	if a.FileName != "" && a.Unpack.Strategy != UnpackNone {
+		return NewError(v1.CodeManifestInvalid,
+			"artifact.fileName 只用于 unpack.strategy=none（归档自带条目名，写了它不会生效）")
+	}
+	if err := validateArtifactFileName(a.FileName); err != nil {
+		return err
+	}
+	if a.Version != "" {
+		// 版本号会进日志、审计与回滚引用；它**不是路径**，因此不允许斜杠。
+		if !versionPattern.MatchString(a.Version) {
+			return NewError(v1.CodeManifestInvalid,
+				"artifact.version 只允许字母、数字、点、下划线、加号与连字符，且必须以字母或数字开头（got %q）", a.Version)
+		}
 	}
 
 	switch a.Unpack.Strategy {
@@ -184,6 +275,40 @@ func (a *SpecArtifact) validate() error {
 	return nil
 }
 
+// validate 只判「这个值是不是一个合理的限制」。0 一律表示不限制，因此不在这里翻译成
+// 运行时的指令——那是适配器的事（同一套意图将来要能落到别的运行时上）。
+func (r *SpecResources) validate() error {
+	if r.CPUQuotaPercent < 0 || r.CPUQuotaPercent > MaxCPUQuotaPercent {
+		return NewError(v1.CodeManifestInvalid,
+			"resources.cpuQuotaPercent 取值范围是 0（不限制）到 %d（got %d）", MaxCPUQuotaPercent, r.CPUQuotaPercent)
+	}
+	if r.MemoryMaxBytes == 0 {
+		return nil
+	}
+	if r.MemoryMaxBytes < MinMemoryMaxBytes || r.MemoryMaxBytes > MaxMemoryMaxBytes {
+		// 比 16 MiB 还小的上限只会让进程一起来就被 OOM 杀掉，那是配置写错而不是意图。
+		return NewError(v1.CodeManifestInvalid,
+			"resources.memoryMaxBytes 要么是 0（不限制），要么不小于 %d 且不大于 %d（got %d）",
+			MinMemoryMaxBytes, MaxMemoryMaxBytes, r.MemoryMaxBytes)
+	}
+	return nil
+}
+
+// validate 不接受 0（不清理）：制品永远在制品库里、重新解包即可，因此「永不清理 release
+// 目录」没有真实价值，只会把盘慢慢占满。少一个取值，也少一处「没写 vs 显式写了 0」的歧义。
+func (r *SpecRelease) validate() error {
+	// 默认值在这里补，与 SpecUnpack 补默认 strategy 同一个位置与理由：校验发生在
+	// applyDefaults 之前，而「没写」必须走默认值、不能走报错。
+	if r.KeepLast == 0 {
+		r.KeepLast = DefaultKeepLast
+	}
+	if r.KeepLast < 1 || r.KeepLast > MaxKeepReleases {
+		return NewError(v1.CodeManifestInvalid,
+			"release.keepLast 取值范围是 1 到 %d（got %d）", MaxKeepReleases, r.KeepLast)
+	}
+	return nil
+}
+
 func (e *SpecExec) validate() error {
 	if len(e.Argv) == 0 {
 		return NewError(v1.CodeManifestInvalid, "exec.argv 不能为空")
@@ -193,8 +318,21 @@ func (e *SpecExec) validate() error {
 			return NewError(v1.CodeManifestInvalid, "exec.argv[%d] 不能为空字符串", i)
 		}
 	}
-	if !path.IsAbs(e.Argv[0]) {
-		return NewError(v1.CodeManifestInvalid, "exec.argv[0] 必须是绝对路径（got %q）", e.Argv[0])
+	// argv 的元素遵循同一条解析规则（规格 D4）：**绝对路径原样、相对路径相对
+	// release 的 current 目录**。
+	//
+	// 这里刻意**不**按 runtime 强制 argv[0] 的形态（「go 必须相对、java 必须绝对」是
+	// 规格里原本的写法）：把 1c 起就被允许的「绝对 argv[0]」收紧成非法，属于**改变
+	// 必填性/形态**的破坏性变更，要提升 apiVersion——而为一条风格约束付这个代价不值。
+	// 「编译产物住在 release 里」作为**推荐用法**写在文档里，不在这里拦。
+	// 只有 argv[0] 会被解析成路径（见 ResolveArgv），因此 `..` 规则也只对它生效：
+	// 它是**逃出 release 目录**的直接手段，而它会变成 ExecStart=。
+	// 其余元素一个字节都不动（它们可能是参数，见 ResolveArgv 的注释），因此不去管。
+	for _, segment := range strings.Split(e.Argv[0], "/") {
+		if segment == ".." {
+			return NewError(v1.CodeManifestInvalid,
+				"exec.argv[0] 不得包含 ..（got %q）", e.Argv[0])
+		}
 	}
 	if !runUserPattern.MatchString(e.RunUser) {
 		return NewError(v1.CodeManifestInvalid,
@@ -404,6 +542,54 @@ func ReleaseDir(application, releaseID string) string {
 	return path.Join("/opt/opsd/apps", application, "releases", releaseID)
 }
 
+// ReleaseRootDir 返回制品解包目录的父目录（`/opt/opsd/apps/<application>/releases`）。
+//
+// 它是 release 目录与 current 指针的共同父目录，因此 **domain 是它唯一的定义处**：
+// unit 渲染要把它写进 ReadWritePaths、runtime 适配器要建它、release 适配器要在它下面
+// 解包、argv 解析要拼到 current 之下——四处各拼一次就等于把「约定」变成四个可能漂移的
+// 实现。（1c 时它临时住在 runtime/unitfile 里，迭代 3 因为用的人多了才归位。）
+func ReleaseRootDir(application string) string {
+	const releaseIDPlaceholder = "unreleased"
+	return path.Dir(ReleaseDir(application, releaseIDPlaceholder))
+}
+
+// CurrentReleaseDir 是 current 指针的位置：一个指向当前激活 release 的符号链接
+// （迭代 3 规格 D3）。
+func CurrentReleaseDir(application string) string {
+	return path.Join(ReleaseRootDir(application), "current")
+}
+
+// ResolveArgv 把 manifest 里的 argv 解析成最终要执行的 argv（迭代 3 规格 D4）。
+//
+// **只解析 argv[0]**：绝对路径原样，相对路径拼到 release 的 current 之下。
+// 其余元素**一个字节都不动**。
+//
+// 为什么只动 argv[0]（这是实现时对规格的修正，原写法是「每个元素都按同一条规则解析」）：
+// 除了 argv[0]，没有任何办法判断一个参数**是不是路径**。`-Xmx512m`、`-Dlogging.file=/var/log/app.log`
+// 看起来都像相对路径（后者还含斜杠），一旦被拼成 `<current>/-Xmx512m`，进程收到的是一个
+// 被**静默改写**的参数——不是报错，是行为变了。而 argv[0] 非解析不可：systemd 要求它是
+// 绝对路径（219 那一档尤其如此），而「相对路径」正是「制品里的那个可执行文件」的表达。
+//
+// 其余元素里若有相对路径（例如 `java -jar app.jar`），由**进程按自己的 workingDirectory**
+// 解释——那是它本来的语义，我们不该抢。
+func ResolveArgv(application string, argv []string) ([]string, error) {
+	resolved := append([]string(nil), argv...)
+	if len(resolved) == 0 || path.IsAbs(resolved[0]) {
+		return resolved, nil
+	}
+
+	base := CurrentReleaseDir(application)
+	joined := path.Join(base, resolved[0])
+	if joined != base && !strings.HasPrefix(joined, base+"/") {
+		// 相对元素里的 .. 在 SpecExec.validate 里已经被拒（那道防线更早），
+		// 这里再确认一次解析结果仍落在 current 之下：**只有这里的检查真的在拼路径**。
+		return nil, NewError(v1.CodeManifestInvalid,
+			"exec.argv[0] 解析后逃出了 release 目录（%q → %q）", resolved[0], joined)
+	}
+	resolved[0] = joined
+	return resolved, nil
+}
+
 func UnitPath(unitName string) string {
 	return path.Join("/etc/systemd/system", unitName)
 }
@@ -415,4 +601,68 @@ func SecretFileVarValue(application, name string) string {
 
 func (s *ApplicationSpec) String() string {
 	return fmt.Sprintf("ApplicationSpec(%s/%s)", s.Application, s.Systemd.UnitName)
+}
+
+// validateArtifactFileName 校验单文件制品的落点名字（空串表示没写，直接通过）。
+//
+// 它是**安全边界**：这个名字会被拼进 release 目录，因此必须是干净的相对路径。
+// 与备份适配器拒绝路径穿越是同一条理由，只是方向相反——那边是往归档里放，这边是从
+// 归档里取出来放。
+func validateArtifactFileName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if path.IsAbs(name) || strings.HasPrefix(name, "/") {
+		return NewError(v1.CodeManifestInvalid, "artifact.fileName 必须是相对路径（got %q）", name)
+	}
+	cleaned := path.Clean(name)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return NewError(v1.CodeManifestInvalid, "artifact.fileName 不得逃出 release 目录（got %q）", name)
+	}
+	if cleaned != name {
+		// 归一化之后与原文不同，说明写了 `a/./b` 或 `a//b` 这类写法；它们在不同工具里
+		// 可能得到不同结果，不如要求写干净的那一种。
+		return NewError(v1.CodeManifestInvalid,
+			"artifact.fileName 必须是已经归一化的路径（got %q，应为 %q）", name, cleaned)
+	}
+	return nil
+}
+
+// MaterializedFileName 返回 strategy=none 时制品字节在 release 目录里的落点；
+// 返回空串表示**这份 manifest 不需要物化任何东西**。
+//
+// 三条规则，都是为了让「迭代 3 的物化」与「1c 时代的手工部署」共存：
+//
+//  1. 显式写了 artifact.fileName → 用它（单个 JAR 就是这种情况：argv[0] 是解释器，
+//     猜不出 jar 该叫什么）；
+//  2. 没写、而 argv[0] 是**相对路径** → 用 argv[0]（Go 的典型形态：制品就是那个二进制，
+//     名字与 argv[0] 本来就是同一个）；
+//  3. 都没写、argv[0] 又是**绝对路径** → 空串：这份 manifest 声明的是「跑一个住在别处的
+//     程序」（1c 时期唯一的形态），物化没有意义，release 目录会是空的。
+//
+// 第 3 条是**兼容性**要求，不是设计偏好：把它判成非法会让 1c 起就合法的 manifest 全部
+// 提交不了，而那是破坏性变更。
+func (s *ApplicationSpec) MaterializedFileName() string {
+	if s.Artifact.Unpack.Strategy != UnpackNone {
+		return ""
+	}
+	if s.Artifact.FileName != "" {
+		return s.Artifact.FileName
+	}
+	if len(s.Exec.Argv) > 0 && !path.IsAbs(s.Exec.Argv[0]) {
+		return s.Exec.Argv[0]
+	}
+	return ""
+}
+
+// Materializes 报告这份 manifest 是否要求把制品解出内容来。
+//
+// 部署流程用它在「没有东西可物化」时跳过物化与切换：那种 manifest 的 argv[0] 指向的是
+// 发布目录之外的既有程序（1c 的形态），给它建一个空 release 目录、再把 current 指过去，
+// 只会让「现在跑的是哪个版本」这句话变成假的。
+func (s *ApplicationSpec) Materializes() bool {
+	if s.Artifact.Unpack.Strategy != UnpackNone {
+		return true
+	}
+	return s.MaterializedFileName() != ""
 }

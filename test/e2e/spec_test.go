@@ -149,7 +149,8 @@ func TestSpecPutRejectsInvalidManifestThroughCLI(t *testing.T) {
 	}
 	dir := t.TempDir()
 
-	// argv[0] 是相对路径：MANIFEST_INVALID → 退出码 17。
+	// 相对 argv[0] 用 .. 逃出 release 目录：MANIFEST_INVALID → 退出码 17。
+	// （相对 argv 本身是合法的（迭代 3 规格 D4），逃出才是错误。）
 	invalid := `apiVersion: ops.frz.io/v1alpha1
 kind: ApplicationSpec
 application: billing-api
@@ -157,7 +158,7 @@ runtime: go
 artifact:
   id: art_whatever
 exec:
-  argv: [bin/billing-api]
+  argv: [bin/../../etc/shadow]
   workingDirectory: /var/lib/billing-api
   runUser: billing-api
 logs:

@@ -67,7 +67,7 @@ func (a *Adapter) ensureDirectories(spec *domain.ApplicationSpec, owner ownershi
 		{spec.Logs.Directory, appDirMode},
 		// 解包目录用 domain.ReleaseDir 的约定路径的父目录（releases 根），
 		// 与 unit 的 ReadWritePaths 保持一致；release 目录本身属迭代 3。
-		{unitfile.ReleaseRootDir(spec.Application), appDirMode},
+		{domain.ReleaseRootDir(spec.Application), appDirMode},
 		{domain.SecretsDir(spec.Application), secretDirMode},
 	} {
 		if err := a.ensureDirectory(dir.path, dir.mode, owner); err != nil {

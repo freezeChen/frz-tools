@@ -18,6 +18,7 @@ import (
 	"github.com/freezeChen/frz-tools/internal/adapters/executor"
 	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
 	"github.com/freezeChen/frz-tools/internal/application"
+	"strings"
 )
 
 // newFullServer 装配一套完整的服务端：spec、host/env 与带真实本地存储的制品服务都在，
@@ -250,7 +251,10 @@ func TestPutSpecRejectsUnknownField(t *testing.T) {
 	assertEnvelopeCode(t, specBody, v1.CodeSpecNotFound)
 }
 
-func TestPutSpecRejectsRelativeArgv(t *testing.T) {
+// 相对 argv 从迭代 3 起是**合法**的（规格 D4：相对路径拼到 release 的 current 之下），
+// 因此这里拒绝的是「相对 argv[0] 用 .. 逃出 release」——那是路径穿越，而它会变成
+// ExecStart=。相对路径本身不该被拒：1c 起就允许绝对 argv，收紧成唯一形态属于破坏性变更。
+func TestPutSpecRejectsEscapingRelativeArgv(t *testing.T) {
 	server, _ := newFullServer(t)
 	createApplication(t, server, "billing-api")
 
@@ -261,7 +265,7 @@ runtime: go
 artifact:
   id: art_whatever
 exec:
-  argv: [bin/billing-api]
+  argv: [bin/../../etc/shadow]
   workingDirectory: /var/lib/billing-api
   runUser: billing-api
 logs:
@@ -273,9 +277,39 @@ health:
 `
 	response, body := putSpec(t, server, "billing-api", manifest)
 	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", response.StatusCode, string(body))
+		t.Fatalf("want 400, got %d: %s", response.StatusCode, body)
 	}
-	assertEnvelopeCode(t, body, v1.CodeManifestInvalid)
+	if !strings.Contains(string(body), string(v1.CodeManifestInvalid)) {
+		t.Fatalf("错误码应当是 MANIFEST_INVALID：%s", body)
+	}
+}
+
+// 相对 argv[0] 会被原样接受（解析发生在渲染 unit 时）。
+func TestPutSpecAcceptsRelativeArgv(t *testing.T) {
+	server, _ := newFullServer(t)
+	createApplication(t, server, "billing-api")
+
+	manifest := `apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: billing-api
+runtime: go
+artifact:
+  id: art_whatever
+exec:
+  argv: [bin/billing-api, --config, /etc/billing/config.yaml]
+  workingDirectory: /var/lib/billing-api
+  runUser: billing-api
+logs:
+  directory: /var/log/billing-api
+health:
+  readiness:
+    type: tcp
+    target: "127.0.0.1:8080"
+`
+	response, body := putSpec(t, server, "billing-api", manifest)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", response.StatusCode, body)
+	}
 }
 
 func TestPutSpecRequiresApplicationToExist(t *testing.T) {

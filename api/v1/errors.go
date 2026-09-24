@@ -53,6 +53,10 @@ const (
 	// 后者说「一条命令跑失败了」，前者说「这次恢复没成功」。运维要据此判断
 	// 「数据回来了没有」，混成一个码就等于把这个问题留给日志去翻。
 	CodeBackupRestoreFailed ErrorCode = "BACKUP_RESTORE_FAILED"
+	// CodeArtifactUnpackFailed 是**制品解不开**：不是 tar/zip、条目名逃出 release 目录、
+	// 落点已被符号链接占住……它与 MANIFEST_INVALID 刻意分开：manifest 没问题，是制品
+	// 本身与它声称的形态不符，而运维要做的事不同（重新上传制品，而不是改 manifest）。
+	CodeArtifactUnpackFailed ErrorCode = "ARTIFACT_UNPACK_FAILED"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -90,6 +94,7 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeBackupInUse:              409,
 	CodeBackupKeyUnresolved:      400,
 	CodeBackupRestoreFailed:      409,
+	CodeArtifactUnpackFailed:     409,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -141,6 +146,7 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeBackupInUse:              26,
 	CodeBackupKeyUnresolved:      27,
 	CodeBackupRestoreFailed:      28,
+	CodeArtifactUnpackFailed:     30,
 }
 
 func ExitCode(code ErrorCode) int {

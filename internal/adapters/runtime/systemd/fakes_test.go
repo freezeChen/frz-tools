@@ -192,7 +192,7 @@ func specFixture(t *testing.T, name string) *domain.ApplicationSpec {
 		Kind:        domain.ManifestKind,
 		Application: name,
 		Runtime:     domain.RuntimeKindGo,
-		Artifact:    domain.SpecArtifact{Digest: "sha256:" + name},
+		Artifact:    domain.SpecArtifact{Digest: fakeDigest(name)},
 		Exec: domain.SpecExec{
 			Argv:             []string{"/opt/opsd/apps/" + name + "/bin/run"},
 			WorkingDirectory: "/var/lib/" + name,
@@ -248,3 +248,17 @@ func formatCommands(commands [][]string) string {
 }
 
 var errBoom = errors.New("boom")
+
+// fakeDigest 把任意名字映射成一个**合法**的 sha256 摘要：摘要从迭代 3 起是严格校验的
+// （前缀对、长度不对的写法在提交期就被拒），夹具不能再拿"看起来像摘要"的字符串糊。
+func fakeDigest(name string) string {
+	var b strings.Builder
+	for i := 0; i < 64; i++ {
+		sum := i + 11
+		for j := 0; j < len(name); j++ {
+			sum = (sum*37 + int(name[j])) % 251
+		}
+		b.WriteByte("0123456789abcdef"[sum%16])
+	}
+	return "sha256:" + b.String()
+}
