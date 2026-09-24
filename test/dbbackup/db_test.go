@@ -322,9 +322,12 @@ func (f *fixture) fingerprint(t *testing.T, _ *domain.BackupPolicy) string {
 	if exists != "1" {
 		return "absent"
 	}
+	// 注意 `CONCAT` 而不是 `||`：MySQL/MariaDB 里 `||` 是**逻辑或**（PostgreSQL 里才是
+	// 字符串拼接），写成 `||` 会让这个指纹永远返回 1——往返用例就退化成「表里有至少
+	// 一行」，内容有没有真的恢复根本没被验证。这个坑是在真实主机上发现的。
 	return strings.TrimSpace(f.query(fmt.Sprintf(
-		`SELECT count(*) || '|' || coalesce(sum(id),0) || '|' ||`+
-			` coalesce(md5(group_concat(v ORDER BY id SEPARATOR ',')),'-') FROM %s`, probeTable)))
+		`SELECT CONCAT(count(*), '|', coalesce(sum(id),0), '|',`+
+			` coalesce(md5(group_concat(v ORDER BY id SEPARATOR ',')),'-')) FROM %s`, probeTable)))
 }
 
 func TestMain(m *testing.M) {
@@ -333,4 +336,46 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "dbbackup: 未设置任何 FRZ_TEST_*_DSN，整包跳过（见 test/linux/verify-db.sh）")
 	}
 	os.Exit(m.Run())
+}
+
+// 指纹必须真的对**内容**敏感。
+//
+// 这条元断言是为了防住我自己踩过的坑：MySQL/MariaDB 里 `||` 是逻辑或（不是拼接），
+// 按 PostgreSQL 的写法写出来的指纹**永远是 1**，于是「备份 → 破坏 → 恢复 → 内容一致」
+// 那条往返断言退化成「表里有至少一行」，而且会一路绿着通过。
+// 断言测不出东西比断言失败更危险——所以这里直接测「断言本身有没有分辨力」。
+func TestFingerprintIsContentSensitive(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		kind domain.BackupResourceKind
+	}{
+		{"postgres", postgresDSNEnv, domain.BackupResourcePostgres},
+		{"mysql", mysqlDSNEnv, domain.BackupResourceMySQL},
+		{"mariadb", mariadbDSNEnv, domain.BackupResourceMySQL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := requireDSN(t, tc.env)
+			client := newFixture(t, tc.kind, dsn)
+
+			populated := client.populate(t, nil)
+			if populated == "absent" || populated == "" {
+				t.Fatalf("造完内容之后指纹不该是 %q", populated)
+			}
+
+			// 只改一行的值：指纹必须变。
+			client.run("UPDATE frz_probe SET v = 'changed' WHERE id = 1")
+			if got := client.fingerprint(t, nil); got == populated {
+				t.Fatalf("指纹对内容不敏感：改了一行的值它仍然是 %q。"+
+					"这样的指纹会让往返用例空转（MySQL 里 `||` 是逻辑或就是这样一个坑）", got)
+			}
+
+			// 改回来：指纹必须回到原样（否则它连稳定性都不具备）。
+			client.run("UPDATE frz_probe SET v = 'alpha' WHERE id = 1")
+			if got := client.fingerprint(t, nil); got != populated {
+				t.Fatalf("指纹不稳定：改回原值后 want %q, got %q", populated, got)
+			}
+		})
+	}
 }

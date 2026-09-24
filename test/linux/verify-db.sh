@@ -194,8 +194,11 @@ run_engine() { # 名称 目录 DSN 环境变量 测试名
   # 与真正的原因（跑错了客户端）差得很远。
   # -buildvcs=false：PATH 里没有 git，而 Go 在仓库里构建时会去问 git 要版本信息。
   # 注意顺序：`env` 自己要用**当前**的 PATH 才找得到，因此先给变量、再改 PATH。
+  # 一并跑指纹的元断言：它证明的是「夹具的指纹对这个引擎真的有分辨力」，
+  # 少了它，整条往返断言可能是空转的（MySQL 里 `||` 是逻辑或就是这么骗过去的）。
   if env "${env}=${dsn}" PATH="${bin}" \
-    "$GO" test -count=1 -buildvcs=false ./test/dbbackup/ -run "${test_name}" -v >"$output" 2>&1; then
+    "$GO" test -count=1 -buildvcs=false ./test/dbbackup/ \
+    -run "${test_name}|TestFingerprintIsContentSensitive" -v >"$output" 2>&1; then
     status=0
   else
     status=1
