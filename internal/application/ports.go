@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"time"
 
@@ -45,6 +46,11 @@ type Repository interface {
 	ActivateRelease(ctx context.Context, id string, now time.Time) (int, error)
 	FailRelease(ctx context.Context, id, code, message string, now time.Time) error
 	MarkReleaseRemoved(ctx context.Context, id string, now time.Time) error
+	// GetReleaseByVersion 按 (应用, 版本) 查一次；没有时返回 (nil, nil)——「没有」是
+	// 部署的**正常路径**（新版本），不是错误。
+	GetReleaseByVersion(ctx context.Context, applicationID, version string) (*domain.Release, error)
+	// PreviousRelease 返回回滚的默认目标：最近一个曾经激活、且状态仍可回滚的版本。
+	PreviousRelease(ctx context.Context, applicationID string) (*domain.Release, error)
 	// ActiveRelease 返回当前激活的 release；没有时返回 (nil, nil)。
 	ActiveRelease(ctx context.Context, applicationID string) (*domain.Release, error)
 
@@ -221,6 +227,9 @@ type ReleaseAdapter interface {
 	Remove(ctx context.Context, spec *domain.ApplicationSpec, releaseID string) error
 	// List 列出磁盘上实际存在的 release 目录，供发现「库里有记录、盘上没目录」这类不一致。
 	List(ctx context.Context, spec *domain.ApplicationSpec) ([]string, error)
+	// Deactivate 撤掉 current 指针（幂等）。用于「第一次部署就失败」：那时没有可回退的
+	// 版本，只能把它停下来，而留下的 current 会指向一个马上要被删掉的目录。
+	Deactivate(ctx context.Context, spec *domain.ApplicationSpec) error
 }
 
 // RuntimePrepareReporter 让装配层把适配器独有的 Prepare 决策（systemd 的 unit 档位与
@@ -261,6 +270,13 @@ type backupOperationResolver interface {
 	// PrepareRestore 在**创建期**校验一次恢复请求（含原地恢复的显式确认）。
 	// 让它在排队之后才失败，等于让运维以为提交成功了。
 	PrepareRestore(ctx context.Context, backupID string, mode domain.RestoreMode, confirmed bool) (*RestoreTarget, error)
+}
+
+// deployOperationResolver 是 Service 与 DeployService 之间的内部接缝，与
+// runtime / backup 两个 resolver 同形：把 kind 与引用解析成规范化的 Operation 资源与
+// 要随操作存下的 spec（部署类操作存的是 releaseId，而不是"当前规格"）。
+type deployOperationResolver interface {
+	ResolveDeployOperation(ctx context.Context, kind, appRef string, spec json.RawMessage) (string, json.RawMessage, error)
 }
 
 type Defaults struct {

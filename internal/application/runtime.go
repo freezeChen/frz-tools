@@ -24,6 +24,9 @@ type Options struct {
 	// RuntimeAdapter 是运行时适配器（systemd / proc）。非 Linux 上装配层刻意不注入：
 	// runtime.* 于是给出 RUNTIME_UNSUPPORTED，而不是让一个假适配器在生产里假装能用。
 	RuntimeAdapter RuntimeAdapter
+	// ReleaseAdapter 是发布适配器（解包、切换、清理）。它同样可以缺席：缺席时部署类
+	// 操作给出 RUNTIME_UNSUPPORTED，而不是走到一半才发现解不开制品。
+	ReleaseAdapter ReleaseAdapter
 	// PrepareReporter 由装配层实现，把适配器私有的 Prepare 决策（unit 档位、systemd
 	// 版本）翻译成 Operation 的日志与审计字段。
 	PrepareReporter RuntimePrepareReporter
@@ -56,6 +59,7 @@ type Runtime struct {
 	Schedules *ScheduleService
 	Scheduler *Scheduler
 	Backups   *BackupService
+	Deploys   *DeployService
 	Pool      *Pool
 }
 
@@ -71,8 +75,18 @@ func NewRuntime(opts Options) *Runtime {
 
 	backups := newBackupService(opts.Repo, opts.BackupStore, opts.Secrets, opts.BackupAdapters, idGen, opts.Now, opts.Logger)
 
+	// 制品服务要早于 Service 建：部署服务需要它把制品字节交给解包适配器。
+	artifacts := newArtifactService(opts.Repo, opts.Store, opts.ArtifactPolicy, func() string {
+		return idGen("art")
+	}, opts.Logger)
+	if opts.Now != nil {
+		artifacts.now = opts.Now
+	}
+
+	deploys := newDeployService(opts.Repo, artifacts, opts.ReleaseAdapter, opts.RuntimeAdapter, idGen, opts.Now, opts.Logger)
+
 	cancels := newCancelRegistry()
-	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, backups, opts.Workers, opts.Logger, idGen)
+	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, backups, deploys, opts.Workers, opts.Logger, idGen)
 	if opts.Idle > 0 {
 		pool.idle = opts.Idle
 	}
@@ -83,20 +97,13 @@ func NewRuntime(opts Options) *Runtime {
 		pool.jitter = opts.Jitter
 	}
 
-	service := newService(opts.Repo, opts.Defaults, opts.AllowExecutable, cancels, runtimes, backups, func() string {
+	service := newService(opts.Repo, opts.Defaults, opts.AllowExecutable, cancels, runtimes, backups, deploys, func() string {
 		return idGen("op")
 	}, opts.Logger)
 	if opts.Now != nil {
 		service.now = opts.Now
 	}
 	service.notify = pool.Notify
-
-	artifacts := newArtifactService(opts.Repo, opts.Store, opts.ArtifactPolicy, func() string {
-		return idGen("art")
-	}, opts.Logger)
-	if opts.Now != nil {
-		artifacts.now = opts.Now
-	}
 
 	catalogs := newCatalogService(opts.Repo, idGen, opts.Now)
 	specs := newSpecService(opts.Repo, opts.Now)
@@ -116,6 +123,7 @@ func NewRuntime(opts Options) *Runtime {
 		Runtimes:  runtimes,
 		Schedules: schedules,
 		Backups:   backups,
+		Deploys:   deploys,
 		Scheduler: scheduler,
 		Pool:      pool,
 	}

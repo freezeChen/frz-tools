@@ -145,6 +145,12 @@ func releaseDTO(release *domain.Release) v1.Release {
 		Labels:        release.Labels,
 		CreatedAt:     release.CreatedAt,
 		CreatedBy:     release.CreatedBy,
+		Status:        string(release.Status),
+		Directory:     release.Directory,
+		ActivatedAt:   release.ActivatedAt,
+		FinishedAt:    release.FinishedAt,
+		ErrorCode:     release.ErrorCode,
+		ErrorMessage:  release.ErrorMessage,
 	}
 }
 

@@ -41,6 +41,14 @@ type Release struct {
 	Labels        map[string]string `json:"labels,omitempty"`
 	CreatedAt     time.Time         `json:"createdAt"`
 	CreatedBy     string            `json:"createdBy,omitempty"`
+
+	// 迭代 3 起，release 是一次**部署**而不只是一条登记记录。
+	Status       string     `json:"status"`
+	Directory    string     `json:"directory,omitempty"`
+	ActivatedAt  *time.Time `json:"activatedAt,omitempty"`
+	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
+	ErrorCode    string     `json:"errorCode,omitempty"`
+	ErrorMessage string     `json:"errorMessage,omitempty"`
 }
 
 type ReleaseResponse struct {

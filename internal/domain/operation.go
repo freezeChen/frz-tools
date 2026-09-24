@@ -20,8 +20,11 @@ const (
 	PhaseValidate = "validate"
 	// PhasePrepare 是运行时准备阶段：它只出现在 runtime.* 操作里，
 	// 用来把「建用户/目录/环境文件/unit」与「启停进程」在日志里分开。
-	PhasePrepare  = "prepare"
-	PhaseExecute  = "execute"
+	PhasePrepare = "prepare"
+	PhaseExecute = "execute"
+	// PhaseRollback 是**收尾性的回退**：部署失败时把上一个稳定版本放回去。
+	// 单独一个阶段是有意的：运维在日志里找「到底回滚了没有」时，不该去翻 free-form 的消息。
+	PhaseRollback = "rollback"
 	PhaseFinalize = "finalize"
 )
 

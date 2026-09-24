@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -17,7 +18,15 @@ func newAppCommand(opts *rootOptions) *cobra.Command {
 		Use:   "app",
 		Short: "管理应用",
 	}
-	cmd.AddCommand(newAppCreateCommand(opts), newAppListCommand(opts), newAppInspectCommand(opts))
+	cmd.AddCommand(
+		newAppCreateCommand(opts),
+		newAppListCommand(opts),
+		newAppInspectCommand(opts),
+		// 部署与回滚（迭代 3）：它们直接操作应用，不挂在 release 下面——release 是
+		// 「登记一条版本记录」，而部署是「把某个版本真正跑起来」。
+		newAppDeployCommand(opts),
+		newAppRollbackCommand(opts),
+	)
 	return cmd
 }
 
@@ -231,4 +240,101 @@ func printLabels(labels map[string]string) {
 	for key, value := range labels {
 		fmt.Printf("label:      %s=%s\n", key, value)
 	}
+}
+
+func newAppDeployCommand(opts *rootOptions) *cobra.Command {
+	flags := &actionFlags{}
+	var (
+		app  string
+		file string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "deploy --app <name> --file <manifest.yaml>",
+		Short: "部署一个版本：物化制品、准备运行时、切换并启动",
+		Long: "把 manifest 里声明的制品解成一个带版本的 release 目录，然后切换 current 指针、" +
+			"启动并等就绪。**健康通过才算部署成功**；任何一步失败都会把上一个稳定版本放回去，" +
+			"并以 DEPLOY_ROLLED_BACK（退出码 29）收场。\n\n" +
+			"同一版本重复部署是幂等的：它已经是当前版本时什么都不做。",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if app == "" || file == "" {
+				return domain.NewError(v1.CodeInvalidRequest, "必须给出 --app 与 --file")
+			}
+			raw, err := os.ReadFile(file)
+			if err != nil {
+				return domain.NewError(v1.CodeInvalidRequest, "无法读取 manifest %q：%v", file, err)
+			}
+			in, err := flags.input(cmd)
+			if err != nil {
+				return err
+			}
+			result, err := opts.client().DeployApplication(cmd.Context(), app, string(raw), in)
+			if err != nil {
+				return err
+			}
+			return reportDeploy(opts, result, "部署")
+		},
+	}
+
+	cmd.Flags().StringVar(&app, "app", "", "应用名称或 ID（必填）")
+	cmd.Flags().StringVar(&file, "file", "", "应用 manifest 文件路径（必填）")
+	flags.bind(cmd)
+	return cmd
+}
+
+func newAppRollbackCommand(opts *rootOptions) *cobra.Command {
+	flags := &actionFlags{}
+	var (
+		app string
+		to  string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "rollback --app <name> [--to <version>]",
+		Short: "回滚到上一个（或指定的）版本",
+		Long: "回滚**连配置一起回滚**：每个 release 都记着它当时那份 manifest，回滚时用的是它，\n" +
+			"不会出现「旧二进制配新配置」的混合体。不带 --to 时回到上一个曾经激活过的版本。",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if app == "" {
+				return domain.NewError(v1.CodeInvalidRequest, "必须给出 --app")
+			}
+			in, err := flags.input(cmd)
+			if err != nil {
+				return err
+			}
+			result, err := opts.client().RollbackApplication(cmd.Context(), app, to, in)
+			if err != nil {
+				return err
+			}
+			return reportDeploy(opts, result, "回滚")
+		},
+	}
+
+	cmd.Flags().StringVar(&app, "app", "", "应用名称或 ID（必填）")
+	cmd.Flags().StringVar(&to, "to", "", "回滚到哪个版本（省略则回到上一个曾经激活过的版本）")
+	flags.bind(cmd)
+	return cmd
+}
+
+// reportDeploy 打印部署/回滚的结果。
+//
+// 两种结果都要说清楚：**提交了但没有操作**（版本已经是当前版本）与**产生了操作**是两件事，
+// 而它们都不等于"已经成功"——部署的成败在 Operation 的终态上。
+func reportDeploy(opts *rootOptions, result *v1.DeployResponse, action string) error {
+	if opts.json {
+		return opts.printJSON(result)
+	}
+	if result.Noop {
+		fmt.Printf("无需%s：版本 %s 已经是当前版本（release %s）\n", action, result.Release.Version, result.Release.ID)
+		return nil
+	}
+	fmt.Printf("已提交%s：release %s（版本 %s）\n", action, result.Release.ID, result.Release.Version)
+	if result.Operation != nil {
+		printOperation(result.Operation)
+		fmt.Printf("\n查询进度：opsctl operation get %s\n查看日志：opsctl operation logs %s\n",
+			result.Operation.ID, result.Operation.ID)
+	}
+	return nil
 }

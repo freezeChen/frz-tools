@@ -489,3 +489,39 @@ func (s *Store) ActiveRelease(ctx context.Context, applicationID string) (*domai
 	}
 	return release, nil
 }
+
+// GetReleaseByVersion 按 (应用, 版本) 查一次；没有时返回 (nil, nil)。
+//
+// 「没有」是部署的**正常路径**（这是一个新版本），因此不能当成错误返回——把它做成
+// ARTIFACT_NOT_FOUND 之类的话，调用方每次都要去分辨「真的错了」还是「第一次见这个版本」。
+func (s *Store) GetReleaseByVersion(ctx context.Context, applicationID, version string) (*domain.Release, error) {
+	release, err := scanRelease(s.db.QueryRowContext(ctx, `
+		SELECT `+releaseColumns+` FROM releases WHERE application_id = ? AND version = ?`,
+		applicationID, version))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return release, nil
+}
+
+// PreviousRelease 返回回滚的默认目标：最近一个**曾经激活过**、且状态仍可回滚的版本。
+//
+// 判据是 `superseded` 而不是「第二新的记录」：一个从没部署成功的版本（failed）或者还没
+// 部署过的（created）都不能当回滚目标——回滚到它等于把应用指向一个从没跑起来的东西。
+func (s *Store) PreviousRelease(ctx context.Context, applicationID string) (*domain.Release, error) {
+	release, err := scanRelease(s.db.QueryRowContext(ctx, `
+		SELECT `+releaseColumns+` FROM releases
+		WHERE application_id = ? AND status = ?
+		ORDER BY activated_at DESC, id DESC LIMIT 1`,
+		applicationID, string(domain.ReleaseSuperseded)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return release, nil
+}

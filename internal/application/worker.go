@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"math/rand"
@@ -25,6 +26,7 @@ type Pool struct {
 	cancels  *cancelRegistry
 	runtimes *RuntimeService
 	backups  *BackupService
+	deploys  *DeployService
 	workers  int
 	idle     time.Duration
 	logger   *slog.Logger
@@ -38,7 +40,7 @@ type Pool struct {
 	jitter func() float64
 }
 
-func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, runtimes *RuntimeService, backups *BackupService, workers int, logger *slog.Logger, newID func(string) string) *Pool {
+func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, runtimes *RuntimeService, backups *BackupService, deploys *DeployService, workers int, logger *slog.Logger, newID func(string) string) *Pool {
 	if workers < 1 {
 		workers = 1
 	}
@@ -53,6 +55,7 @@ func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults D
 		cancels:  cancels,
 		runtimes: runtimes,
 		backups:  backups,
+		deploys:  deploys,
 		workers:  workers,
 		idle:     defaultIdlePoll,
 		logger:   logger,
@@ -134,6 +137,10 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 	}
 	if isBackupKind(op.Kind) {
 		p.executeBackup(persistCtx, execCtx, op)
+		return
+	}
+	if isDeployKind(op.Kind) {
+		p.executeDeploy(persistCtx, execCtx, op)
 		return
 	}
 
@@ -538,4 +545,65 @@ func formatEnv(env map[string]string) string {
 		parts = append(parts, key+"="+env[key])
 	}
 	return strings.Join(parts, " ")
+}
+
+// executeDeploy 执行一次部署或回滚。
+//
+// 与 runtime.* / backup.* 共用 Operation 的创建、锁、状态机、取消与落库，只把「做什么」
+// 换成 DeployService 调用。执行时**不读"应用的当前规格"**：要跑的那个版本的配置在创建期
+// 就随 Operation.spec 存下了（releaseId），回滚要靠它才回得干净。
+func (p *Pool) executeDeploy(persistCtx, execCtx context.Context, op *domain.Operation) {
+	if p.deploys == nil || !p.deploys.Configured() {
+		p.finish(persistCtx, op, domain.StatusFailed, nil,
+			string(v1.CodeRuntimeUnsupport), "本部署未启用应用部署能力")
+		return
+	}
+
+	releaseID, err := decodeReleaseID(op.Spec)
+	if err != nil {
+		p.finish(persistCtx, op, domain.StatusFailed, nil,
+			string(domain.CodeOf(err)), domain.MessageOf(err))
+		return
+	}
+
+	logf := func(level, phase, message string, fields map[string]string) {
+		p.appendLog(persistCtx, op, nil, level, phase, message, fields)
+	}
+
+	switch op.Kind {
+	case v1.KindAppRollback:
+		err = p.deploys.ExecuteRollback(execCtx, releaseID, logf)
+	default:
+		err = p.deploys.ExecuteDeploy(execCtx, releaseID, logf)
+	}
+
+	if err != nil {
+		status := domain.StatusFailed
+		if domain.CodeOf(err) == v1.CodeExecCancelled {
+			status = domain.StatusCancelled
+		}
+		code := string(domain.CodeOf(err))
+		p.appendLog(persistCtx, op, nil, "error", domain.PhaseFinalize,
+			"operation failed: "+domain.MessageOf(err), map[string]string{"errorCode": code})
+		p.finish(persistCtx, op, status, nil, code, domain.MessageOf(err))
+		return
+	}
+	p.finish(persistCtx, op, domain.StatusSucceeded, nil, "", "")
+}
+
+// decodeReleaseID 从 Operation 的 spec 里取出创建期选定的 release ID。
+func decodeReleaseID(raw json.RawMessage) (string, error) {
+	var options struct {
+		ReleaseID string `json:"releaseId"`
+	}
+	if len(raw) == 0 {
+		return "", domain.NewError(v1.CodeInvalidRequest, "部署类操作缺少 releaseId")
+	}
+	if err := json.Unmarshal(raw, &options); err != nil {
+		return "", domain.NewError(v1.CodeInvalidRequest, "部署类操作的参数无法解析: %v", err)
+	}
+	if options.ReleaseID == "" {
+		return "", domain.NewError(v1.CodeInvalidRequest, "部署类操作的 releaseId 为空")
+	}
+	return options.ReleaseID, nil
 }

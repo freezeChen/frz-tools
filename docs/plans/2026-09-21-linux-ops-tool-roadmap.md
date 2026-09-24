@@ -767,3 +767,37 @@
   （塞进按策略的命令是设计错误，应当是一个独立的 `backup gc`；**后果**是 prune 在「标记」与
   「删内容」之间崩溃会留下无人回收的孤儿 blob）、以及「校验失败的备份永远不会被清理」
   （D9 的直接后果，方向对但要有人决定谁来清）。三条都已记入停放区第 3 节。
+
+### 2026-09-24（补记十）迭代 3 的 3a 与 3b 实现并验证：制品解包、部署与回滚
+
+- **变更原因**：迭代 2 收尾后按路线图进入迭代 3（Go/Java 通用进程部署）。规格冻结在
+  `docs/plans/2026-09-24-iteration-3.md`，拆成 3a（解包与 manifest 增量）、3b（部署与回滚）、
+  3c（资源限制与 Java 运行时）三片。**本轮完成 3a 与 3b，3c 未开始。**
+- **3a 交付**：`ReleaseAdapter` 端口与 `internal/adapters/release/local` 的解包实现
+  （`none`/`tar`/`tar-gz`/`zip` + `stripComponents`，含 tar slip 的三道防线）；manifest 新增
+  `artifact.version`/`artifact.fileName`、`resources`、`release` 与严格校验；argv 的解析规则
+  （**只解析 `argv[0]`**）。新增错误码 `ARTIFACT_UNPACK_FAILED`（409/30）。
+- **3b 交付**：迁移 `0009`（release 状态机 + `application_specs` 按 release 版本化）、
+  `app.deploy` / `app.rollback` 走 Operation、`current` 符号链接切换、保留最近 N 个、
+  失败自动回到上一稳定版、HTTP 端点与 CLI、`check_deploy`（20 项容器断言）。
+- **三条实现时对规格的修正**（都已就地写进规格并注明理由）：
+  1. **只解析 `argv[0]`**：原写法会把 `-Xmx512m`、`-Dlogging.file=...` 这类参数**静默改写**
+     成路径——不是报错，是行为变了。
+  2. **就绪由部署流程轮询**：1c 的 `runtime.start` **不等待就绪**（「启动 ≠ 就绪」是它刻意保留
+     的区分），因此「健康通过才算发布成功」必须由部署流程自己做。
+  3. **换版本必须先停掉上一个版本**：`Start` 对已经 active 的 unit 是**幂等的 no-op**，不重启
+     根本换不过去。**这条是容器验证抓出来的真实缺陷**——第二版部署一直以「15 秒内未就绪」失败，
+     而这只有真实 systemd 能暴露（假适配器不区分「start 一个没运行的」与「start 一个在跑的」）。
+- **两条 SQLite 陷阱**（写进迁移注释与回归测试）：`release_id` 为 NULL 的行**不受主键约束**
+  （NULL 互不相等），`ON CONFLICT (application_id, release_id)` 对它永远不触发，于是每写一次
+  多一行而读的时候只取第一行；以及 `GetApplicationSpec` 必须带 `release_id IS NULL`，否则会
+  取到**任意一行**——「任意一行」在测试里往往恰好是对的。
+- **验证要求**：证据是单元测试（解包的 18 个用例含四种路径穿越形态、release 状态机、
+  规格分层）、集成测试（部署/回滚编排 10 个用例，含「回滚连配置一起回滚」）、**Linux 容器**
+  （`make verify-linux` **151/0**，新增 `check_deploy` 20 项：真实 systemd 上部署真实进程、
+  换版本、回滚、失败回到稳定版、保留策略）、以及 `make ci` 全绿。
+  **最有分量的一条**是「回滚后旧版本的端口重新在监听」：两版监听的端口不同，端口回来就说明
+  unit 里的 `ExecStart` 也是旧版本那一份——**配置跟着一起回滚了**。
+- **仍未验证**：3c 的全部内容（`resources` 与 Java 运行时只有模型、零行为）、真机部署
+  （容器里是真实 systemd 但仍是「Linux 容器」证据）、大制品解包（zip 要落临时文件，占双份
+  磁盘）、多应用并发部署。

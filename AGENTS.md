@@ -21,7 +21,9 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 （PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
 **2d（保留策略与 `prune`）已实现并验证**——范围是**只用 `keepLast` / `keepDays`**，
 **GFS 已按用户指示移出并停放为未来迭代目标**
-（见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）；迭代 3–5 未开始。
+（见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）。
+**迭代 3（Go/Java 通用进程部署）的 3a / 3b 已实现并验证**（解包与 release 目录、部署与回滚），
+**3c（资源限制与 Java 运行时）未开始**；迭代 4–5 未开始。
 **真实 Linux 主机的证据已于 2026-09-24 取得**（Rocky Linux 10.2 / systemd 257 / SELinux
 enforcing，含一次真实重启，见 `test/host/`）；
 **仍缺 `legacy` 档（systemd 219–239）的证据**，这一项不得写成已验证。
@@ -41,6 +43,7 @@ enforcing，含一次真实重启，见 `test/host/`）；
 - `docs/plans/2026-09-21-iteration-1d.md`：任务引擎的重试、退避与并发策略（已实现并提交）
 - `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b、2d 已实现并验证；
   GFS 已移出 2d，见第 22 节）
+- `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a、3b 已实现并验证，3c 未开始）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -129,10 +132,10 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 131**（2026-09-24 迭代 2d 落地后实跑：131 通过 / 0 失败，其中 1c 的 `check_runtime`
-49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项、2d 的 `check_prune` 13 项；
-历史快照：2a 时点 118 项、1d 时点 106 项、1c 时点 89 项、1b 时点 40 项，A7 落地时的静态
-推导 87 项偏低）。**不要引用静态推导值当结论。**
+当前为 151**（2026-09-24 迭代 3b 落地后实跑：151 通过 / 0 失败，其中 1c 的 `check_runtime`
+49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项、2d 的 `check_prune` 13 项、
+3b 的 `check_deploy` 20 项；历史快照：2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
+1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在
 它上面，前缀未动），另一个**以 root 运行**（配置 `test/linux/opsd.root.verify.yaml`，独立

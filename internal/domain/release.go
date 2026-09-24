@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -94,4 +95,78 @@ func (r *Release) Validate() error {
 		return NewError(v1.CodeInvalidRequest, "release.version is required")
 	}
 	return nil
+}
+
+// PlanReleaseRemoval 算出「哪些 release 的目录该被清掉」（迭代 3 规格 D7）。
+//
+// 判据：
+//
+//	保留 = {当前激活的那个} ∪ {最年轻的 keepLast-1 个仍带目录的版本}
+//	删除 = 其余**仍带目录**的版本
+//
+// 三条刻意的规则：
+//
+//  1. **current 永远不删**，且它不占 keepLast 的名额——回滚到旧版本之后，激活的那个可能
+//     比某些 superseded 的更老，把它当成"最新的一份"去数会让保留集合算错。
+//  2. 只有**还带目录**的版本参与（`superseded`）：`created` / `deploying` 的行目录可能
+//     还没建好，`failed` / `removed` 的目录已经没了，删它们没有意义。
+//  3. 删除顺序**从老到新**：先删最没用的，中途出错时剩下的都是更有价值的那些。
+//
+// 它是纯函数，因此「保留集合长什么样」可以完全用表驱动测出来。而这条策略算错的后果是
+// 「某个还能回滚的版本被删掉了」——只在真要回滚时才发现。
+func PlanReleaseRemoval(releases []Release, keepLast int) []string {
+	active := ""
+	candidates := make([]Release, 0, len(releases))
+	for _, release := range releases {
+		if release.Status == ReleaseActive {
+			active = release.ID
+			continue
+		}
+		if release.Status == ReleaseSuperseded && release.Directory != "" {
+			candidates = append(candidates, release)
+		}
+	}
+	if keepLast <= 0 {
+		// 0 在领域校验里是非法值（release.keepLast 至少 1），走到这里说明调用方没校验过。
+		return nil
+	}
+
+	// 最年轻的在前：完成时刻优先，其次创建时刻，最后用 ID 决胜（保证可重放）。
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if left.ActivatedAt != nil && right.ActivatedAt != nil &&
+			!left.ActivatedAt.Equal(*right.ActivatedAt) {
+			return left.ActivatedAt.After(*right.ActivatedAt)
+		}
+		if left.ActivatedAt != nil && right.ActivatedAt == nil {
+			return true
+		}
+		if left.ActivatedAt == nil && right.ActivatedAt != nil {
+			return false
+		}
+		if !left.CreatedAt.Equal(right.CreatedAt) {
+			return left.CreatedAt.After(right.CreatedAt)
+		}
+		return left.ID > right.ID
+	})
+
+	// keepLast 数的是**盘上有目录的版本**，其中一个是 current 自己。
+	keepOthers := keepLast - 1
+	if active == "" {
+		// 没有 current（首次部署之前，或第一次部署失败）：keepLast 全部给 superseded。
+		keepOthers = keepLast
+	}
+	if keepOthers < 0 {
+		keepOthers = 0
+	}
+	if len(candidates) <= keepOthers {
+		return nil
+	}
+
+	removable := candidates[keepOthers:]
+	removal := make([]string, 0, len(removable))
+	for i := len(removable) - 1; i >= 0; i-- { // 从老到新
+		removal = append(removal, removable[i].ID)
+	}
+	return removal
 }

@@ -52,12 +52,13 @@ type Service struct {
 	notify   func()
 	runtime  runtimeOperationResolver
 	backups  backupOperationResolver
+	deploys  deployOperationResolver
 	newID    func() string
 	now      func() time.Time
 	logger   *slog.Logger
 }
 
-func newService(repo Repository, defaults Defaults, allow func(string) bool, cancels *cancelRegistry, runtime runtimeOperationResolver, backups backupOperationResolver, newID func() string, logger *slog.Logger) *Service {
+func newService(repo Repository, defaults Defaults, allow func(string) bool, cancels *cancelRegistry, runtime runtimeOperationResolver, backups backupOperationResolver, deploys deployOperationResolver, newID func() string, logger *slog.Logger) *Service {
 	return &Service{
 		repo:     repo,
 		defaults: defaults,
@@ -65,6 +66,7 @@ func newService(repo Repository, defaults Defaults, allow func(string) bool, can
 		cancels:  cancels,
 		runtime:  runtime,
 		backups:  backups,
+		deploys:  deploys,
 		newID:    newID,
 		now:      func() time.Time { return time.Now().UTC() },
 		logger:   logger,
@@ -158,6 +160,24 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 			// 规格一致：改了策略之后重试，用的是最新那份。
 			specJSON = nil
 		}
+	} else if isDeployKind(req.Kind) {
+		if req.DryRun {
+			// 与 runtime.* 同一条理由：换版本会重启正在服务的进程，而适配器端口没有
+			// dry-run 语义——接受它就会变成「以为只是预演、其实真的换了版本」。
+			return nil, false, domain.NewError(v1.CodeInvalidRequest,
+				"%s 不支持 dryRun：它无法阻止适配器真的切换版本，只做校验请用 spec put", req.Kind)
+		}
+		if s.deploys == nil {
+			return nil, false, domain.NewError(v1.CodeRuntimeUnsupport, "本部署未启用应用部署能力")
+		}
+		resolvedResource, resolvedSpec, err := s.deploys.ResolveDeployOperation(ctx, req.Kind, req.Resource, req.Spec)
+		if err != nil {
+			return nil, false, err
+		}
+		// 部署与回滚**不读"应用的当前规格"**：要跑的那个版本的配置是创建期就选好的
+		// （随 Operation.spec 存下），执行时再去读当前规格会让「回滚」回成一个混合体。
+		resource = resolvedResource
+		specJSON = resolvedSpec
 	} else {
 		spec, err := BuildCommandSpec(req.Kind, req.Spec, s.defaults)
 		if err != nil {
@@ -209,6 +229,11 @@ func isRuntimeKind(kind string) bool {
 func errBackupUnsupported() error {
 	return domain.NewError(v1.CodeConfigInvalid,
 		"本部署未配置备份存储根（backupStore.root），备份相关操作不可用")
+}
+
+// isDeployKind 判定 kind 是否是部署类操作。
+func isDeployKind(kind string) bool {
+	return kind == v1.KindAppDeploy || kind == v1.KindAppRollback
 }
 
 // isBackupKind 判定 kind 是否是备份类操作。

@@ -20,6 +20,7 @@ import (
 	"github.com/freezeChen/frz-tools/internal/adapters/config"
 	"github.com/freezeChen/frz-tools/internal/adapters/executor"
 	"github.com/freezeChen/frz-tools/internal/adapters/httpapi"
+	releaselocal "github.com/freezeChen/frz-tools/internal/adapters/release/local"
 	"github.com/freezeChen/frz-tools/internal/adapters/runtime/systemd"
 	"github.com/freezeChen/frz-tools/internal/adapters/secret"
 	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
@@ -143,6 +144,9 @@ func run(cmd *cobra.Command, _ []string) error {
 		},
 		RuntimeAdapter:  runtimeAdapter,
 		PrepareReporter: prepareReporter,
+		// 发布适配器（解包、切换、清理）与运行时适配器**分开装配**：它只做文件系统与归档，
+		// 任何平台都能用；而部署能力是否可用由 Configured() 一起判定（缺运行时就没有部署）。
+		ReleaseAdapter:  releaselocal.New(),
 		AllowExecutable: cfg.ExecutableAllowed,
 		Defaults: application.Defaults{
 			Timeout:          cfg.DefaultTimeout(),
@@ -187,6 +191,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		Runtimes:  runtime.Runtimes,
 		Schedules: runtime.Schedules,
 		Backups:   runtime.Backups,
+		Deploys:   runtime.Deploys,
 		Store:     store,
 		Workers:   runtime.Pool.Workers(),
 		Logger:    logger,

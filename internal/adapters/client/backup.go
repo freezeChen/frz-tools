@@ -36,14 +36,16 @@ func (c *Client) ListBackupPolicies(ctx context.Context) (*v1.BackupPolicyListRe
 	return &out, nil
 }
 
-// BackupActionInput 是触发备份类操作的公共参数。
-type BackupActionInput struct {
+// ActionInput 是触发备份类操作的公共参数。
+// ActionInput 是「会发起一次动作」的命令行共有的那几个输入。备份与部署都用它，
+// 因为「谁发起的、要不要重试、幂等键是什么」与具体做什么无关。
+type ActionInput struct {
 	IdempotencyKey string
 	CreatedBy      string
 	Retry          *v1.RetrySpec
 }
 
-func (c *Client) RunBackup(ctx context.Context, policy string, in BackupActionInput) (*v1.Operation, bool, error) {
+func (c *Client) RunBackup(ctx context.Context, policy string, in ActionInput) (*v1.Operation, bool, error) {
 	var out v1.OperationResponse
 	created, err := c.doWithStatus(ctx, http.MethodPost, "/api/v1/backups", nil,
 		v1.BackupRunRequest{
@@ -58,7 +60,7 @@ func (c *Client) RunBackup(ctx context.Context, policy string, in BackupActionIn
 	return &out.Operation, created, nil
 }
 
-func (c *Client) VerifyBackup(ctx context.Context, backupID string, in BackupActionInput) (*v1.Operation, bool, error) {
+func (c *Client) VerifyBackup(ctx context.Context, backupID string, in ActionInput) (*v1.Operation, bool, error) {
 	var out v1.OperationResponse
 	created, err := c.doWithStatus(ctx, http.MethodPost, backupPath(backupID, "verify"), nil,
 		v1.BackupVerifyRequest{
@@ -73,7 +75,7 @@ func (c *Client) VerifyBackup(ctx context.Context, backupID string, in BackupAct
 }
 
 // RestoreBackup 恢复一份备份。confirm 只对 inPlace 模式有意义，且是**服务端**的硬门槛。
-func (c *Client) RestoreBackup(ctx context.Context, backupID string, mode string, confirm bool, in BackupActionInput) (*v1.Operation, bool, error) {
+func (c *Client) RestoreBackup(ctx context.Context, backupID string, mode string, confirm bool, in ActionInput) (*v1.Operation, bool, error) {
 	var out v1.OperationResponse
 	created, err := c.doWithStatus(ctx, http.MethodPost, backupPath(backupID, "restore"), nil,
 		v1.BackupRestoreRequest{

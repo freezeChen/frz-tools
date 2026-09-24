@@ -243,13 +243,6 @@ func (a *SpecArtifact) validate() error {
 			return NewError(v1.CodeManifestInvalid, "artifact.digest 不是合法的摘要（got %q）", a.Digest)
 		}
 	}
-	if a.FileName != "" && a.Unpack.Strategy != UnpackNone {
-		return NewError(v1.CodeManifestInvalid,
-			"artifact.fileName 只用于 unpack.strategy=none（归档自带条目名，写了它不会生效）")
-	}
-	if err := validateArtifactFileName(a.FileName); err != nil {
-		return err
-	}
 	if a.Version != "" {
 		// 版本号会进日志、审计与回滚引用；它**不是路径**，因此不允许斜杠。
 		if !versionPattern.MatchString(a.Version) {
@@ -272,7 +265,15 @@ func (a *SpecArtifact) validate() error {
 		return NewError(v1.CodeManifestInvalid,
 			"unpack.strategy=none 时不能提供 stripComponents")
 	}
-	return nil
+
+	// fileName 与解包方式是**互斥的一对**：归档自带名字，用不着它；单文件制品没有名字，
+	// 只能靠它。这条检查必须放在**补齐默认 strategy 之后**——否则「给了 fileName、没写
+	// unpack」这种最常见的写法会被误判成「strategy 不是 none」。
+	if a.FileName != "" && a.Unpack.Strategy != UnpackNone {
+		return NewError(v1.CodeManifestInvalid,
+			"artifact.fileName 只用于 unpack.strategy=none（归档自带条目名，写了它不会生效）")
+	}
+	return validateArtifactFileName(a.FileName)
 }
 
 // validate 只判「这个值是不是一个合理的限制」。0 一律表示不限制，因此不在这里翻译成

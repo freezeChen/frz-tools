@@ -129,7 +129,7 @@ func newBackupPolicyGetCommand(opts *rootOptions) *cobra.Command {
 }
 
 func newBackupRunCommand(opts *rootOptions) *cobra.Command {
-	flags := &backupActionFlags{}
+	flags := &actionFlags{}
 
 	cmd := &cobra.Command{
 		Use:   "run --policy <name>",
@@ -213,7 +213,7 @@ func newBackupShowCommand(opts *rootOptions) *cobra.Command {
 }
 
 func newBackupVerifyCommand(opts *rootOptions) *cobra.Command {
-	flags := &backupActionFlags{}
+	flags := &actionFlags{}
 
 	cmd := &cobra.Command{
 		Use:   "verify <id>",
@@ -237,7 +237,7 @@ func newBackupVerifyCommand(opts *rootOptions) *cobra.Command {
 }
 
 func newBackupRestoreCommand(opts *rootOptions) *cobra.Command {
-	flags := &backupActionFlags{}
+	flags := &actionFlags{}
 	var (
 		mode    string
 		confirm bool
@@ -269,8 +269,8 @@ func newBackupRestoreCommand(opts *rootOptions) *cobra.Command {
 	return cmd
 }
 
-// backupActionFlags 是备份类操作共用的参数。
-type backupActionFlags struct {
+// actionFlags 是备份类操作共用的参数。
+type actionFlags struct {
 	policy         string
 	idempotencyKey string
 	createdBy      string
@@ -279,7 +279,7 @@ type backupActionFlags struct {
 	retryMaxDelay  time.Duration
 }
 
-func (f *backupActionFlags) bind(cmd *cobra.Command) {
+func (f *actionFlags) bind(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&f.idempotencyKey, "idempotency-key", "", "幂等键：相同请求重复提交会返回同一个操作")
 	cmd.Flags().StringVar(&f.createdBy, "created-by", "", "调用方标识")
 	cmd.Flags().IntVar(&f.retryMax, "retry-max", 0,
@@ -290,8 +290,8 @@ func (f *backupActionFlags) bind(cmd *cobra.Command) {
 
 // input 组装公共参数。重试参数与 operation submit 用同一套语义：只有显式设置
 // --retry-* 才构成策略。
-func (f *backupActionFlags) input(cmd *cobra.Command) (client.BackupActionInput, error) {
-	in := client.BackupActionInput{
+func (f *actionFlags) input(cmd *cobra.Command) (client.ActionInput, error) {
+	in := client.ActionInput{
 		IdempotencyKey: f.idempotencyKey,
 		CreatedBy:      f.createdBy,
 	}

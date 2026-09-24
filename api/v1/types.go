@@ -20,6 +20,11 @@ const (
 	KindBackupRun     = "backup.run"
 	KindBackupVerify  = "backup.verify"
 	KindBackupRestore = "backup.restore"
+
+	// 部署类操作（迭代 3）。它们与 runtime.* 共用同一把应用级锁，因此同一应用上的
+	// 「部署」与「启停」天然互斥——那是同一个应用上的两件事，同时做会互相踩。
+	KindAppDeploy   = "app.deploy"
+	KindAppRollback = "app.rollback"
 )
 
 type CreateOperationRequest struct {

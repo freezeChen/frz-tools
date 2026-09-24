@@ -57,6 +57,11 @@ const (
 	// 落点已被符号链接占住……它与 MANIFEST_INVALID 刻意分开：manifest 没问题，是制品
 	// 本身与它声称的形态不符，而运维要做的事不同（重新上传制品，而不是改 manifest）。
 	CodeArtifactUnpackFailed ErrorCode = "ARTIFACT_UNPACK_FAILED"
+	// CodeDeployRolledBack 是**部署失败但已回滚**：进程与配置都回到了上一个稳定版本。
+	// 它与 RUNTIME_NOT_READY 之类的区别在于它回答了运维的第一个问题——「现在线上跑的是
+	// 哪个版本」。刻意不加进 1d 的重试白名单：部署失败通常不是瞬时故障，自动重试会把
+	// 同一个坏版本反复推上去。
+	CodeDeployRolledBack ErrorCode = "DEPLOY_ROLLED_BACK"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -95,6 +100,7 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeBackupKeyUnresolved:      400,
 	CodeBackupRestoreFailed:      409,
 	CodeArtifactUnpackFailed:     409,
+	CodeDeployRolledBack:         409,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -147,6 +153,7 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeBackupKeyUnresolved:      27,
 	CodeBackupRestoreFailed:      28,
 	CodeArtifactUnpackFailed:     30,
+	CodeDeployRolledBack:         29,
 }
 
 func ExitCode(code ErrorCode) int {

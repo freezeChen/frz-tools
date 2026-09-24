@@ -32,6 +32,7 @@ type Dependencies struct {
 	Runtimes  *application.RuntimeService
 	Schedules *application.ScheduleService
 	Backups   *application.BackupService
+	Deploys   *application.DeployService
 	Store     *sqlite.Store
 	Workers   int
 	Logger    *slog.Logger
@@ -81,6 +82,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/start", s.handleStartRuntime)
 	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/stop", s.handleStopRuntime)
 	mux.HandleFunc("GET /api/v1/applications/{id}/runtime/health", s.handleRuntimeHealth)
+	// 部署与回滚（迭代 3）：都走 Service.Create，与 runtime.* / backup.* 同一条创建路径，
+	// 因此 operation get/logs/cancel/retry 对它们同样适用。
+	mux.HandleFunc("POST /api/v1/applications/{id}/deploy", s.handleDeployApplication)
+	mux.HandleFunc("POST /api/v1/applications/{id}/rollback", s.handleRollbackApplication)
 	mux.HandleFunc("POST /api/v1/releases", s.handleCreateRelease)
 	mux.HandleFunc("GET /api/v1/releases/{id}", s.handleGetRelease)
 

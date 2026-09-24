@@ -1161,6 +1161,169 @@ POLICY
   fi
 }
 
+
+# ==== 迭代 3：部署与回滚 ====
+#
+# 这一段是 3b 的主要证据：在**真实的 systemd** 上部署一个真实的制品、把服务跑起来、
+# 换版本、回滚，并用「哪个端口在监听」判断**现在跑的是哪个版本**。
+#
+# 为什么用端口而不是日志判断：端口是外部可观测的事实，而日志是进程自己的说法。
+# 两个版本监听**不同端口**，于是「版本换过去了没有」与「配置有没有跟着回去」都能被直接断言。
+check_deploy() {
+  log "迭代 3：部署、换版本与回滚（Linux 容器证据）"
+
+  # release 目录计数。用 find -type d 而不是 `ls -d */`：后者会把 current（指向目录的
+  # 符号链接）也算成一个目录，于是 keepLast=2 的断言永远差一。
+  count_release_dirs() {
+    q sh -c "find /opt/opsd/apps/${app}/releases -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l" | tr -d ' '
+  }
+
+  local app=frz-deploy
+  local port_v1=28601
+  local port_v2=28602
+  local port_dead=28603   # 没人监听的端口：就绪检查打在这里，必然失败
+  local port_listen=28604 # 那一次失败部署真正监听的端口（与就绪目标故意不同）
+
+  require_ok "注册应用" runtimectl app create "${app}"
+
+  # 制品就是探针二进制本身（单文件制品：unpack.strategy=none + fileName）。
+  local uploaded artifact_id
+  uploaded=$(rq artifact put /opt/frz-ops/frz-probe --media-type application/octet-stream --json)
+  artifact_id=$(printf '%s' "${uploaded}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${artifact_id}" ]; then
+    fail "制品上传失败：${uploaded}"
+    return 0
+  fi
+  pass "制品上传成功（${artifact_id}）"
+
+  # deploy_manifest 造一份 manifest。
+  #
+  # 前两个参数是「实际监听的端口」与版本号；第三个可选，是**就绪检查打在哪里**——
+  # 让两者不同，才能构造出「进程起来了但没就绪」这种失败（而不是"进程起不来"）。
+  deploy_manifest() { # 监听端口 版本 [就绪端口]
+    local listen_port=$1 version=$2 ready_port=${3:-$1}
+    cat <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${app}
+runtime: go
+artifact:
+  id: ${artifact_id}
+  version: ${version}
+  fileName: bin/frz-probe
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - bin/frz-probe
+    - --report
+    - /var/lib/${app}/probe-report.txt
+    - --listen
+    - 127.0.0.1:${listen_port}
+  workingDirectory: /var/lib/${app}
+  runUser: ${app}
+  ports:
+    - ${listen_port}
+health:
+  readiness:
+    type: tcp
+    target: 127.0.0.1:${ready_port}
+    consecutiveSuccesses: 2
+  startTimeoutSeconds: 15
+  stopTimeoutSeconds: 15
+logs:
+  directory: /var/log/${app}
+systemd:
+  unitName: ${app}.service
+release:
+  keepLast: 2
+MANIFEST
+  }
+
+  deploy_ok() { # 描述 端口 版本
+    local desc=$1 port=$2 version=$3
+    deploy_manifest "${port}" "${version}" > "$WORK_DIR/deploy-$3.yaml"
+    docker cp "$WORK_DIR/deploy-$3.yaml" "$CID:/opt/frz-ops/deploy-$3.yaml"
+    local out id
+    out=$(rq app deploy --app "${app}" --file "/opt/frz-ops/deploy-$3.yaml" --json)
+    id=$(printf '%s' "${out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+    if [ -z "${id}" ]; then
+      fail "${desc}：未返回 operation id（${out}）"
+      return 1
+    fi
+    if ! wait_for_status "${id}" "succeeded" "${RUNTIME_SOCK}"; then
+      fail "${desc}：部署未成功（$(rq operation get "${id}" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p' | head -1)：$(rq operation logs "${id}" --json | sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' | tail -3 | tr '\n' ' ')）"
+      return 1
+    fi
+    pass "${desc}"
+    return 0
+  }
+
+  # 1) 部署 v1。
+  if deploy_ok "部署 1.0.0" "${port_v1}" "1.0.0"; then
+    assert_eq "unit 状态" "active" "$(q systemctl is-active ${app}.service)"
+    assert_eq "1.0.0 的端口在监听" "yes" "$(q sh -c "ss -lnt | grep -q ':${port_v1} ' && echo yes || echo no")"
+    assert_eq "current 指向的版本目录存在" "yes" \
+      "$(q sh -c "test -x /opt/opsd/apps/${app}/releases/current/bin/frz-probe && echo yes || echo no")"
+    # stat 默认跟随符号链接，因此这一条同时说明「current 指到的目录存在且是 0750」。
+    # `stat -L`：不加 -L 时 stat 报的是**符号链接自己**的模式（永远是 777）。
+    assert_eq "release 目录模式" "750" "$(q stat -L -c '%a' /opt/opsd/apps/${app}/releases/current)"
+    assert_eq "current 是符号链接" "yes" \
+      "$(q sh -c "test -L /opt/opsd/apps/${app}/releases/current && echo yes || echo no")"
+  fi
+
+  # 2) 部署 v2（另一个端口）：旧端口必须随之关闭——否则「换过去了没有」说不清楚。
+  if deploy_ok "部署 2.0.0" "${port_v2}" "2.0.0"; then
+    assert_eq "2.0.0 的端口在监听" "yes" "$(q sh -c "ss -lnt | grep -q ':${port_v2} ' && echo yes || echo no")"
+    assert_eq "1.0.0 的端口已关闭" "yes" "$(q sh -c "ss -lnt | grep -q ':${port_v1} ' && echo no || echo yes")"
+  fi
+
+  # 3) 回滚到上一个版本（不带 --to）：**配置也要跟着回去**，因此 v1 的端口重新在监听。
+  local rollback_out rollback_id
+  rollback_out=$(rq app rollback --app "${app}" --json)
+  rollback_id=$(printf '%s' "${rollback_out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -n "${rollback_id}" ] && wait_for_status "${rollback_id}" "succeeded" "${RUNTIME_SOCK}"; then
+    pass "回滚走 Operation 且成功"
+    assert_eq "回滚后 1.0.0 的端口重新在监听" "yes" "$(q sh -c "ss -lnt | grep -q ':${port_v1} ' && echo yes || echo no")"
+    assert_eq "回滚后 2.0.0 的端口已关闭" "yes" "$(q sh -c "ss -lnt | grep -q ':${port_v2} ' && echo no || echo yes")"
+  else
+    fail "回滚未成功"
+  fi
+
+  # 4) 一次注定失败的部署：就绪目标指向没人监听的端口。
+  #    它必须**回到当前稳定版本**，而当前稳定版本是回滚之后的 1.0.0。
+  local dirs_before_failure
+  dirs_before_failure=$(count_release_dirs)
+  # 监听 28604、就绪检查打 28603：进程能起来，但永远不就绪。
+  deploy_manifest "${port_listen}" "3.0.0" "${port_dead}" > "$WORK_DIR/deploy-3.0.0-bad.yaml"
+  docker cp "$WORK_DIR/deploy-3.0.0-bad.yaml" "$CID:/opt/frz-ops/deploy-3.0.0-bad.yaml"
+  local fail_out fail_id
+  fail_out=$(rq app deploy --app "${app}" --file /opt/frz-ops/deploy-3.0.0-bad.yaml --json)
+  fail_id=$(printf '%s' "${fail_out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "${fail_id}" ]; then
+    fail "失败的部署没有返回 operation id：${fail_out}"
+    return 0
+  fi
+  if wait_for_status "${fail_id}" "failed" "${RUNTIME_SOCK}"; then
+    assert_eq "失败部署的错误码" "DEPLOY_ROLLED_BACK" \
+      "$(rq operation get "${fail_id}" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p' | head -1)"
+  else
+    fail "部署 3.0.0 本该失败却成功了（状态 $(rq operation get "${fail_id}" --json | sed -n 's/.*"status": *"\([^"]*\)".*/\1/p' | head -1)，端口 $(q sh -c "ss -lnt | grep -c ':${port_dead} '" || echo 0)）"
+  fi
+  assert_eq "失败之后旧版本仍在监听" "yes" "$(q sh -c "ss -lnt | grep -q ':${port_v1} ' && echo yes || echo no")"
+  # 失败的版本不该留下目录，也不该留下暂存目录：两者都会让下一次部署踩到残片。
+  assert_eq "失败之后没有多出 release 目录" "${dirs_before_failure}" "$(count_release_dirs)"
+
+  # 5) 保留策略：keepLast=2，再成功部署一次之后最老的目录应当被清掉，而 current 的永远在。
+  if deploy_ok "再次部署 2.0.0" "${port_v2}" "2.0.0"; then
+    assert_eq "current 的目录还在" "yes" \
+      "$(q sh -c "test -d /opt/opsd/apps/${app}/releases/current && echo yes || echo no")"
+    # keepLast=2：算上 current，盘上最多两个版本目录。
+    assert_eq "release 目录数不超过 keepLast" "yes" \
+      "$(q sh -c "test \$(find /opt/opsd/apps/${app}/releases -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) -le 2 && echo yes || echo no")"
+  fi
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -1204,6 +1367,8 @@ main() {
   check_backup
   # 迭代 2d：按保留策略清理备份（keepLast / keepDays，不含 GFS）。
   check_prune
+  # 迭代 3：部署与回滚（真 systemd、真进程、真切换）。
+  check_deploy
   # 放在最后：它会故意让探针 unit 停在 failed 状态（验证缺凭据必须起不来）。
   check_runtime
 

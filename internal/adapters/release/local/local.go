@@ -321,3 +321,20 @@ func (o ownership) chown(target string) error {
 }
 
 var errPathEscape = errors.New("条目名逃出了 release 目录")
+
+// Deactivate 撤掉 current 指针（幂等）。
+//
+// 用在「第一次部署就失败」那条路上：没有可回退的版本，只能把它停下来，而留下的 current
+// 会指向一个马上要被删掉的目录——于是「现在跑的是哪个版本」这句话指向了不存在的东西。
+func (a *Adapter) Deactivate(ctx context.Context, spec *domain.ApplicationSpec) error {
+	if spec == nil {
+		return domain.NewError(v1.CodeInvalidRequest, "release 适配器需要非空的应用规格")
+	}
+	if err := ctx.Err(); err != nil {
+		return domain.NewError(v1.CodeExecCancelled, "撤销激活被取消")
+	}
+	if err := os.Remove(filepath.Join(a.releaseRoot(spec), currentLink)); err != nil && !os.IsNotExist(err) {
+		return domain.NewError(v1.CodeInternal, "移除 current 指针失败: %v", err)
+	}
+	return nil
+}
