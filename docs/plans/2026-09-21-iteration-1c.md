@@ -1045,6 +1045,43 @@ manifest 端点、`runtime/*` 端点、hosts/environments 端点、CLI、`runtim
 - **真实 Linux 主机**：reboot 后 unit 持久化、`WantedBy` 实际生效、SELinux/AppArmor、
   sudoers/PAM。容器证据**不能**替代它们。
 
+### 2026-09-24：1c 的 e2e 用例首次在 Linux 上执行，暴露一处平台耦合缺陷并修复
+
+**背景**：1c 的实现提交后（`1168f29`）CI 的 `test` job 在干净 ubuntu-latest runner 上**失败**
+——本地 macOS 全绿、CI 红。这是 1c 的 e2e 用例第一次在 Linux 上执行：此前 CI 跑过的
+`test/e2e` 还是 1b 的用例集，`runtime_test.go` 是随该提交才进入仓库的。
+
+**缺陷**（`test/e2e/runtime_test.go`）：`TestRuntimeWithoutAdapterThroughCLI` 把「本机没有运行时
+适配器」当作前提，断言 `runtime.{validate,prepare,start,stop,health}` 全部退出码 21
+（`RUNTIME_UNSUPPORTED`）。这个前提**只在非 Linux 上成立**——装配层的平台选择是
+`GOOS == linux` 才注入 systemd 适配器（`cmd/opsd/main.go`）。于是在 Linux 上 `runtime validate`
+返回 `0`，断言失败（CI 日志：`runtime validate want exit 21 (RUNTIME_UNSUPPORTED), got 0`）。
+
+**修法**：按 `GOOS` 分断言，两个平台各钉各自成立的那个命题，而不是把 macOS 的行为写死：
+
+- 非 Linux（macOS）：保持原意——适配器不可用，五个动作都必须快速失败为退出码 21，且不留
+  任何 `runtime.*` 操作行（`start` 是快速失败：适配器不可用是部署属性，排队没有意义）。
+- Linux：断言**反面**——适配器确实被装配，`runtime validate` 退出码 0；因为是同步用例，
+  同样不留 Operation 行。真正的启停与就绪链路需要 root 与 systemd，不在 e2e 的覆盖范围内，
+  由 `test/linux/verify.sh` 的 `check_runtime` 承担。
+
+**证据**：
+
+| 命令 | 结果 | 证据类型 |
+| --- | --- | --- |
+| `go test ./test/e2e/... -run TestRuntimeWithoutAdapterThroughCLI -v` | PASS（走非 Linux 分支） | e2e（macOS） |
+| 容器内 `go test ./test/e2e/... -run TestRuntimeWithoutAdapterThroughCLI -v` | PASS；`POST /applications/billing-api/runtime/validate` = **200**，容器 systemd 252 | e2e（Linux 容器） |
+| `gh run view 35942862018 --log-failed` | 失败点＝`runtime_test.go:63`，「want 21, got 0」 | CI 日志 |
+
+Linux 侧的做法：`docker build` 一个 `golang:1.27-bookworm` 镜像，`apt-get install systemd`
+只为拿到 `systemctl` 二进制（版本探测走 `systemctl --version`，它只输出编译进去的版本，
+不需要 systemd 作为 PID 1）；源码用 `git archive HEAD` 做**干净副本**而不是 bind mount
+macOS 目录——后者对权限断言不保真，是 AGENTS.md 已记录的坑。
+
+**教训**：e2e 此前只在 macOS 上跑过，平台耦合缺陷直到 CI 才暴露。这与 A7 那次「本地全绿的
+测试挡不住部署形态差异」是同一类问题的两个面——**断言里凡是用到「本机如何」的前提，都要先
+问它在另一个受支持平台上是否成立**。
+
 ### 结论汇总（2026-09-23，含本次修订）
 
 - 第 13 节的 12 条验收标准：**11 条达成、1 条部分达成（第 8 条的 `legacy` 档）**。
