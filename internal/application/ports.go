@@ -37,6 +37,17 @@ type Repository interface {
 	GetRelease(ctx context.Context, id string) (*domain.Release, error)
 	ListReleases(ctx context.Context, applicationID string, limit int) ([]domain.Release, error)
 
+	// release 的状态机（迭代 3 规格 §5）。每次转移都带 status 条件，因此重复调用是幂等的。
+	MarkReleaseDeploying(ctx context.Context, id, directory string, now time.Time) error
+	// ActivateRelease 把该 release 置为 active，并把同应用里原本 active 的那个置为
+	// superseded——两件事必须在同一个事务里，否则会出现「两个 active」或「一个都没有」，
+	// 而 current 指针只有一个。
+	ActivateRelease(ctx context.Context, id string, now time.Time) (int, error)
+	FailRelease(ctx context.Context, id, code, message string, now time.Time) error
+	MarkReleaseRemoved(ctx context.Context, id string, now time.Time) error
+	// ActiveRelease 返回当前激活的 release；没有时返回 (nil, nil)。
+	ActiveRelease(ctx context.Context, applicationID string) (*domain.Release, error)
+
 	CreateSchedule(ctx context.Context, schedule *domain.Schedule) error
 	GetSchedule(ctx context.Context, ref string) (*domain.Schedule, error)
 	ListSchedules(ctx context.Context, limit int) ([]domain.Schedule, error)
@@ -52,6 +63,10 @@ type Repository interface {
 	// 序列化，仓储只存不解释。
 	PutApplicationSpec(ctx context.Context, applicationID string, specJSON []byte, now time.Time, updatedBy string) error
 	GetApplicationSpec(ctx context.Context, applicationID string) (*domain.ApplicationSpec, error)
+	// 规格**按 release 版本化**（1c 决定 3）：部署时写一份，回滚时读回——回滚连配置一起
+	// 回滚，否则「回到上一个版本」只回了一半。
+	PutApplicationSpecForRelease(ctx context.Context, applicationID, releaseID string, specJSON []byte, now time.Time, updatedBy string) error
+	GetApplicationSpecForRelease(ctx context.Context, applicationID, releaseID string) (*domain.ApplicationSpec, error)
 
 	// 主机与环境在 1c 只是身份与标签，不承载连接语义。FindLocalHost 按
 	// address 为空查找本机记录，供启动时的自举使用（没有时返回 nil, nil）。

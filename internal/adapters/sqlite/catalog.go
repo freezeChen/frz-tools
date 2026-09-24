@@ -201,11 +201,18 @@ func (s *Store) CreateRelease(ctx context.Context, release *domain.Release) (*do
 	if err != nil {
 		return nil, err
 	}
+	status := release.Status
+	if status == "" {
+		// 回填给调用方：返回的对象应当反映**库里的事实**，而不是调用方传进来时的零值
+		// （否则调用方要自己知道默认值是 created 才对得上）。
+		status = domain.ReleaseCreated
+		release.Status = status
+	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO releases (id, application_id, artifact_id, version, labels_json, created_at, created_by)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO releases (id, application_id, artifact_id, version, labels_json, created_at, created_by, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		release.ID, release.ApplicationID, release.ArtifactID, release.Version,
-		labels, formatTime(release.CreatedAt), nullString(release.CreatedBy))
+		labels, formatTime(release.CreatedAt), nullString(release.CreatedBy), string(status))
 	if isUniqueViolation(err) {
 		return nil, domain.NewError(v1.CodeReleaseConflict,
 			"application %s already has a release with version %q", release.ApplicationID, release.Version)
@@ -218,8 +225,7 @@ func (s *Store) CreateRelease(ctx context.Context, release *domain.Release) (*do
 
 func (s *Store) GetRelease(ctx context.Context, id string) (*domain.Release, error) {
 	release, err := scanRelease(s.db.QueryRowContext(ctx, `
-		SELECT id, application_id, artifact_id, version, labels_json, created_at, created_by
-		FROM releases WHERE id = ?`, id))
+		SELECT `+releaseColumns+` FROM releases WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, domain.NewError(v1.CodeReleaseNotFound, "release %q not found", id)
 	}
@@ -231,8 +237,7 @@ func (s *Store) GetRelease(ctx context.Context, id string) (*domain.Release, err
 
 func (s *Store) ListReleases(ctx context.Context, applicationID string, limit int) ([]domain.Release, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, application_id, artifact_id, version, labels_json, created_at, created_by
-		FROM releases WHERE application_id = ?
+		SELECT `+releaseColumns+` FROM releases WHERE application_id = ?
 		ORDER BY created_at DESC, id DESC LIMIT ?`, applicationID, limit)
 	if err != nil {
 		return nil, err
@@ -306,18 +311,28 @@ func scanApplication(sc scanner) (*domain.Application, error) {
 	return &app, nil
 }
 
+// releaseColumns 是 reads 用的列清单。集中一处，免得三处 SELECT 各自漂移出不同的字段集。
+const releaseColumns = `id, application_id, artifact_id, version, labels_json, created_at, created_by,
+	status, COALESCE(directory, ''), activated_at, finished_at,
+	COALESCE(error_code, ''), COALESCE(error_message, '')`
+
 func scanRelease(sc scanner) (*domain.Release, error) {
 	var (
-		release   domain.Release
-		labels    sql.NullString
-		createdAt string
-		createdBy sql.NullString
+		release     domain.Release
+		labels      sql.NullString
+		createdAt   string
+		createdBy   sql.NullString
+		activated   sql.NullString
+		finished    sql.NullString
+		statusValue string
 	)
 	if err := sc.Scan(&release.ID, &release.ApplicationID, &release.ArtifactID, &release.Version,
-		&labels, &createdAt, &createdBy); err != nil {
+		&labels, &createdAt, &createdBy, &statusValue, &release.Directory,
+		&activated, &finished, &release.ErrorCode, &release.ErrorMessage); err != nil {
 		return nil, err
 	}
 	release.CreatedBy = createdBy.String
+	release.Status = domain.ReleaseStatus(statusValue)
 
 	decoded, err := decodeLabels(labels)
 	if err != nil {
@@ -327,6 +342,21 @@ func scanRelease(sc scanner) (*domain.Release, error) {
 
 	if release.CreatedAt, err = parseTime(createdAt); err != nil {
 		return nil, err
+	}
+	// 可空时间统一用「先看 Valid 再 parse」的写法（与 scanBackup 同一套）。
+	if activated.Valid {
+		parsed, err := parseTime(activated.String)
+		if err != nil {
+			return nil, err
+		}
+		release.ActivatedAt = &parsed
+	}
+	if finished.Valid {
+		parsed, err := parseTime(finished.String)
+		if err != nil {
+			return nil, err
+		}
+		release.FinishedAt = &parsed
 	}
 	return &release, nil
 }
@@ -357,4 +387,105 @@ func decodeLabels(raw sql.NullString) (map[string]string, error) {
 // SQLite 的约束错误信息是稳定的。
 func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// 下面四个方法实现 release 的状态机。每一次转移都带 status 条件，因此并发下重复调用是
+// **幂等**的：第二次 UPDATE 影响 0 行，而不会把一个已经 active 的版本倒退回去。
+
+// MarkReleaseDeploying 把一次部署推进到 deploying，并记下它的目录。
+//
+// 允许的来源状态是 created / failed / removed：前两个是「这一次部署要开始了」（重试同一个
+// 版本走的就是失败那一行），最后一个是「这个版本的目录被保留策略清掉了，现在重新部署它」。
+// **不允许**从 active / superseded 进来——那意味着「已经在跑或跑过的版本又要部署一次」，
+// 而调用方应当先把它识别成幂等或冲突（见 application 层的判断）。
+func (s *Store) MarkReleaseDeploying(ctx context.Context, id, directory string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE releases SET status = ?, directory = ?, activated_at = NULL, finished_at = NULL,
+			error_code = NULL, error_message = NULL
+		WHERE id = ? AND status IN (?, ?, ?)`,
+		string(domain.ReleaseDeploying), directory, id,
+		string(domain.ReleaseCreated), string(domain.ReleaseFailed), string(domain.ReleaseRemoved))
+	return err
+}
+
+// ActivateRelease 把该 release 置为 active，并把同应用里**原本 active 的那个**置为 superseded。
+//
+// 两件事必须在**同一个事务**里：中间崩一下会出现「两个 active」或「一个都没有」的状态，
+// 而 current 指针只有一个——那正是「现在跑的是哪个版本」这个问题的第二个答案。
+func (s *Store) ActivateRelease(ctx context.Context, id string, now time.Time) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE releases SET status = ?
+		WHERE status = ? AND application_id = (SELECT application_id FROM releases WHERE id = ?)`,
+		string(domain.ReleaseSuperseded), string(domain.ReleaseActive), id)
+	if err != nil {
+		return 0, err
+	}
+	superseded, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE releases SET status = ?, activated_at = ?, finished_at = ? WHERE id = ?`,
+		string(domain.ReleaseActive), formatTime(now), formatTime(now), id); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(superseded), nil
+}
+
+// FailRelease 记下一次失败的部署。
+//
+// directory 被**清空**：失败的 release 目录会被删掉，于是「failed 的行没有目录」是自洽的，
+// 而不是让 list 时看起来像「库里有记录、盘上没目录」。目录路径本身进审计与 Operation 日志，
+// 排查时从那里查。
+func (s *Store) FailRelease(ctx context.Context, id, code, message string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE releases SET status = ?, finished_at = ?, error_code = ?, error_message = ?,
+			directory = NULL
+		WHERE id = ? AND status IN (?, ?)`,
+		string(domain.ReleaseFailed), formatTime(now), nullString(code), nullString(message), id,
+		string(domain.ReleaseCreated), string(domain.ReleaseDeploying))
+	return err
+}
+
+// MarkReleaseRemoved 标记一个 release 的目录已被保留策略清理。
+//
+// 只在**非 active** 的行上生效：current 指向的那个永远不能被标记为 removed（ReleaseAdapter
+// 也会拒绝真的删它，这是第二道保险）。
+func (s *Store) MarkReleaseRemoved(ctx context.Context, id string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE releases SET status = ?, directory = NULL, finished_at = ?
+		WHERE id = ? AND status IN (?, ?)`,
+		string(domain.ReleaseRemoved), formatTime(now), id,
+		string(domain.ReleaseSuperseded), string(domain.ReleaseFailed))
+	return err
+}
+
+// ActiveRelease 返回某个应用当前激活的 release（没有时返回 nil, nil）。
+//
+// 「当前激活」的唯一权威是数据库里的这一行，而 current 符号链接是它的镜像；两者不一致时
+// 以数据库为准（部署时是先切链接再写库，因此中途崩溃会留下「链接指向新的、库里还是旧的」
+// ——那种情况下回滚的依据应当是库里那个，见部署流程的失败处理）。
+func (s *Store) ActiveRelease(ctx context.Context, applicationID string) (*domain.Release, error) {
+	release, err := scanRelease(s.db.QueryRowContext(ctx, `
+		SELECT `+releaseColumns+` FROM releases
+		WHERE application_id = ? AND status = ?
+		ORDER BY activated_at DESC, id DESC LIMIT 1`,
+		applicationID, string(domain.ReleaseActive)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return release, nil
 }
