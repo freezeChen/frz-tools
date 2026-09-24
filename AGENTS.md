@@ -19,8 +19,11 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 
 **迭代 2a（备份：端口、策略模型、文件适配器、传输编码、API+CLI）与 2b
 （PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
-2d（GFS 保留与 prune）未开始；迭代 3–5 未开始。
-**仍缺 `legacy` 档（systemd 219–239）与真实 Linux 主机的证据**，这两项不得写成已验证。
+**2d 未开始**，且其中的 **GFS 保留策略已按用户指示移出 2d、停放为未来迭代目标**
+（见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）；迭代 3–5 未开始。
+**真实 Linux 主机的证据已于 2026-09-24 取得**（Rocky Linux 10.2 / systemd 257 / SELinux
+enforcing，含一次真实重启，见 `test/host/`）；
+**仍缺 `legacy` 档（systemd 219–239）的证据**，这一项不得写成已验证。
 进度与逐条证据见 `docs/plans/` 下对应迭代文档的第 13 节之后（实现记录与验证记录）。
 
 - `opsd`：目标主机上的守护进程，负责执行需要权限的操作。
@@ -35,7 +38,11 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 - `docs/plans/2026-09-21-iteration-1b.md`：调度器（已实现并提交）
 - `docs/plans/2026-09-21-iteration-1c.md`：Linux 适配（已实现并提交）
 - `docs/plans/2026-09-21-iteration-1d.md`：任务引擎的重试、退避与并发策略（已实现并提交）
-- `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b 已实现并验证，2d 未开始）
+- `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b 已实现并验证，2d 未开始，
+  GFS 已移出，见第 22 节）
+- `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
+  以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
+  独立的迭代文档（含验收标准与证据类型）
 
 ## 代码规范
 
