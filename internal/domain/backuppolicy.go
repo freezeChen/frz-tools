@@ -2,6 +2,7 @@ package domain
 
 import (
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -191,6 +192,10 @@ func (r *BackupResource) validate() error {
 		if strings.TrimSpace(r.Database) == "" {
 			return NewError(v1.CodeManifestInvalid, "resource.database 不能为空")
 		}
+		if !databaseNamePattern.MatchString(r.Database) {
+			return NewError(v1.CodeManifestInvalid,
+				"resource.database 只能是字母、数字、下划线与 $，且不以数字开头（got %q）", r.Database)
+		}
 		if len(r.Paths) > 0 || len(r.Exclude) > 0 || r.Symlinks != "" {
 			return NewError(v1.CodeManifestInvalid,
 				"resource.kind=%s 时不能提供 paths/exclude/symlinks（那些只属于 files）", r.Kind)
@@ -208,6 +213,15 @@ func (r *BackupResource) validate() error {
 	}
 	return nil
 }
+
+// databaseNamePattern 限定库名的字符集。
+//
+// 这是**安全边界**而不是格式偏好：库名会进命令行（mysql 的位置参数）与连接串
+// （postgres 的 URI 路径）。一个以 `-` 开头的库名会被 MySQL 客户端当成旗标解析——
+// 那是一条从 manifest 通往任意客户端选项的注入路径。执行器只接受 argv、永不经过 shell，
+// 因此它挡得住 shell 注入，但**挡不住旗标注入**，这里补上。
+// 同时排除了点号，免得出现 `db.table` 这类在各家客户端里含义不同的写法。
+var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_$]*$`)
 
 // validateBackupPath 拒绝相对路径与包含 .. 的路径。
 //
