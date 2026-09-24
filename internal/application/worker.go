@@ -24,6 +24,7 @@ type Pool struct {
 	defaults Defaults
 	cancels  *cancelRegistry
 	runtimes *RuntimeService
+	backups  *BackupService
 	workers  int
 	idle     time.Duration
 	logger   *slog.Logger
@@ -37,7 +38,7 @@ type Pool struct {
 	jitter func() float64
 }
 
-func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, runtimes *RuntimeService, workers int, logger *slog.Logger, newID func(string) string) *Pool {
+func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, runtimes *RuntimeService, backups *BackupService, workers int, logger *slog.Logger, newID func(string) string) *Pool {
 	if workers < 1 {
 		workers = 1
 	}
@@ -51,6 +52,7 @@ func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults D
 		defaults: defaults,
 		cancels:  cancels,
 		runtimes: runtimes,
+		backups:  backups,
 		workers:  workers,
 		idle:     defaultIdlePoll,
 		logger:   logger,
@@ -128,6 +130,10 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 
 	if isRuntimeKind(op.Kind) {
 		p.executeRuntime(persistCtx, execCtx, op)
+		return
+	}
+	if isBackupKind(op.Kind) {
+		p.executeBackup(persistCtx, execCtx, op)
 		return
 	}
 
@@ -331,6 +337,67 @@ func (p *Pool) finishRuntimeFailure(ctx context.Context, op *domain.Operation, e
 	p.finish(ctx, op, status, nil, string(code), domain.MessageOf(err))
 	p.logger.Info("runtime operation finished", "operationId", op.ID, "kind", op.Kind,
 		"status", string(status), "errorCode", string(code))
+}
+
+// executeBackup 执行备份类操作。
+//
+// 与 executeRuntime 一样，它复用 Operation 的创建、锁、状态机、取消与落库，只把
+// 「做什么」换成 BackupService 的调用。备份**执行时读当前的策略**（backup.run /
+// backup.verify），因此改了策略之后重试用的是最新那份；只有恢复的模式是创建时
+// 定下的，因为它在那时被确认过。
+func (p *Pool) executeBackup(persistCtx, execCtx context.Context, op *domain.Operation) {
+	if p.backups == nil || !p.backups.Configured() {
+		p.finish(persistCtx, op, domain.StatusFailed, nil,
+			string(v1.CodeConfigInvalid), domain.MessageOf(errBackupUnsupported()))
+		return
+	}
+
+	logf := func(level, phase, message string, fields map[string]string) {
+		p.appendLog(persistCtx, op, nil, level, phase, message, fields)
+	}
+
+	var err error
+	switch op.Kind {
+	case v1.KindBackupRun:
+		var policy *domain.BackupPolicy
+		policy, err = p.backups.GetPolicy(execCtx, op.Resource)
+		if err == nil {
+			err = p.backups.ExecuteRun(execCtx, policy, op.ID, logf)
+		}
+	case v1.KindBackupVerify:
+		err = p.backups.ExecuteVerify(execCtx, op.Resource, logf)
+	case v1.KindBackupRestore:
+		var options RestoreOptions
+		options, err = DecodeRestoreOptions(op.Spec)
+		if err == nil {
+			err = p.backups.ExecuteRestore(execCtx, op.Resource, options.Mode, logf)
+		}
+	default:
+		// 创建侧已经限制了 kind；走到这里说明有人绕过 Service 直接写了库。
+		err = domain.NewError(v1.CodeInvalidRequest, "unsupported backup kind %q", op.Kind)
+	}
+
+	if err != nil {
+		code := string(domain.CodeOf(err))
+		message := domain.MessageOf(err)
+		status := domain.StatusFailed
+		if domain.CodeOf(err) == v1.CodeExecCancelled || errors.Is(err, context.Canceled) {
+			status = domain.StatusCancelled
+			code = string(v1.CodeExecCancelled)
+		}
+		p.appendLog(persistCtx, op, nil, "error", domain.PhaseExecute, "备份操作失败: "+message,
+			map[string]string{"errorCode": code})
+		p.finish(persistCtx, op, status, nil, code, message)
+		p.logger.Info("backup operation finished", "operationId", op.ID, "kind", op.Kind,
+			"status", string(status), "errorCode", code)
+		return
+	}
+
+	p.appendLog(persistCtx, op, nil, "info", domain.PhaseFinalize, "backup operation finished", map[string]string{
+		"status": string(domain.StatusSucceeded),
+	})
+	p.finish(persistCtx, op, domain.StatusSucceeded, nil, "", "")
+	p.logger.Info("backup operation finished", "operationId", op.ID, "kind", op.Kind, "status", "succeeded")
 }
 
 // resolveSecrets 在使用时刻把 SecretRef 解析成明文并合并进命令环境。返回值是

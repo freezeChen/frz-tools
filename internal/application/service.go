@@ -51,18 +51,20 @@ type Service struct {
 	cancels  *cancelRegistry
 	notify   func()
 	runtime  runtimeOperationResolver
+	backups  backupOperationResolver
 	newID    func() string
 	now      func() time.Time
 	logger   *slog.Logger
 }
 
-func newService(repo Repository, defaults Defaults, allow func(string) bool, cancels *cancelRegistry, runtime runtimeOperationResolver, newID func() string, logger *slog.Logger) *Service {
+func newService(repo Repository, defaults Defaults, allow func(string) bool, cancels *cancelRegistry, runtime runtimeOperationResolver, backups backupOperationResolver, newID func() string, logger *slog.Logger) *Service {
 	return &Service{
 		repo:     repo,
 		defaults: defaults,
 		allow:    allow,
 		cancels:  cancels,
 		runtime:  runtime,
+		backups:  backups,
 		newID:    newID,
 		now:      func() time.Time { return time.Now().UTC() },
 		logger:   logger,
@@ -125,6 +127,37 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		// 因此重试 runtime.start 用的是最新 manifest，而不是创建时的快照。
 		resource = resolved
 		specJSON = nil
+	} else if isBackupKind(req.Kind) {
+		if req.DryRun {
+			// 与 runtime.* 同样的理由：适配器端口没有 dry-run 语义。备份的预演请用
+			// `backup verify`；恢复的「预演」用隔离恢复（--mode isolated）。
+			return nil, false, domain.NewError(v1.CodeInvalidRequest,
+				"%s 不支持 dryRun：适配器端口没有 dry-run 语义，预演请用 backup verify 或 --mode isolated", req.Kind)
+		}
+		if s.backups == nil {
+			return nil, false, errBackupUnsupported()
+		}
+		resolved, err := s.backups.ResolveBackupOperation(ctx, req.Kind, req.Resource)
+		if err != nil {
+			return nil, false, err
+		}
+		resource = resolved
+		if req.Kind == v1.KindBackupRestore {
+			// 恢复的模式是**创建时**决定的，必须随操作一起存下来（见 RestoreOptions）。
+			options, err := DecodeRestoreOptions(req.Spec)
+			if err != nil {
+				return nil, false, err
+			}
+			// 原地恢复的显式确认在这里检查：让它在排队之后就失败，等于让运维
+			// 以为提交成功了，而恢复会覆盖真实数据。
+			if _, err := s.backups.PrepareRestore(ctx, resolved, options.Mode, options.Confirmed); err != nil {
+				return nil, false, err
+			}
+		} else {
+			// backup.run / backup.verify 执行时读「当前」的策略，与 runtime.* 读当前
+			// 规格一致：改了策略之后重试，用的是最新那份。
+			specJSON = nil
+		}
 	} else {
 		spec, err := BuildCommandSpec(req.Kind, req.Spec, s.defaults)
 		if err != nil {
@@ -170,6 +203,21 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 // isRuntimeKind 判定 kind 是否由运行时适配器执行（而不是本机执行器）。
 func isRuntimeKind(kind string) bool {
 	return kind == v1.KindRuntimeStart || kind == v1.KindRuntimeStop
+}
+
+// errBackupUnsupported 是「本部署没配备份能力」时的统一说法，与 runtime 的对应函数同形。
+func errBackupUnsupported() error {
+	return domain.NewError(v1.CodeConfigInvalid,
+		"本部署未配置备份存储根（backupStore.root），备份相关操作不可用")
+}
+
+// isBackupKind 判定 kind 是否是备份类操作。
+func isBackupKind(kind string) bool {
+	switch kind {
+	case v1.KindBackupRun, v1.KindBackupVerify, v1.KindBackupRestore:
+		return true
+	}
+	return false
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*domain.Operation, error) {

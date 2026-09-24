@@ -75,6 +75,7 @@ type Repository interface {
 	ListBackups(ctx context.Context, policyRef string, limit int) ([]domain.Backup, error)
 	FinishBackup(ctx context.Context, in domain.FinishBackupInput, now time.Time) (*domain.Backup, error)
 	MarkBackupVerified(ctx context.Context, id string, ok bool, now time.Time) error
+	FailStaleBackups(ctx context.Context, now time.Time) (int, error)
 }
 
 // Executor 是进程执行端口，由本机执行器适配器实现。
@@ -186,6 +187,16 @@ type RuntimeDecision struct {
 // 它不导出——除了 RuntimeService 没有别的实现者，调用方只通过 HTTP/CLI 使用。
 type runtimeOperationResolver interface {
 	ResolveRuntimeOperation(ctx context.Context, kind, appRef string) (string, error)
+}
+
+// backupOperationResolver 是 Service 与 BackupService 之间的内部接缝，与
+// runtimeOperationResolver 同形：把 kind 与引用解析成规范化的 Operation 资源。
+// 它不导出——除了 BackupService 没有别的实现者。
+type backupOperationResolver interface {
+	ResolveBackupOperation(ctx context.Context, kind, ref string) (string, error)
+	// PrepareRestore 在**创建期**校验一次恢复请求（含原地恢复的显式确认）。
+	// 让它在排队之后才失败，等于让运维以为提交成功了。
+	PrepareRestore(ctx context.Context, backupID string, mode domain.RestoreMode, confirmed bool) (*RestoreTarget, error)
 }
 
 type Defaults struct {

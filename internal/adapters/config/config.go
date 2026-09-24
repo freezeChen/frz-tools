@@ -32,6 +32,12 @@ const (
 	DefaultArtifactDirMode   = "0750"
 	DefaultMaxUploadBytes    = int64(2) << 30
 	DefaultArtifactQuotaByte = int64(20) << 30
+
+	// 备份存储的默认模式与配额。配额按规格决定 2 **独立计数**：物理上是同一块盘，
+	// 但备份天然比制品大得多，混在一个配额里会让「传制品」因为「备份占满」而失败。
+	DefaultBackupFileMode  = "0640"
+	DefaultBackupDirMode   = "0750"
+	DefaultBackupQuotaByte = int64(20) << 30
 )
 
 // maxMigrationSteps 防止迁移链配置错误导致死循环。
@@ -45,6 +51,7 @@ type Config struct {
 	Runtime       RuntimeConfig       `yaml:"runtime"`
 	Execution     ExecutionConfig     `yaml:"execution"`
 	ArtifactStore ArtifactStoreConfig `yaml:"artifactStore"`
+	BackupStore   BackupStoreConfig   `yaml:"backupStore"`
 	Secrets       SecretsConfig       `yaml:"secrets"`
 	Sudo          SudoConfig          `yaml:"sudo"`
 }
@@ -81,6 +88,19 @@ type ArtifactStoreConfig struct {
 	DirMode        string `yaml:"dirMode"`
 	MaxUploadBytes int64  `yaml:"maxUploadBytes"`
 	QuotaBytes     int64  `yaml:"quotaBytes"`
+}
+
+// BackupStoreConfig 为空（root 未设置）时表示不启用备份：相关端点返回 CONFIG_INVALID
+// 并说明缺失项，而不是让守护进程启动失败——与制品存储同样的取舍。
+//
+// 它的根**必须**与 artifactStore.root 分开：1a 的制品 GC 把「digest 不在 artifacts 表里」
+// 一律当作孤儿删除（internal/application/artifact.go 的 Collect），共用根会让
+// artifact gc 删掉**全部**备份（迭代 2 规格 D5）。这是一条防数据丢失的结构性要求。
+type BackupStoreConfig struct {
+	Root       string `yaml:"root"`
+	FileMode   string `yaml:"fileMode"`
+	DirMode    string `yaml:"dirMode"`
+	QuotaBytes int64  `yaml:"quotaBytes"`
 }
 
 type SecretsConfig struct {
@@ -213,6 +233,17 @@ func (c *Config) applyDefaults() {
 			c.ArtifactStore.QuotaBytes = DefaultArtifactQuotaByte
 		}
 	}
+	if c.BackupStoreEnabled() {
+		if c.BackupStore.FileMode == "" {
+			c.BackupStore.FileMode = DefaultBackupFileMode
+		}
+		if c.BackupStore.DirMode == "" {
+			c.BackupStore.DirMode = DefaultBackupDirMode
+		}
+		if c.BackupStore.QuotaBytes == 0 {
+			c.BackupStore.QuotaBytes = DefaultBackupQuotaByte
+		}
+	}
 }
 
 func (c *Config) Validate() error {
@@ -308,6 +339,16 @@ func (c *Config) ArtifactFileMode() (os.FileMode, error) {
 
 func (c *Config) ArtifactDirMode() (os.FileMode, error) {
 	return parseOctalMode("artifactStore.dirMode", c.ArtifactStore.DirMode)
+}
+
+func (c *Config) BackupStoreEnabled() bool { return c.BackupStore.Root != "" }
+
+func (c *Config) BackupFileMode() (os.FileMode, error) {
+	return parseOctalMode("backupStore.fileMode", c.BackupStore.FileMode)
+}
+
+func (c *Config) BackupDirMode() (os.FileMode, error) {
+	return parseOctalMode("backupStore.dirMode", c.BackupStore.DirMode)
 }
 
 func (c *Config) SocketFileMode() (os.FileMode, error) {

@@ -149,6 +149,17 @@ func (s *Store) FinishBackup(ctx context.Context, in domain.FinishBackupInput, n
 	}
 	defer tx.Rollback()
 
+	// 审计事件的 operation_id 有指向 operations(id) 的外键，因此这里要填**发起这次备份
+	// 的那个 Operation**，而不是备份自己的 ID。备份 ID 进 details，两个方向都可查。
+	var operationID sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT operation_id FROM backups WHERE id = ?`, in.BackupID).Scan(&operationID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.NewError(v1.CodeBackupNotFound, "备份 %q 不存在", in.BackupID)
+		}
+		return nil, err
+	}
+
 	res, err := tx.ExecContext(ctx, `
 		UPDATE backups SET
 			status = ?, storage_digest = ?, logical_bytes = ?, stored_bytes = ?, compression = ?,
@@ -172,12 +183,18 @@ func (s *Store) FinishBackup(ctx context.Context, in domain.FinishBackupInput, n
 		return s.GetBackup(ctx, in.BackupID)
 	}
 
+	// errorDetail 在没有错误码时返回 nil（成功路径就是这种），直接赋值会 panic。
+	details := errorDetail(in.ErrorCode)
+	if details == nil {
+		details = map[string]string{}
+	}
+	details["backupId"] = in.BackupID
 	if err := insertAudit(ctx, tx, domain.AuditEvent{
 		EventType:   backupEventType(in.Status),
-		OperationID: in.BackupID,
+		OperationID: operationID.String,
 		Result:      string(in.Status),
 		Time:        now,
-		Details:     errorDetail(in.ErrorCode),
+		Details:     details,
 	}); err != nil {
 		return nil, err
 	}
@@ -231,6 +248,26 @@ func (s *Store) ListBackups(ctx context.Context, policyRef string, limit int) ([
 		out = append(out, *backup)
 	}
 	return out, rows.Err()
+}
+
+// FailStaleBackups 把上一个守护进程实例遗留的 running/pending 备份标记为失败。
+//
+// 没有这一步的话，被杀死的那次备份会永远停在 running——它不会被当成有效备份
+// （Usable 要求 succeeded），但会一直挂在列表里，让运维分不清「在跑」还是「早就死了」。
+func (s *Store) FailStaleBackups(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE backups SET status = ?, error_code = ?, error_message = ?, finished_at = ?
+		WHERE status IN ('pending', 'running')`,
+		string(domain.BackupFailed), string(v1.CodeDaemonRestarted),
+		"daemon restarted while the backup was running", formatTime(now))
+	if err != nil {
+		return 0, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
 }
 
 // MarkBackupVerified 记录一次校验的结果。校验**不通过**也要落库：

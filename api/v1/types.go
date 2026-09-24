@@ -14,6 +14,12 @@ const (
 	// 日志、取消与重试，因此「启动一个应用」在查询与排查上和「跑一条命令」完全一致。
 	KindRuntimeStart = "runtime.start"
 	KindRuntimeStop  = "runtime.stop"
+
+	// 备份类操作。它们与 runtime.* 走同一条创建路径，因此锁、幂等键、请求摘要、
+	// 审计、日志、取消、重试与查询全部复用既有机制，没有第二条旁路。
+	KindBackupRun     = "backup.run"
+	KindBackupVerify  = "backup.verify"
+	KindBackupRestore = "backup.restore"
 )
 
 type CreateOperationRequest struct {

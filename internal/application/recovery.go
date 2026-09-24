@@ -47,5 +47,14 @@ func Recover(ctx context.Context, repo Repository, logger *slog.Logger, now time
 	if len(recovered) > 0 {
 		logger.Warn("recovered operations interrupted by a previous daemon run", "count", len(recovered))
 	}
+
+	// 备份记录也要收尾：被杀死的那次备份会永远停在 running，让运维分不清
+	// 「在跑」还是「早就死了」。它本来就不会被当成有效备份（Usable 要求 succeeded），
+	// 但挂着不动同样有害。
+	if stale, err := repo.FailStaleBackups(ctx, now); err != nil {
+		return len(recovered), err
+	} else if stale > 0 {
+		logger.Warn("marked backups interrupted by a previous daemon run as failed", "count", stale)
+	}
 	return len(recovered), nil
 }

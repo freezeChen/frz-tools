@@ -13,6 +13,7 @@ import (
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/backup/files"
 	"github.com/freezeChen/frz-tools/internal/adapters/blob"
 	"github.com/freezeChen/frz-tools/internal/adapters/config"
 	"github.com/freezeChen/frz-tools/internal/adapters/executor"
@@ -97,6 +98,13 @@ func run(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	// 备份用的是**独立的**存储根：1a 的制品 GC 把「digest 不在 artifacts 表里」一律
+	// 当作孤儿删除，共用根会让 artifact gc 删掉全部备份（迭代 2 规格 D5）。
+	backupStore, err := openBackupStore(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+
 	// 运行时适配器的平台选择只有这一处：Linux 上真的装配 systemd 适配器，其它平台
 	// 刻意不注入——runtime.* 于是返回 RUNTIME_UNSUPPORTED，而不是让一个假适配器在生产
 	// 里假装能用（也不引入让生产误选假适配器的配置开关）。secretResolver 两个用途
@@ -120,6 +128,8 @@ func run(cmd *cobra.Command, _ []string) error {
 		Executor:        exec,
 		Secrets:         secretResolver,
 		Store:           artifactStore,
+		BackupStore:     backupStore,
+		BackupAdapters:  []application.BackupAdapter{files.New()},
 		RuntimeAdapter:  runtimeAdapter,
 		PrepareReporter: prepareReporter,
 		AllowExecutable: cfg.ExecutableAllowed,
@@ -218,13 +228,58 @@ func openArtifactStore(ctx context.Context, cfg *config.Config, logger *slog.Log
 	}, nil
 }
 
+// openBackupStore 打开备份存储。未配置 backupStore.root 时返回 nil：
+// 备份相关端点会明确拒绝（CONFIG_INVALID），而不是让守护进程启动失败。
+func openBackupStore(ctx context.Context, cfg *config.Config, logger *slog.Logger) (application.StorageBackend, error) {
+	if !cfg.BackupStoreEnabled() {
+		logger.Info("backup store is disabled", "reason", "backupStore.root is not configured")
+		return nil, nil
+	}
+
+	fileMode, err := cfg.BackupFileMode()
+	if err != nil {
+		return nil, domain.NewError(v1.CodeConfigInvalid, "%v", err)
+	}
+	dirMode, err := cfg.BackupDirMode()
+	if err != nil {
+		return nil, domain.NewError(v1.CodeConfigInvalid, "%v", err)
+	}
+
+	local, err := blob.NewLocal(cfg.BackupStore.Root, fileMode, dirMode)
+	if err != nil {
+		return nil, err
+	}
+
+	// 上一次运行留下的半截备份要清掉，否则它们会一直占着盘。
+	removed, err := local.CleanupTemp(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if removed > 0 {
+		logger.Warn("removed stale backup uploads left by a previous run", "count", removed)
+	}
+
+	logger.Info("backup store ready",
+		"root", cfg.BackupStore.Root,
+		"fileMode", fmt.Sprintf("%04o", fileMode),
+		"quotaBytes", cfg.BackupStore.QuotaBytes,
+	)
+	return local, nil
+}
+
 func prepareDirectories(cfg *config.Config) error {
 	for _, dir := range []string{
 		filepath.Dir(cfg.Socket.Path),
 		filepath.Dir(cfg.Database.Path),
 		cfg.Runtime.WorkDirectory,
 		cfg.Runtime.LogDirectory,
+		cfg.BackupStore.Root,
 	} {
+		// 跳过未配置的项：backupStore.root 之类是可选的，空串会让 MkdirAll 直接失败，
+		// 从而把一个「功能没启用」变成「守护进程起不来」。
+		if dir == "" {
+			continue
+		}
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return domain.NewError(v1.CodeConfigInvalid, "无法创建目录 %q: %v", dir, err)
 		}

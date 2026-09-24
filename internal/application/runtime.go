@@ -14,6 +14,13 @@ type Options struct {
 	Secrets  SecretResolver
 	Store    StorageBackend
 
+	// BackupStore 是**独立**于制品的备份存储根。它必须是独立的一份：1a 的制品 GC
+	// 把「digest 不在 artifacts 表里」一律当作孤儿删除，共用根会让 artifact gc
+	// 删掉全部备份（迭代 2 规格 D5）。
+	BackupStore StorageBackend
+	// BackupAdapters 是已注册的备份适配器。2a 只有 files。
+	BackupAdapters []BackupAdapter
+
 	// RuntimeAdapter 是运行时适配器（systemd / proc）。非 Linux 上装配层刻意不注入：
 	// runtime.* 于是给出 RUNTIME_UNSUPPORTED，而不是让一个假适配器在生产里假装能用。
 	RuntimeAdapter RuntimeAdapter
@@ -48,6 +55,7 @@ type Runtime struct {
 	Runtimes  *RuntimeService
 	Schedules *ScheduleService
 	Scheduler *Scheduler
+	Backups   *BackupService
 	Pool      *Pool
 }
 
@@ -61,8 +69,10 @@ func NewRuntime(opts Options) *Runtime {
 	// 建两份会让同一次 runtime.start 里的探测结果互相不可见。
 	runtimes := newRuntimeService(opts.Repo, opts.RuntimeAdapter, opts.PrepareReporter)
 
+	backups := newBackupService(opts.Repo, opts.BackupStore, opts.Secrets, opts.BackupAdapters, idGen, opts.Now, opts.Logger)
+
 	cancels := newCancelRegistry()
-	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, opts.Workers, opts.Logger, idGen)
+	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, backups, opts.Workers, opts.Logger, idGen)
 	if opts.Idle > 0 {
 		pool.idle = opts.Idle
 	}
@@ -73,7 +83,7 @@ func NewRuntime(opts Options) *Runtime {
 		pool.jitter = opts.Jitter
 	}
 
-	service := newService(opts.Repo, opts.Defaults, opts.AllowExecutable, cancels, runtimes, func() string {
+	service := newService(opts.Repo, opts.Defaults, opts.AllowExecutable, cancels, runtimes, backups, func() string {
 		return idGen("op")
 	}, opts.Logger)
 	if opts.Now != nil {
@@ -105,6 +115,7 @@ func NewRuntime(opts Options) *Runtime {
 		Hosts:     hosts,
 		Runtimes:  runtimes,
 		Schedules: schedules,
+		Backups:   backups,
 		Scheduler: scheduler,
 		Pool:      pool,
 	}
