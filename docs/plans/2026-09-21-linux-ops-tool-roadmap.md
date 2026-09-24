@@ -690,3 +690,23 @@
 - **仍未验证**：`legacy` 档（systemd 219–239）、**reboot 后的 unit 持久化**（本轮没有重启
   那台生产机）、sudoers/PAM 实际策略、真实生产库与大库的备份、GTID 开启的 MySQL 8、
   `prune`（2d 未实现）。
+
+### 2026-09-24（补记七）重启验证：unit 持久化与 self-healing
+
+- **变更原因**：补记六里记着「reboot 后的 unit 持久化」仍未验证（需要重启那台生产机）。
+  用户随后单独授权重启，本轮补上。
+- **做法**：`test/host/verify.sh` 增加三个阶段 `prepare` / `check` / `cleanup`
+  （`FRZ_HOST_PHASE`）。分段是必需的——跨重启存活的那个状态正是要留下的东西，
+  一次跑完的 `full` 模式会把它删掉。
+- **重启事实**：发起 14:57:56，SSH 恢复 14:58:40（停机约 **44 秒**）；`boot_id`
+  `3ac249b2…` → `4146571f…`——**两个值不同，才是「真的重启过」的硬证据**。
+  9 个业务容器（全部 `RestartPolicy=always`）在恢复连接时已经全部回来。
+- **证据**：重启后 **21 项通过 / 0 项失败**。要点：opsd 与托管应用的 unit 都 enabled 且
+  **自动**回到 active；**`/run/opsd` 由 systemd 重新创建**（`RuntimeDirectory=opsd`，
+  `/run` 是 tmpfs 这件事在容器里被 `install -d` 掩盖）；磁盘上的模式/属主/凭据副本一字未变；
+  **重启前创建的 Operation 重启后仍可查且终态仍是 succeeded**（任务引擎状态是持久的）；
+  **重启后凭据仍逐字节到达进程**（探针开机重跑）。
+- **仍未验证**：`legacy` 档（systemd 219–239，本机 systemd 257 证明不了）、
+  sudoers/PAM 实际策略、AppArmor、**重启后再跑一次数据库备份闭环**
+  （重启后跑的是 runtime 那一组断言）、真实生产库与大库的备份、GTID 开启的 MySQL 8、
+  `prune`（2d 未实现）。

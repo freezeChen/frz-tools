@@ -1184,10 +1184,40 @@ opsd 本身在这轮里**以 systemd 服务运行**（harness 写一个测试用
    内部也在用（启动超时判定），但 **CLI 与 HTTP API 都只有 `health`**——运维问不出
    「进程活着但没就绪」这个状态，而端口注释里恰恰写着这两者「刻意不合并」。记为待定。
 
-### 仍未验证（本轮**没有**触碰的两项）
+### 重启验证 2026-09-24（同一台机，经用户授权）
+
+用户单独授权重启后做了这一轮。它补上的是从本节第 14 节起一直挂着的**「reboot 后的 unit
+持久化」**——在此之前 `systemctl is-enabled` 只能证明「配置上是持久的」。
+
+harness 因此分了三段：`FRZ_HOST_PHASE=prepare`（建状态并启动，**不清场**）→ 重启 → `check`
+（重启后接着断言，跑完再删干净）。分段是必需的：跨重启存活的那个状态正是要留下的东西。
+
+**重启事实**：发起 14:57:56，SSH 恢复 14:58:40（停机约 **44 秒**）；`boot_id`
+`3ac249b2…` → `4146571f…`（**这两个值不同，是「真的重启过」的硬证据**，而不是在检查一台
+没重启的机器）；开机的 9 个业务容器（全部 `RestartPolicy=always`）在恢复连接时已经全部回来。
+
+**重启后 21 项通过 / 0 项失败**：
+
+| 断言 | 结果 |
+| --- | --- |
+| `boot_id` 变了、系统运行时长只有 20 秒 | PASS |
+| `frz-opsd-verify.service` 仍 enabled，且**自动**回到 active | PASS |
+| **`/run/opsd` 被 systemd 重新创建（模式 750）、socket 重新出现（0660）** | PASS |
+| opsd 能应答 | PASS |
+| `frz-probe.service` 仍 enabled，且**自动**回到 active、health 就绪 | PASS |
+| 托管进程仍以 `frz-probe` 运行（SELinux 上下文仍是 `unconfined_service_t`） | PASS |
+| unit 文件、`/etc/opsd` 的 0751、配置 600、凭据 600 与凭据副本逐字节一致，全部保留 | PASS |
+| **重启前创建的 Operation 重启后仍可查且终态仍是 `succeeded`**（任务引擎状态是持久的） | PASS |
+| **重启后凭据仍逐字节到达进程**（探针开机重跑，报告是新的） | PASS |
+| 主机上 9 个业务容器都回来了 | PASS |
+
+其中「`/run/opsd` 被重新创建」这一条尤其值得记：`/run` 是 tmpfs、开机即空，socket 的父目录
+**必须**由 systemd 在每次启动时建（harness 用的是 `RuntimeDirectory=opsd`）。这正是容器 harness
+里被 `install -d` 掩盖、只有真实重启才验证得了的那一点。
+
+### 仍未验证
 
 - **`legacy` 档（systemd 219–239）**：本机 systemd 257 比容器里的 255 还新，仍然证明不了它。
   这一档继续标注**未验证**，不得声称「已支持」。
-- **reboot 后的 unit 持久化**：需要重启这台生产机（上面跑着 MES），本轮**没有**重启。
-  `systemctl is-enabled` 与 unit 文件的持久化位置只能证明「配置上是持久的」，不能替代
-  一次真实重启。AppArmor（RHEL 系没有）与 sudoers/PAM 实际策略同样仍未验证。
+- AppArmor（RHEL 系没有）与 sudoers/PAM 的**实际策略**仍未验证（`SudoConfig` 至今只有模型、
+  零行为）。

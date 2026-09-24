@@ -129,7 +129,7 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」；不要引用静态推导值或历史快照当结论。
 - **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、
-  **reboot 后的 unit 持久化**（真机验证时没有重启那台生产机）、sudoers/PAM 实际策略、
+  sudoers/PAM 实际策略、
   `SudoConfig`（只有模型、零行为）、`prune`（2d 未实现）、真实生产库与大库的备份、
   GTID 开启的 MySQL 8、大容量长时间备份。
   SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
@@ -137,6 +137,9 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
 - **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
   因此不进 CI）。2026-09-24 在 Rocky Linux 10.2 / systemd 257 / SELinux enforcing 上
   实跑 **93 项通过 / 0 项失败**（1c 的 71 项 + 2b 的 22 项），跑完自动清理。
+  **重启验证**另做了一轮（停机 44 秒、`boot_id` 前后不同、重启后 **21 项通过 / 0 项失败**），
+  用 `FRZ_HOST_PHASE=prepare` → 重启 → `FRZ_HOST_PHASE=check`；`check` 阶段**不重新上传**，
+  否则会把跨重启状态的记录冲掉。
 - 备份适配器的真实实例验证用 `make verify-db`（`test/linux/verify-db.sh` + `test/dbbackup`，
   由 `FRZ_TEST_*_DSN` 控制，未设置时跳过）。它跑的是 `internal/application/backupcontract`
   的共享合约——**新增任何 `BackupAdapter` 实现都必须过同一套**。

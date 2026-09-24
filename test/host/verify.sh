@@ -23,7 +23,14 @@
 #   · 迭代 0/1b/1d/2a 的多数用例（执行器、调度器、重试、备份）：同上，与发行版无关。
 #   本脚本覆盖的是上面那四类容器给不了的证据，外加「同一套 unit 语义在真机上是否还成立」。
 #
-# 结束时会把本轮创建的一切**删干净**（用户、组、unit、目录、数据库），并逐项报告；
+# 三个阶段（FRZ_HOST_PHASE）：
+#   full（默认）  完整跑一遍：建状态 → 断言 → 删干净
+#   prepare      只建状态并启动，**不清场**——留下的东西正是要跨重启存活的
+#   check        重启后接着断言：真的重启了吗、服务自动起来了吗、磁盘上的状态还在吗，
+#                跑完再删干净
+#   cleanup      只做收尾（跑到一半被打断时用）
+#
+# 结束时会把本轮创建的一切**删干净**（用户、组、unit、目录），并逐项报告；
 # 设置 FRZ_HOST_KEEP=1 可以保留现场用于排查。
 
 set -euo pipefail
@@ -42,6 +49,7 @@ OPSD_UNIT=frz-opsd-verify.service
 OPSCTL="$FRZ_HOST_DIR/bin/opsctl"
 OPSD="$FRZ_HOST_DIR/bin/opsd"
 
+START_OP_ID=""
 PASS_COUNT=0
 FAIL_COUNT=0
 FINDINGS=()
@@ -226,11 +234,15 @@ WantedBy=multi-user.target
 UNIT
 
   require_ok "daemon-reload" systemctl daemon-reload
+  # enable 是**部署的一部分**：不 enable，重启后 opsd 不会自己起来，
+  # 而「重启后还在不在」正是这一轮要验证的东西。
+  require_ok "enable $OPSD_UNIT（开机会起）" systemctl enable "$OPSD_UNIT"
   require_ok "启动 $OPSD_UNIT" systemctl start "$OPSD_UNIT"
   wait_for_socket
   pass "socket 已创建：/run/opsd/opsd.sock"
 
   assert_eq "$OPSD_UNIT 服务状态" "active" "$(systemctl is-active "$OPSD_UNIT" 2>/dev/null)"
+  assert_eq "$OPSD_UNIT 开机自启" "enabled" "$(systemctl is-enabled "$OPSD_UNIT" 2>/dev/null)"
   assert_eq "RuntimeDirectory 建出的 /run/opsd 模式" "750" "$(mode_of /run/opsd)"
   # 属主是**服务的运行用户**（这里 opsd 以 root 运行，因为 RuntimeAdapter 要
   # useradd/chown/systemctl），因此是 root:root——不是 frz-ops。
@@ -422,6 +434,7 @@ check_lifecycle() {
     fail "runtime start 没有返回 Operation：${started}"
     return 0
   fi
+  START_OP_ID="$op_id"
   pass "runtime start 走 Operation（$op_id）"
   if wait_for_status "$op_id" succeeded; then
     pass "start 操作的终态为 succeeded"
@@ -683,6 +696,111 @@ POLICY
   fi
 }
 
+# ==== 重启验证：记录重启前的主机身份 ====
+record_boot_identity() {
+  log "记录重启前的主机身份（用来证明真的重启过，而不是在检查一台没重启的机器）"
+  # CLI 没有 operation list，因此 start 操作的 ID 由 check_lifecycle 记在变量里。
+  local start_op=${START_OP_ID:-}
+  {
+    printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id)"
+    printf 'boot_time=%s\n' "$(uptime -s)"
+    printf 'recorded_at=%s\n' "$(date -Is)"
+    printf 'start_op=%s\n' "$start_op"
+  } > "$FRZ_HOST_DIR/boot-before.txt"
+  sed 's/^/      /' "$FRZ_HOST_DIR/boot-before.txt"
+  pass "已记录重启前的 boot_id、开机时刻与 start 操作的 ID"
+}
+
+# ==== 重启验证：重启之后的断言 ====
+check_post_reboot() {
+  log "重启后：证明真的重启过"
+
+  local before_id after_id before_time upsec
+  before_id=$(sed -n 's/^boot_id=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  after_id=$(cat /proc/sys/kernel/random/boot_id)
+  before_time=$(sed -n 's/^boot_time=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  if [ -n "$before_id" ] && [ "$before_id" != "$after_id" ]; then
+    pass "boot_id 变了：确实重启过（${before_id:0:8}… → ${after_id:0:8}…）"
+  else
+    fail "boot_id 没变（${before_id:0:8}…）：这台机没有重启，后面的断言证明不了任何事"
+  fi
+  printf '      重启前的开机时刻: %s\n' "$before_time"
+  printf '      当前开机时刻    : %s\n' "$(uptime -s)"
+  printf '      当前运行时长    : %s\n' "$(uptime -p)"
+  upsec=$(cut -d. -f1 /proc/uptime)
+  if [ "$upsec" -lt 3600 ]; then
+    pass "系统运行时长 ${upsec}s，符合「刚重启」"
+  else
+    fail "系统已运行 ${upsec}s，不像刚重启过"
+  fi
+
+  log "重启后：opsd 作为系统服务自己起来了（/run 是 tmpfs，socket 目录要能重建）"
+  assert_eq "$OPSD_UNIT 开机自启" "enabled" "$(systemctl is-enabled "$OPSD_UNIT" 2>/dev/null)"
+  assert_eq "$OPSD_UNIT 重启后的状态" "active" "$(systemctl is-active "$OPSD_UNIT" 2>/dev/null)"
+  require_ok "socket 被重新创建" test -S /run/opsd/opsd.sock
+  assert_eq "/run/opsd 模式（RuntimeDirectory 重建）" "750" "$(mode_of /run/opsd)"
+  assert_eq "socket 模式（重建后一致）" "660" "$(mode_of /run/opsd/opsd.sock)"
+  require_ok "opsd 能应答" opsctl health
+
+  log "重启后：托管的应用自己起来了（靠 enabled + WantedBy=multi-user.target）"
+  assert_eq "$RUNTIME_UNIT 开机自启" "enabled" "$(systemctl is-enabled "$RUNTIME_UNIT" 2>/dev/null)"
+  assert_eq "$RUNTIME_UNIT 重启后的状态" "active" "$(systemctl is-active "$RUNTIME_UNIT" 2>/dev/null)"
+  if wait_for_ready; then
+    pass "runtime health 就绪（重启后自己起回了就绪态）"
+  else
+    fail "重启后 runtime health 未就绪"
+    journalctl -u "$RUNTIME_UNIT" -n 20 --no-pager >&2 || true
+  fi
+  local main_pid ctx
+  main_pid=$(systemctl show "$RUNTIME_UNIT" -p MainPID --value 2>/dev/null)
+  if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
+    assert_eq "托管进程的运行用户（重启后）" "$RUNTIME_USER" "$(ps -o user= -p "$main_pid" 2>/dev/null | tr -d ' ')"
+    ctx=$(tr -d '\0' < "/proc/$main_pid/attr/current" 2>/dev/null || printf '<不可读>')
+    printf '      重启后托管进程的 SELinux 上下文: %s\n' "$ctx"
+  else
+    fail "重启后拿不到 unit 的 MainPID"
+  fi
+
+  log "重启后：磁盘上的状态没有被冲掉"
+  assert_eq "unit 文件仍在" "yes" "$([ -f "/etc/systemd/system/$RUNTIME_UNIT" ] && printf yes || printf no)"
+  assert_eq "/etc/opsd 模式（Prepare 补的穿越位应当保留）" "751" "$(mode_of /etc/opsd)"
+  assert_eq "/etc/opsd/config.yaml 模式" "600" "$(mode_of /etc/opsd/config.yaml)"
+  assert_eq "凭据文件模式" "600" "$(mode_of /etc/opsd/secrets/probe-file)"
+  assert_eq "凭据副本仍逐字节一致" "yes" \
+    "$(cmp -s /etc/opsd/secrets/probe-file "${PROBE_DIR}.secrets/PROBE_FILE" && printf yes || printf no)"
+  assert_eq "opsd 的数据库文件仍在" "yes" "$([ -f /var/lib/opsd/opsd.db ] && printf yes || printf no)"
+
+  # 重启前创建的 Operation 重启后仍可查、终态未变：证明任务引擎的状态是持久的。
+  local start_op
+  start_op=$(sed -n 's/^start_op=//p' "$FRZ_HOST_DIR/boot-before.txt")
+  if [ -n "$start_op" ]; then
+    assert_eq "重启前创建的 Operation 仍可查且终态为 succeeded" "succeeded" \
+      "$(q operation get "$start_op" --json | sed -n 's/.*"status": *"\([^"]*\)".*/\1/p')"
+  fi
+
+  # 凭据在重启后仍然逐字节到达进程：探针在开机时重新跑过一遍，报告是新的。
+  local report="/var/lib/$RUNTIME_APP/probe-report.txt"
+  if [ -f "$report" ]; then
+    local expected_len expected_hash
+    expected_len=${#PROBE_ENV_VALUE}
+    expected_hash=$(printf '%s' "$PROBE_ENV_VALUE" | sha256sum | cut -d' ' -f1)
+    assert_eq "重启后 kind=env 凭据的长度与摘要" "$expected_len $expected_hash" \
+      "$(sed -n 's/^env:PROBE_ENV len=\([0-9]*\) sha256=\(.*\)$/\1 \2/p' "$report")"
+  else
+    fail "重启后探针没有写出报告——托管应用其实没起来"
+  fi
+
+  log "重启后：主机上的业务没有被牵连"
+  local running
+  running=$(docker ps -q | wc -l | tr -d ' ')
+  printf '      当前在跑的容器数: %s\n' "$running"
+  if [ "$running" -ge 9 ]; then
+    pass "业务容器都回来了（${running} 个）"
+  else
+    fail "业务容器只有 ${running} 个（重启前是 9 个）"
+  fi
+}
+
 report() {
   printf '\n--- 观察到的、不属于断言结果的部署事实\n'
   if [ "${#FINDINGS[@]}" -eq 0 ]; then
@@ -695,17 +813,47 @@ report() {
 }
 
 main() {
-  trap cleanup EXIT
-  env_facts
-  check_preconditions
-  provision
-  check_install_state
-  install_opsd_unit
-  check_prepare
-  check_lifecycle
-  check_stop
-  check_database
-  report
+  case "${FRZ_HOST_PHASE:-full}" in
+    cleanup)
+      # 单独一个收尾入口：跑到一半被打断时，「怎么清干净」必须有一条命令，
+      # 而不是去读脚本里那段 trap。
+      cleanup
+      ;;
+    prepare)
+      # 不清场：这一阶段留下的东西正是要跨重启存活的那个状态。
+      env_facts
+      check_preconditions
+      provision
+      check_install_state
+      install_opsd_unit
+      check_prepare
+      check_lifecycle
+      record_boot_identity
+      printf '\n--- 重启前的一切就绪\n'
+      printf '接下来重启这台机，然后跑：FRZ_HOST_PHASE=check bash test/host/run.sh\n'
+      printf '%d 项通过，%d 项失败\n' "$PASS_COUNT" "$FAIL_COUNT"
+      [ "$FAIL_COUNT" -eq 0 ]
+      ;;
+    check)
+      trap cleanup EXIT
+      env_facts
+      check_post_reboot
+      report
+      ;;
+    *)
+      trap cleanup EXIT
+      env_facts
+      check_preconditions
+      provision
+      check_install_state
+      install_opsd_unit
+      check_prepare
+      check_lifecycle
+      check_stop
+      check_database
+      report
+      ;;
+  esac
 }
 
 main "$@"

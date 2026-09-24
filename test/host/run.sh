@@ -30,6 +30,16 @@ WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 mkdir -p "$WORK_DIR/bin"
 
+# check 阶段不需要重新上传：断言要看的正是**留在主机上**的那份状态
+# （包括 prepare 阶段写下的 boot-before.txt），重传会把记录冲掉。
+if [ "${FRZ_HOST_PHASE:-full}" = "check" ]; then
+  log "check 阶段：跳过编译与上传，直接跑重启后的断言"
+  ssh -o BatchMode=yes "$FRZ_HOST" \
+    env FRZ_HOST_DIR="$FRZ_HOST_DIR" FRZ_HOST_PHASE=check \
+    bash -s < "$REPO_ROOT/test/host/verify.sh"
+  exit $?
+fi
+
 log "交叉编译 linux/amd64 的 opsd / opsctl / 探针"
 for target in "opsd:./cmd/opsd" "opsctl:./cmd/opsctl" "frz-probe:./test/linux/probe"; do
   name=${target%%:*}
@@ -55,7 +65,7 @@ log "在主机上执行断言（证据类型：Linux 主机）"
 set +e
 ssh -o BatchMode=yes "$FRZ_HOST" \
   env FRZ_HOST_DIR="$FRZ_HOST_DIR" FRZ_HOST_KEEP="$FRZ_HOST_KEEP" FRZ_PROBE_PORT="$FRZ_PROBE_PORT" \
-  FRZ_HOST_MYSQL_DSN="${FRZ_HOST_MYSQL_DSN:-}" \
+  FRZ_HOST_MYSQL_DSN="${FRZ_HOST_MYSQL_DSN:-}" FRZ_HOST_PHASE="${FRZ_HOST_PHASE:-full}" \
   bash -s < "$REPO_ROOT/test/host/verify.sh"
 status=$?
 set -e

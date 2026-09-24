@@ -133,13 +133,18 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 **不是**容器验证。
 
 **边界没有变**：以上都是「**Linux 容器**」证据（Ubuntu 24.04 / systemd 255），
-**不等于「Linux 主机」**——reboot 后的 unit 持久化、sudoers/PAM，以及 `legacy` 档
-（systemd 219–239，容器只有 255）都仍是**未验证**。
+**不等于「Linux 主机」**——sudoers/PAM 实际策略与 `legacy` 档（systemd 219–239，
+容器只有 255）都仍是**未验证**。
 
 `make verify-host`（`test/host/run.sh` + `test/host/verify.sh`）是**第一类「Linux 主机」证据**：
 在一台真实主机（2026-09-24：**Rocky Linux 10.2 / 内核 6.12 / systemd 257 / SELinux Enforcing** /
 x86_64）上把 opsd 装成 systemd 服务、跑完 RuntimeAdapter 的生命周期与真实的 MySQL 8.4 备份闭环，
 实跑 **93 项通过 / 0 项失败**（1c 的 71 项 + 2b 的 22 项），结束时把主机上创建的一切删干净。
+**重启验证也做了**（用户单独授权重启那台机）：停机 44 秒、`boot_id` 前后不同（这是「真的
+重启过」的硬证据）、重启后 **21 项通过 / 0 项失败**——两个 unit 都 enabled 且自动回到 active、
+**`/run/opsd` 由 systemd 重新创建**（`/run` 是 tmpfs，容器里被 `install -d` 掩盖的那一点）、
+磁盘上的模式与凭据副本一字未变、**重启前创建的 Operation 仍可查且终态仍是 succeeded**、
+凭据仍逐字节到达进程。harness 因此有三个阶段（`FRZ_HOST_PHASE=prepare|check|cleanup`）。
 它**不进 CI**（需要一个能 ssh 的目标主机），细节见 `docs/plans/2026-09-21-iteration-1c.md` 第 18 节
 与 `iteration-2.md` 第 21 节。三条真机才暴露得出的事实：**SELinux enforcing 下 opsd 与托管进程
 都落在 `unconfined_service_t`——本工具不提供 SELinux 加固，这一条是「未实现」而不是「已支持」**；
@@ -186,8 +191,9 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 - 每个迭代的验收标准必须给出「命令 / 结果 / 证据类型」。
 - 证据类型必须显式区分：静态检查、单元测试、集成测试、**Linux 容器**、**Linux 主机**、真实服务。
 - 「Linux 容器」与「Linux 主机」是两类不同证据，不得混用。容器只验证内核级语义（文件模式、
-  Unix Socket ACL、用户/属组、`runuser` 行为）；**真实 reboot 后的 unit 持久化**与
-  **sudoers/PAM 实际策略**仍需 Linux 主机验证——到 2026-09-24 为止这两项**仍未验证**。
+  Unix Socket ACL、用户/属组、`runuser` 行为）；**sudoers/PAM 实际策略**仍需 Linux 主机验证，
+  到 2026-09-24 为止**仍未验证**。**reboot 后的 unit 持久化已于 2026-09-24 在真实主机上验证**
+  （见上），引用它时必须带主机与 systemd 版本（Rocky Linux 10.2 / systemd 257）。
 - SELinux 的措辞必须精确：enforcing 下的实际行为**已观测**（进程落在 `unconfined_service_t`，
   本工具不安装策略模块），因此只能说「能装能跑、**不提供** SELinux 加固」，
   不得写成「已支持 SELinux」或「SELinux 已加固」。AppArmor 未在 RHEL 系上存在，仍未验证。
