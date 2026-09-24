@@ -80,7 +80,16 @@ type Repository interface {
 
 // Executor 是进程执行端口，由本机执行器适配器实现。
 type Executor interface {
+	// Run 执行命令并把 stdout 收进**有上限的内存缓冲**。超过上限的部分会被丢弃，
+	// 因此它只适合输出不大的命令。
 	Run(ctx context.Context, spec domain.CommandSpec) (domain.Result, error)
+
+	// RunStream 与 Run 的语义完全一致（argv-only、allowedPaths 校验、超时、取消、
+	// 同一套错误码），差别只在 stdout 与 stdin 是调用方给的流。
+	//
+	// 数据库备份适配器依赖它：一次 pg_dump 的输出可能远大于任何内存缓冲，用 Run
+	// 跑会得到一份**记录为成功、内容却残缺**的备份。in / out 为 nil 表示不接。
+	RunStream(ctx context.Context, spec domain.CommandSpec, in io.Reader, out io.Writer) (domain.Result, error)
 }
 
 // StorageBackend 是制品内容存储端口。它只接受 digest，不接受调用方提供的文件名，

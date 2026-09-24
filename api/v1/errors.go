@@ -49,6 +49,10 @@ const (
 	CodeBackupRestoreUnconfirmed ErrorCode = "BACKUP_RESTORE_UNCONFIRMED"
 	CodeBackupInUse              ErrorCode = "BACKUP_IN_USE"
 	CodeBackupKeyUnresolved      ErrorCode = "BACKUP_KEY_UNRESOLVED"
+	// CodeBackupRestoreFailed 是恢复**执行**失败。它与 EXEC_EXIT_NONZERO 刻意分开：
+	// 后者说「一条命令跑失败了」，前者说「这次恢复没成功」。运维要据此判断
+	// 「数据回来了没有」，混成一个码就等于把这个问题留给日志去翻。
+	CodeBackupRestoreFailed ErrorCode = "BACKUP_RESTORE_FAILED"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -85,6 +89,7 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeBackupRestoreUnconfirmed: 409,
 	CodeBackupInUse:              409,
 	CodeBackupKeyUnresolved:      400,
+	CodeBackupRestoreFailed:      409,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -135,6 +140,7 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeBackupRestoreUnconfirmed: 25,
 	CodeBackupInUse:              26,
 	CodeBackupKeyUnresolved:      27,
+	CodeBackupRestoreFailed:      28,
 }
 
 func ExitCode(code ErrorCode) int {

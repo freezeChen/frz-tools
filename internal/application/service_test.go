@@ -34,6 +34,12 @@ func (f *fakeExec) Run(ctx context.Context, spec domain.CommandSpec) (domain.Res
 	return domain.Result{Executed: !spec.DryRun, ExitCode: 0}, nil
 }
 
+// RunStream 让假实现也满足 Executor 端口。契约测试与备份适配器都不走它，
+// 但端口是完整的——只实现一半的假实现会让「本地能跑、真机不能跑」重新变成可能。
+func (f *fakeExec) RunStream(ctx context.Context, spec domain.CommandSpec, _ io.Reader, _ io.Writer) (domain.Result, error) {
+	return f.Run(ctx, spec)
+}
+
 func (f *fakeExec) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
