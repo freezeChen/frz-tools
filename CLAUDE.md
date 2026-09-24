@@ -46,6 +46,12 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 `opsctl` 的 socket 默认 `/run/opsd/opsd.sock`，可用 `--socket` 或环境变量 `OPSD_SOCKET` 覆盖。
 `opsd` 默认配置 `/etc/opsd/config.yaml`。
 
+**提交后不等 CI 结果**（约定见 AGENTS.md）：文档、注释、单点修复、测试修正这类**非大模块**
+改动，本地 `make ci` 通过后即可提交推送并继续下一步，不要在推送后轮询流水线；CI 由独立的
+定时任务 `check-main-ci` 兜底（每小时的 :13 与 :43 检查 `main`，小范围失败直接修，其余只汇报）。
+只有**大模块**提交（新增端口/适配器、动状态机或数据表、改错误码、跨多包重构）才值得等 CI。
+无论等与不等，引用 CI 结论都必须给出真实运行号与结果。
+
 ## 架构
 
 依赖方向单向：`cmd` → `internal/adapters` → `internal/application` → `internal/domain`。
@@ -115,8 +121,8 @@ SQL 迁移在仓库根 `migrations/`（`0001`…`0004`），由 `migrations` 包
 - 修改 API、状态机、数据表或错误码，**先更新对应迭代文档**并记录兼容性影响。
 - 设计文档在 `docs/plans/`：`2026-09-21-linux-ops-tool-roadmap.md` 是总路线图（追加式变更记录，
   不删历史决策），`2026-09-21-iteration-{0,1a,1b,1c,1d}.md` 是各迭代规格与验证记录。验收标准必须
-  给出「命令 / 结果 / 证据类型」。**迭代 1d（重试与并发策略）的规格已编写但尚未冻结**（第 12 节
-  列了 5 条待拍板的未决事项），**在冻结之前 1d 不进入实现**。
+  给出「命令 / 结果 / 证据类型」。**迭代 1d（重试与并发策略）的规格已于 2026-09-24 冻结**
+  （第 12 节的 5 条决定全部按推荐值拍板），实现待做。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」；不要引用静态推导值或历史快照当结论。
 - **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、真实主机的
