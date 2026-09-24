@@ -231,3 +231,142 @@ func TestBackupRestoreIsolatedAndNotFoundThroughCLI(t *testing.T) {
 		t.Fatalf("不存在的策略 want exit 2, got %d: %v", code, err)
 	}
 }
+
+// backupPrunePolicyManifest 造一份 keepLast=1 的策略：三份备份里应当只留最新的一份。
+func backupPrunePolicyManifest(name, sourceDir string) string {
+	return fmt.Sprintf(`apiVersion: ops.frz.io/v1alpha1
+kind: BackupPolicy
+name: %s
+resource:
+  kind: files
+  paths:
+    - %s
+encoding:
+  compression: gzip
+  encryption:
+    enabled: false
+retention:
+  keepLast: 1
+`, name, sourceDir)
+}
+
+// listBackupRecords 取出当前的备份记录。
+func listBackupRecords(t *testing.T, socket string) []v1.Backup {
+	t.Helper()
+	stdout, _, err := runOpsctl(t, socket, "backup", "list", "--json")
+	if err != nil {
+		t.Fatalf("backup list: %v", err)
+	}
+	var backups v1.BackupListResponse
+	if err := json.Unmarshal([]byte(stdout), &backups); err != nil {
+		t.Fatalf("decode backups from %q: %v", stdout, err)
+	}
+	return backups.Items
+}
+
+// 走 CLI 的保留策略闭环：连备 3 份 → 预演什么都不动 → 真清理只留 keepLast 份
+// → 留着的那份仍能恢复出内容。
+func TestBackupPruneThroughCLI(t *testing.T) {
+	d := newDaemon(t)
+	d.start(t)
+
+	sourceDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(sourceDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	dir := t.TempDir()
+	manifest := writeManifest(t, dir, "policy.yaml", backupPrunePolicyManifest("e2e-prune", sourceDir))
+	if _, _, err := runOpsctl(t, d.socket, "backup", "policy", "put", "--file", manifest); err != nil {
+		t.Fatalf("policy put: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		// 每份的内容都不同：内容寻址下同样的内容会得到同样的 digest，多份备份就共享一个
+		// blob——那样这个用例会去测「共享保护」，而不是「按保留策略清理」。
+		if err := os.WriteFile(filepath.Join(sourceDir, "alpha.txt"),
+			[]byte(fmt.Sprintf("content-%d\n", i)), 0o640); err != nil {
+			t.Fatalf("write source: %v", err)
+		}
+		op := runBackupCommand(t, d.socket, "backup", "run", "--policy", "e2e-prune")
+		finished := waitForStatus(t, d.socket, op.ID, string(domain.StatusSucceeded), string(domain.StatusFailed))
+		if finished.Status != string(domain.StatusSucceeded) {
+			t.Fatalf("第 %d 份备份应当成功，got %s (%s)", i+1, finished.Status, finished.ErrorMessage)
+		}
+	}
+	if records := listBackupRecords(t, d.socket); len(records) != 3 {
+		t.Fatalf("应当有 3 份备份，got %d", len(records))
+	}
+
+	// 预演：报出将要清理的两份，但什么都不动。
+	stdout, _, err := runOpsctl(t, d.socket, "backup", "prune", "--policy", "e2e-prune", "--dry-run", "--json")
+	if err != nil {
+		t.Fatalf("prune --dry-run: %v", err)
+	}
+	var preview v1.BackupPruneResponse
+	if err := json.Unmarshal([]byte(stdout), &preview); err != nil {
+		t.Fatalf("decode preview from %q: %v", stdout, err)
+	}
+	if !preview.DryRun || len(preview.Removed) != 2 || preview.Kept != 1 {
+		t.Fatalf("预演结果不对：%+v", preview)
+	}
+	for _, record := range listBackupRecords(t, d.socket) {
+		if record.Status != string(domain.BackupSucceeded) {
+			t.Fatalf("预演不该改任何状态，%s 是 %s", record.ID, record.Status)
+		}
+	}
+
+	// 真清理。
+	stdout, _, err = runOpsctl(t, d.socket, "backup", "prune", "--policy", "e2e-prune", "--json")
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	var result v1.BackupPruneResponse
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("decode result from %q: %v", stdout, err)
+	}
+	if result.DryRun || len(result.Removed) != 2 || result.Kept != 1 {
+		t.Fatalf("清理结果不对：%+v", result)
+	}
+	if result.FreedBytes <= 0 {
+		t.Fatalf("应当报告释放的字节数，got %d", result.FreedBytes)
+	}
+
+	// 保下来的是**最新**那份，另外两份变成 pruned。
+	records := listBackupRecords(t, d.socket)
+	if len(records) != 3 {
+		t.Fatalf("记录不该消失（只改状态），got %d", len(records))
+	}
+	var kept *v1.Backup
+	pruned := 0
+	for i := range records {
+		switch records[i].Status {
+		case string(domain.BackupSucceeded):
+			kept = &records[i]
+		case string(domain.BackupPruned):
+			pruned++
+		default:
+			t.Fatalf("意外的状态 %s", records[i].Status)
+		}
+	}
+	if kept == nil || pruned != 2 {
+		t.Fatalf("应当是一份 succeeded + 两份 pruned，got kept=%v pruned=%d", kept, pruned)
+	}
+
+	// 清空源目录再原地恢复：证明保下来的那份**真的还能用**，不只是"还在"。
+	if err := os.RemoveAll(sourceDir); err != nil {
+		t.Fatalf("wipe: %v", err)
+	}
+	restoreOp := runBackupCommand(t, d.socket, "backup", "restore", kept.ID, "--mode", "inPlace", "--confirm")
+	if finished := waitForStatus(t, d.socket, restoreOp.ID,
+		string(domain.StatusSucceeded), string(domain.StatusFailed)); finished.Status != string(domain.StatusSucceeded) {
+		t.Fatalf("清理之后保留的那份应当仍能恢复，got %s (%s)", finished.Status, finished.ErrorMessage)
+	}
+	content, err := os.ReadFile(filepath.Join(sourceDir, "alpha.txt"))
+	if err != nil {
+		t.Fatalf("read restored: %v", err)
+	}
+	if string(content) != "content-2\n" {
+		t.Fatalf("恢复出来的内容不对：%q", content)
+	}
+}

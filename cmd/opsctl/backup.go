@@ -30,6 +30,7 @@ func newBackupCommand(opts *rootOptions) *cobra.Command {
 		newBackupShowCommand(opts),
 		newBackupVerifyCommand(opts),
 		newBackupRestoreCommand(opts),
+		newBackupPruneCommand(opts),
 	)
 	return cmd
 }
@@ -419,4 +420,54 @@ func formatTimePtr(t *time.Time) string {
 		return "时间未知"
 	}
 	return t.Format(time.RFC3339)
+}
+
+func newBackupPruneCommand(opts *rootOptions) *cobra.Command {
+	var (
+		policy string
+		dryRun bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "prune --policy <name> [--dry-run]",
+		Short: "按策略声明的保留规则清理备份",
+		Long: "保留规则是**同步**执行的（与制品 GC 一致），只支持 keepLast 与 keepDays——\n" +
+			"gfs 尚未实现，声明了它的策略在提交期就会被拒。\n\n" +
+			"只有已成功**且**校验没失败的备份会进入清理范围；正在被恢复或校验的会被跳过；\n" +
+			"内容仍被其它备份引用的只标记元数据、不删内容。--dry-run 只报告，什么都不动。",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			result, err := opts.client().PruneBackups(cmd.Context(), policy, dryRun)
+			if err != nil {
+				return err
+			}
+			if opts.json {
+				return opts.printJSON(result)
+			}
+			mode := "已清理"
+			if result.DryRun {
+				mode = "预演（未删除）"
+			}
+			fmt.Printf("%s：标记 %d 份，跳过 %d 份，保留 %d 份，释放 %d 字节\n",
+				mode, len(result.Removed), len(result.Skipped), result.Kept, result.FreedBytes)
+			for _, id := range result.Removed {
+				fmt.Printf("  - %s\n", id)
+			}
+			for _, skip := range result.Skipped {
+				fmt.Printf("  ! %s（%s）\n", skip.BackupID, skip.Reason)
+			}
+			// 下面两条都是「有一部分规则没生效」的信号，必须显式说出来而不是等人去看日志。
+			if len(result.IgnoredRetention) > 0 {
+				fmt.Printf("  注意：策略声明了 %v，本版本尚未实现，这些规则被忽略\n", result.IgnoredRetention)
+			}
+			if result.Truncated {
+				fmt.Println("  注意：候选数量撞到扫描上限，更老的备份本次没有参与计算")
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&policy, "policy", "", "备份策略名（必填）")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "只报告将要删除的内容，不动任何数据")
+	return cmd
 }

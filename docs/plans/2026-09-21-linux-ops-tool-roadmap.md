@@ -734,3 +734,35 @@
   GTID 开启的 MySQL 8、大库与长时间备份、sudoers/PAM 与 AppArmor、真机上的遗留物），
   每条一句话 + 指向已有记录，此前它们散落在各迭代文档的末尾。
 - **验证要求**：本轮为文档改动，未触碰产品逻辑；证据为 `make ci` 全绿。按约定提交后不等 CI 结果。
+
+### 2026-09-24（补记九）迭代 2d 实现并验证：保留策略与 prune
+
+- **变更原因**：补记八把 GFS 移出 2d 后，用户确认了范围推断（「按推断，去做 2d」），
+  因此 2d = **只用 `keepLast` / `keepDays` 的 `prune` 与验证链**。
+- **交付**：`internal/domain/retention.go`（保留集合的纯函数）、
+  `internal/application/backup.go` 的 `Prune`、仓储层三个方法、`POST /api/v1/backups/prune`、
+  `opsctl backup prune --policy X [--dry-run]`、`check_prune`（13 项容器断言）。
+- **一件必须先做的事**：prune 一旦上线，「策略里写着每月留 6 份、而没人实现它」就是一次
+  **静默的假承诺**。因此本迭代**改变了既有的提交期行为**：`SavePolicy` 现在拒绝声明了
+  `retention.gfs` 的策略（`MANIFEST_INVALID`，消息指向停放区文档）。
+  **兼容性影响**：2a/2b 时期接受并存储过这类策略，改动后它们**不能再提交**（库里已存在的行
+  不受影响，也不会被删，但下一次覆盖提交会被拒）；对这类旧行，`prune` 的结果里会带上
+  `ignoredRetention: ["gfs"]` 并打 warn 日志，不静默忽略。
+- **三条安全边界**（缺一条都是静默的数据丢失）：只删 `succeeded` **且**校验没失败的备份
+  （D9）；有未完成 Operation 的跳过；删内容之前确认没有**别的策略**的备份还指着同一个 digest
+  （内容寻址是按内容去重的，跨策略共享 blob 是可能的）。
+- **实现时发现的一处规格缺陷**（已就地修正迭代 2 第 23 节的 P4）：规格原本写「查活跃锁」，
+  而**资源锁是 worker 领取操作时才获取的**——一份**排队中**的恢复拿不到锁，按锁判断会放它
+  过去，prune 删掉它要读的内容，等 worker 领到时恢复只能以「没有对应的存储内容」失败。
+  改用「有未完成的 Operation」（`HasIncompleteOperation`）——与 `CreateOperation` 判定
+  `LOCK_BUSY` 用的是**同一个判据**。
+- **验证要求**：证据是**单元测试**（保留集合表驱动 14 个用例）、**集成测试**（连备三份删两份
+  且留着的那份仍能恢复出内容、dry-run 与实跑清单一致、排队中的恢复被跳过、跨策略共享 digest
+  不删内容、旧库 gfs 被报告）、**e2e**（走 CLI 的闭环）、**Linux 容器**（`make verify-linux`
+  **131/0**，新增 `check_prune` 13 项）、**Linux 容器承载的真实数据库实例**（`make verify-db`
+  13/0）、**Linux 主机**（`make verify-host` **95/0**，Rocky Linux 10.2 / systemd 257 /
+  SELinux enforcing）。`make ci` 全绿。
+- **明确不做**：GFS（停放区第 2 节，六个待定问题已各给推荐值）、store-wide 的备份孤儿回收
+  （塞进按策略的命令是设计错误，应当是一个独立的 `backup gc`；**后果**是 prune 在「标记」与
+  「删内容」之间崩溃会留下无人回收的孤儿 blob）、以及「校验失败的备份永远不会被清理」
+  （D9 的直接后果，方向对但要有人决定谁来清）。三条都已记入停放区第 3 节。

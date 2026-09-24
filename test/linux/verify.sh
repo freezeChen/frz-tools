@@ -1058,6 +1058,109 @@ POLICY
     runtimectl backup policy put --file /opt/frz-ops/backup-enc.yaml
 }
 
+
+# ==== 迭代 2d：保留策略与 prune ====
+#
+# 容器这一层能证明的是**文件系统上真的发生了什么**：blob 真的少了、剩下的那些权限与
+# 属主没变、被标记的那些在元数据里是 pruned。保留集合怎么算由领域层的表驱动单测覆盖，
+# 这里不重复算一遍——算了也只是同一份逻辑的第二个实现。
+check_prune() {
+  log "迭代 2d：按保留策略清理备份（Linux 容器证据）"
+
+  local policy=frz-prune-policy
+  cat > "$WORK_DIR/prune-policy.yaml" <<POLICY
+apiVersion: ops.frz.io/v1alpha1
+kind: BackupPolicy
+name: ${policy}
+resource:
+  kind: files
+  paths:
+    - ${BACKUP_SOURCE}
+encoding:
+  compression: gzip
+  encryption:
+    enabled: false
+retention:
+  keepLast: 1
+POLICY
+  docker cp "$WORK_DIR/prune-policy.yaml" "$CID:/opt/frz-ops/prune-policy.yaml"
+  require_ok "提交保留策略（keepLast=1）" runtimectl backup policy put --file /opt/frz-ops/prune-policy.yaml
+
+  # 备份根里已经有前面 check_backup 留下的内容，因此一律看**增量**，不看绝对数。
+  local before
+  before=$(q sh -c "find ${BACKUP_ROOT}/blobs -type f | wc -l" | tr -d ' ')
+
+  # 连备三份，每份的源内容都不同——内容寻址下同样的内容会得到同样的 digest，
+  # 那样三份会共享一个 blob，「删掉内容」这条就断言不出来了。
+  local i
+  for i in 1 2 3; do
+    in_container sh -c "printf 'prune-content-%s\\n' '$i' > ${BACKUP_SOURCE}/alpha.txt"
+    local run_out run_id
+    run_out=$(rq backup run --policy "${policy}" --json)
+    run_id=$(printf '%s' "${run_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+    if [ -z "${run_id}" ] || ! wait_for_status "${run_id}" "succeeded" "${RUNTIME_SOCK}"; then
+      fail "第 $i 份备份未成功"
+      return 0
+    fi
+  done
+  assert_eq "三份备份各落一个 blob" "$((before + 3))" "$(q sh -c "find ${BACKUP_ROOT}/blobs -type f | wc -l" | tr -d ' ')"
+
+  # 预演：报告将要清理的份数，但一个字节都不动。
+  # 断言打在**人类可读输出**上（每份一行 `  - bkp_…`）：list/get 的 --json 是美化过的
+  # 多行，用 sed 单行解析容易写出「看着对其实没匹配上」的断言。
+  local preview
+  preview=$(runtimectl backup prune --policy "${policy}" --dry-run)
+  assert_eq "预演报出 2 份待清理" "2" "$(printf '%s' "${preview}" | grep -c '^  - bkp_' || true)"
+  case "${preview}" in
+    预演（未删除）：*) pass "预演的输出标明「未删除」" ;;
+    *) fail "预演的输出没有标明「未删除」：${preview}" ;;
+  esac
+  assert_eq "预演之后 blob 一个没少" "$((before + 3))" "$(q sh -c "find ${BACKUP_ROOT}/blobs -type f | wc -l" | tr -d ' ')"
+
+  # 真清理。
+  local result
+  result=$(runtimectl backup prune --policy "${policy}")
+  assert_eq "清理报出 2 份已标记" "2" "$(printf '%s' "${result}" | grep -c '^  - bkp_' || true)"
+  case "${result}" in
+    已清理：*) pass "清理的输出标明「已清理」" ;;
+    *) fail "清理的输出没有标明「已清理」：${result}" ;;
+  esac
+  assert_eq "清理之后只多了一个 blob" "$((before + 1))" "$(q sh -c "find ${BACKUP_ROOT}/blobs -type f | wc -l" | tr -d ' ')"
+
+  # 剩下的那个 blob 的权限与属主不该被清理过程动过。
+  local blob
+  blob=$(q sh -c "find ${BACKUP_ROOT}/blobs -type f -newermt '-1 hour' | head -1")
+  if [ -z "${blob}" ]; then
+    fail "清理之后应当还剩一个刚写的 blob"
+  else
+    assert_eq "剩下的备份文件模式" "640" "$(q stat -c '%a' "${blob}")"
+    assert_eq "剩下的备份文件属主" "root" "$(q stat -c '%U' "${blob}")"
+  fi
+
+  # 元数据：一份 succeeded、两份 pruned（记录不消失，只改状态）。
+  local list_json
+  list_json=$(rq backup list --policy "${policy}" --json)
+  assert_eq "清理后仍是 succeeded 的份数" "1" "$(printf '%s' "${list_json}" | grep -c '"status": *"succeeded"')"
+  assert_eq "清理后变成 pruned 的份数" "2" "$(printf '%s' "${list_json}" | grep -c '"status": *"pruned"')"
+
+  # 保下来的那份必须仍能恢复——「还在」不等于「还能用」。
+  # list 按开始时刻倒序，因此第一条就是最新那份，也就是 keepLast=1 保下来的那份。
+  local kept_id
+  kept_id=$(printf '%s' "${list_json}" | sed -n 's/.*"id": *"\(bkp_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "${kept_id}" ]; then
+    fail "找不到保下来的那份备份"
+    return 0
+  fi
+  local restore_out restore_id
+  restore_out=$(rq backup restore "${kept_id}" --mode isolated --json)
+  restore_id=$(printf '%s' "${restore_out}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -n "${restore_id}" ] && wait_for_status "${restore_id}" "succeeded" "${RUNTIME_SOCK}"; then
+    pass "清理之后保下来的那份仍能隔离恢复"
+  else
+    fail "清理之后保下来的那份恢复失败"
+  fi
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -1099,6 +1202,8 @@ main() {
   check_retry
   # 迭代 2a：备份的存储根、权限与与制品 GC 的隔离。
   check_backup
+  # 迭代 2d：按保留策略清理备份（keepLast / keepDays，不含 GFS）。
+  check_prune
   # 放在最后：它会故意让探针 unit 停在 failed 状态（验证缺凭据必须起不来）。
   check_runtime
 

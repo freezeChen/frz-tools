@@ -298,3 +298,52 @@ func backupDTO(backup *domain.Backup) v1.Backup {
 		ErrorMessage:    backup.ErrorMessage,
 	}
 }
+
+// handlePruneBackups 按策略声明的保留规则清理备份。
+//
+// 这是本工具里**唯一**会删除备份内容的入口，因此三件事都在应用层兜住（见
+// application.BackupService.Prune）：只删已完成且校验没失败的、正在被操作的跳过、
+// 内容仍被别的备份引用时不删。这里只负责把结果原样交出去。
+func (s *Server) handlePruneBackups(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Backups == nil {
+		writeError(w, s.logger(), errBackupServiceMissing())
+		return
+	}
+
+	var req v1.BackupPruneRequest
+	if r.ContentLength > 0 {
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeError(w, s.logger(), err)
+			return
+		}
+	}
+	if strings.TrimSpace(req.Policy) == "" {
+		writeError(w, s.logger(), domain.NewError(v1.CodeInvalidRequest, "必须给出 policy"))
+		return
+	}
+
+	result, err := s.deps.Backups.Prune(r.Context(), req.Policy, req.DryRun)
+	if err != nil {
+		writeError(w, s.logger(), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v1.BackupPruneResponse{
+		APIVersion:       v1.APIVersion,
+		DryRun:           result.DryRun,
+		Policy:           result.Policy,
+		Removed:          emptyIfNil(result.Removed),
+		Skipped:          pruneSkipsDTO(result.Skipped),
+		Kept:             result.Kept,
+		FreedBytes:       result.FreedBytes,
+		IgnoredRetention: result.IgnoredRetention,
+		Truncated:        result.Truncated,
+	})
+}
+
+func pruneSkipsDTO(skips []application.PruneSkip) []v1.BackupPruneSkip {
+	out := make([]v1.BackupPruneSkip, 0, len(skips))
+	for _, skip := range skips {
+		out = append(out, v1.BackupPruneSkip{BackupID: skip.BackupID, Reason: skip.Reason})
+	}
+	return out
+}

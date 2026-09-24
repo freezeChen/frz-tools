@@ -366,3 +366,106 @@ func backupEventType(status domain.BackupStatus) string {
 		return domain.EventBackupFinished
 	}
 }
+
+// ListBackupsForRetention 取一份策略下的备份，**按完成时刻倒序**，供保留计算使用。
+//
+// 三处刻意的选择：
+//
+//  1. **包含非 succeeded 的行**。过滤交给领域层的 `Usable()`——「谁参与保留计算」只有
+//     一处判据，也才测得出来。在 SQL 里再写一遍那个条件，就成了第二份会漂移的真相。
+//  2. 按**完成时刻**排而不是开始时刻：保留策略的判据是「这份备份什么时候备好的」。
+//  3. `started_at` 那个 LIMIT 的默认值不适用：prune 要看**全部**候选，截断会漏掉最老的
+//     那些（漏掉的只是不删，方向保守，但必须由调用方知道——见 limit 参数与返回值）。
+func (s *Store) ListBackupsForRetention(ctx context.Context, policyRef string, limit int) ([]domain.Backup, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `SELECT ` + backupColumns + ` FROM backups
+		WHERE policy_id = (SELECT id FROM backup_policies WHERE id = ? OR name = ?)
+		ORDER BY finished_at DESC, id DESC LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, query, policyRef, policyRef, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []domain.Backup
+	for rows.Next() {
+		backup, err := scanBackup(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *backup)
+	}
+	return out, rows.Err()
+}
+
+// CountBackupReferencesByDigest 数**还有多少份未删除的备份**指向同一个 digest。
+//
+// prune 在删内容之前必须问这一句：内容寻址是按内容去重的，加密关闭时两份不同的备份
+// 可能共享同一个 blob。少了这道检查，删 A 策略的一份备份会顺手毁掉 B 策略的一份——
+// 而且是静默的，只在真要恢复时才发现。
+//
+// 数的是**未被 pruned** 的行：调用方先标记自己那一份，再问这一句，于是"还剩谁指着它"
+// 天然把刚标记的那份排除在外。
+func (s *Store) CountBackupReferencesByDigest(ctx context.Context, digest domain.Digest) (int, error) {
+	if digest == "" {
+		return 0, nil
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM backups
+		WHERE storage_digest = ? AND status <> 'pruned'`, digest.String()).Scan(&count)
+	return count, err
+}
+
+// HasIncompleteOperation 报告某个资源上还有没有未完成的 Operation。
+//
+// 直接复用 CreateOperation 判 LOCK_BUSY 用的那个助手：prune 要问的正是同一个问题
+// ——「这个资源现在被占着吗」，而两套判据迟早会漂移出第三种行为。
+func (s *Store) HasIncompleteOperation(ctx context.Context, resource string) (bool, error) {
+	return hasIncompleteOperation(ctx, s.db, resource)
+}
+
+// MarkBackupPruned 把一份备份标记为已清理，并写下审计事件。
+//
+// 只改元数据、不碰内容：调用方随后单独判断内容能不能删（可能还有别的记录指着它）。
+// 两步分开是 D9 的取舍——中断在最坏的情况下留下一个无人认领的 blob，而不是
+// 「元数据说内容在、内容没了」。
+//
+// 幂等：行已经不是 succeeded（例如并发下已经被别的 prune 标记过）时返回 nil 且不写审计。
+// prune 必须可重跑，把「已经被清理过」当成错误会让一次中断卡住后续所有 prune。
+func (s *Store) MarkBackupPruned(ctx context.Context, id string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 审计事件的 operation_id 指向 operations(id)，而 prune 不是 Operation，因此留空。
+	// 备份 ID 进 details，两个方向都可查（与 FinishBackup 同一套做法）。
+	res, err := tx.ExecContext(ctx,
+		`UPDATE backups SET status = 'pruned' WHERE id = ? AND status = 'succeeded'`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return nil
+	}
+	if err := insertAudit(ctx, tx, domain.AuditEvent{
+		EventType: domain.EventBackupPruned,
+		Resource:  id,
+		Result:    string(domain.BackupPruned),
+		Time:      now,
+		Details:   map[string]string{"backupId": id},
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}

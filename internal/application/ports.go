@@ -76,6 +76,26 @@ type Repository interface {
 	FinishBackup(ctx context.Context, in domain.FinishBackupInput, now time.Time) (*domain.Backup, error)
 	MarkBackupVerified(ctx context.Context, id string, ok bool, now time.Time) error
 	FailStaleBackups(ctx context.Context, now time.Time) (int, error)
+
+	// 保留策略（prune）要的三件事。
+	//
+	// ListBackupsForRetention 按**完成时刻倒序**取该策略的备份，**含非 succeeded 的行**：
+	// 「谁参与保留计算」的判据只有领域层的 Usable() 一处，在 SQL 里再写一遍就是第二份
+	// 会漂移的真相。
+	ListBackupsForRetention(ctx context.Context, policyRef string, limit int) ([]domain.Backup, error)
+	// CountBackupReferencesByDigest 数还有多少份**未删除**的备份指着同一个 digest。
+	// 删内容之前必须问这一句：内容寻址是按内容去重的，跨策略共享一个 blob 是可能的。
+	CountBackupReferencesByDigest(ctx context.Context, digest domain.Digest) (int, error)
+	// MarkBackupPruned 把一份备份标记为已清理（只改元数据、不碰内容）。
+	// 先标记、后删内容：中断时最坏留下无主的 blob，而不是「元数据说在、内容没了」。
+	MarkBackupPruned(ctx context.Context, id string, now time.Time) error
+	// HasIncompleteOperation 报告某个资源上还有没有未完成（pending 或 running）的
+	// Operation。它与 CreateOperation 判定 LOCK_BUSY 用的是**同一个判据**：同一个词
+	// （「这个资源正被用着」）在仓库里只该有一个定义。
+	//
+	// prune 用它跳过"正在被恢复/校验"的备份。**不能用活跃锁代替**：资源锁是 worker
+	// 领取操作时才获取的，一份排队中的恢复拿不到锁——按锁判断会放它过去。
+	HasIncompleteOperation(ctx context.Context, resource string) (bool, error)
 }
 
 // Executor 是进程执行端口，由本机执行器适配器实现。

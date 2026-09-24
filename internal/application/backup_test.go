@@ -3,9 +3,11 @@ package application_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -733,4 +735,393 @@ func (f *backupFixture) storedBlobPath(t *testing.T) string {
 		t.Fatalf("存储根里应当恰好一个 blob，got %v", found)
 	}
 	return found[0]
+}
+
+// ==== 2d：保留策略与 prune ====
+//
+// 这些用例护的是「本工具里唯一会删除备份内容的入口」。删错一份备份，只有在真要恢复时
+// 才会被发现，因此每一条安全边界都单独钉一遍。
+
+// touchSource 改一下源内容，让下一次备份产出**不同的** digest。
+//
+// 内容寻址下同样的内容会得到同样的 digest，多份备份就共享一个 blob——那样「删掉了内容」
+// 这条根本断言不出来（而且会去测试共享保护，不是这个用例想测的东西）。
+func (f *backupFixture) touchSource(t *testing.T, marker string) {
+	t.Helper()
+	base := filepath.Join(f.sourceRoot, strings.TrimPrefix(f.declared, "/"))
+	if err := os.WriteFile(filepath.Join(base, "alpha.txt"), []byte(marker+"\n"), 0o640); err != nil {
+		t.Fatalf("改源内容: %v", err)
+	}
+}
+
+// storedBlobs 列出备份根下已落盘的内容文件。
+func (f *backupFixture) storedBlobs(t *testing.T) []string {
+	t.Helper()
+	var found []string
+	err := filepath.WalkDir(f.backupStore.Root(), func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		found = append(found, path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("遍历备份根: %v", err)
+	}
+	return found
+}
+
+// runBackups 连做 n 份备份，每份的源内容都不同（因此 digest 也不同）。
+func (f *backupFixture) runBackups(t *testing.T, policy string, n int) []*domain.Backup {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		f.touchSource(t, fmt.Sprintf("content-%d", i))
+		op := f.runOperation(t, backupRunRequest(policy))
+		if op.Status != domain.StatusSucceeded {
+			t.Fatalf("第 %d 份备份未成功：%s (%s)", i+1, op.Status, op.ErrorMessage)
+		}
+	}
+	backups, err := f.rt.Backups.List(context.Background(), policy, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(backups) != n {
+		t.Fatalf("应当有 %d 份备份，got %d", n, len(backups))
+	}
+	out := make([]*domain.Backup, 0, n)
+	for i := range backups {
+		out = append(out, &backups[i])
+	}
+	return out
+}
+
+// 验收标准 #7：连备 3 份 → prune 掉 2 份 → 剩下那份仍能恢复出正确内容。
+func TestPruneKeepsLastAndDeletesTheRest(t *testing.T) {
+	f := newBackupFixture(t)
+	ctx := context.Background()
+
+	f.savePolicy(t, "orders", func(policy *domain.BackupPolicy) {
+		policy.Retention = domain.BackupRetention{KeepLast: 1}
+	})
+	f.populate(t)
+	backups := f.runBackups(t, "orders", 3)
+
+	if len(f.storedBlobs(t)) != 3 {
+		t.Fatalf("三份不同内容的备份应当有三个 blob，got %d", len(f.storedBlobs(t)))
+	}
+
+	result, err := f.rt.Backups.Prune(ctx, "orders", false)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(result.Removed) != 2 {
+		t.Fatalf("keepLast=1 应当删掉 2 份，got %v（跳过 %v）", result.Removed, result.Skipped)
+	}
+	if result.Kept != 1 {
+		t.Fatalf("应当保留 1 份，got %d", result.Kept)
+	}
+	if result.FreedBytes <= 0 {
+		t.Fatalf("应当报告释放的字节数，got %d", result.FreedBytes)
+	}
+	if len(result.Skipped) != 0 {
+		t.Fatalf("这里不该有跳过：%v", result.Skipped)
+	}
+	if len(f.storedBlobs(t)) != 1 {
+		t.Fatalf("内容应当只剩一份，got %d", len(f.storedBlobs(t)))
+	}
+
+	// 被删的那两份状态是 pruned；保留的那份仍是 succeeded。
+	var kept *domain.Backup
+	for _, backup := range backups {
+		stored, err := f.rt.Backups.Get(ctx, backup.ID)
+		if err != nil {
+			t.Fatalf("get %s: %v", backup.ID, err)
+		}
+		if result.Kept != 1 {
+			continue
+		}
+		if stored.Status == domain.BackupSucceeded {
+			kept = stored
+		} else if stored.Status != domain.BackupPruned {
+			t.Fatalf("非保留的 %s 状态应当是 pruned，got %s", stored.ID, stored.Status)
+		}
+	}
+	if kept == nil {
+		t.Fatal("应当恰好有一份仍是 succeeded")
+	}
+
+	// 最强的那条：保下来的那份**真的还能恢复出内容**（不只是"还在"）。
+	before := f.fingerprint(t)
+	if err := os.RemoveAll(filepath.Join(f.sourceRoot, strings.TrimPrefix(f.declared, "/"))); err != nil {
+		t.Fatalf("wipe: %v", err)
+	}
+	restoreOp := f.runOperation(t, v1.CreateOperationRequest{
+		Kind:     v1.KindBackupRestore,
+		Resource: kept.ID,
+		Spec:     mustRestoreOptions(t, domain.RestoreInPlace, true),
+	})
+	if restoreOp.Status != domain.StatusSucceeded {
+		t.Fatalf("prune 之后保留的那份应当仍能恢复，got %s (%s)", restoreOp.Status, restoreOp.ErrorMessage)
+	}
+	if got := f.fingerprint(t); got != before {
+		t.Fatalf("恢复出来的内容不一致：\nwant %s\ngot  %s", before, got)
+	}
+}
+
+// 验收标准 #3：dry-run 不改元数据、不删内容——它必须能安全地反复跑。
+func TestPruneDryRunChangesNothing(t *testing.T) {
+	f := newBackupFixture(t)
+	ctx := context.Background()
+
+	f.savePolicy(t, "orders", func(policy *domain.BackupPolicy) {
+		policy.Retention = domain.BackupRetention{KeepLast: 1}
+	})
+	f.populate(t)
+	backups := f.runBackups(t, "orders", 3)
+	blobsBefore := len(f.storedBlobs(t))
+
+	result, err := f.rt.Backups.Prune(ctx, "orders", true)
+	if err != nil {
+		t.Fatalf("Prune(dry-run): %v", err)
+	}
+	if !result.DryRun {
+		t.Fatal("结果里应当标记这是预演")
+	}
+	if len(result.Removed) != 2 {
+		t.Fatalf("预演应当报告将要标记的 2 份，got %v", result.Removed)
+	}
+	if result.FreedBytes <= 0 {
+		t.Fatalf("预演应当报告预计释放的字节数，got %d", result.FreedBytes)
+	}
+
+	// 什么都没变：行还是 succeeded，内容一个没少。
+	for _, backup := range backups {
+		stored, err := f.rt.Backups.Get(ctx, backup.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if stored.Status != domain.BackupSucceeded {
+			t.Fatalf("预演不该改状态：%s 变成了 %s", stored.ID, stored.Status)
+		}
+	}
+	if got := len(f.storedBlobs(t)); got != blobsBefore {
+		t.Fatalf("预演不该删内容：%d → %d", blobsBefore, got)
+	}
+
+	// 预演报告的清单必须与真跑一次的结果一致，否则它就不是预演。
+	real, err := f.rt.Backups.Prune(ctx, "orders", false)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if strings.Join(sortedStrings(real.Removed), ",") != strings.Join(sortedStrings(result.Removed), ",") {
+		t.Fatalf("预演 %v 与实跑 %v 的清单不一致", result.Removed, real.Removed)
+	}
+}
+
+// 验收标准 #6：正在被恢复/校验的备份跳过，而且**不让整批 prune 失败**。
+//
+// 「正在被操作」包括**排队中**（pending）——这一点是写代码时才发现要覆盖的，见 §23 的 P4。
+func TestPruneSkipsBackupInUse(t *testing.T) {
+	f := newBackupFixture(t)
+	ctx := context.Background()
+
+	f.savePolicy(t, "orders", func(policy *domain.BackupPolicy) {
+		policy.Retention = domain.BackupRetention{KeepLast: 1}
+	})
+	f.populate(t)
+	backups := f.runBackups(t, "orders", 3)
+
+	// 挑一份**该被删**的（最老的那份）挂上一个**排队中**的恢复操作，且不去处理它。
+	//
+	// 这里刻意用「排队」而不是「正在跑」：资源锁是 worker 领取时才获取的，排队中的操作
+	// 根本没有锁——用活跃锁判「正在被操作」的写法会放它过去，prune 删掉它要读的内容，
+	// 等 worker 领到时恢复只能以「没有对应的存储内容」失败。用例钉的正是这个窗口。
+	var oldest *domain.Backup
+	for _, backup := range backups {
+		if oldest == nil || backup.StartedAt.Before(oldest.StartedAt) {
+			oldest = backup
+		}
+	}
+	if _, _, err := f.rt.Service.Create(ctx, v1.CreateOperationRequest{
+		Kind:     v1.KindBackupRestore,
+		Resource: oldest.ID,
+		Spec:     mustRestoreOptions(t, domain.RestoreIsolated, false),
+	}); err != nil {
+		t.Fatalf("占住锁: %v", err)
+	}
+
+	result, err := f.rt.Backups.Prune(ctx, "orders", false)
+	if err != nil {
+		t.Fatalf("一份正在被操作的备份不该让整批 prune 失败：%v", err)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].BackupID != oldest.ID {
+		t.Fatalf("排队中的那份也应当被跳过并报告，got %v（removed %v）", result.Skipped, result.Removed)
+	}
+	if len(result.Removed) != 1 {
+		t.Fatalf("另外一份仍然要删，got %v", result.Removed)
+	}
+	stored, err := f.rt.Backups.Get(ctx, oldest.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.Status != domain.BackupSucceeded {
+		t.Fatalf("被跳过的备份不该改状态，got %s", stored.Status)
+	}
+}
+
+// 验收标准 #5：内容仍被**别的策略**引用时不删内容。
+//
+// 这是最容易被漏掉的一条：prune 是按策略跑的，而内容寻址是按内容去重的，两份不同策略的
+// 备份完全可能指着同一个 blob。少了这道检查，`prune --policy A` 会顺手毁掉 B 的一份备份，
+// 而且是静默的。
+func TestPruneProtectsSharedDigestAcrossPolicies(t *testing.T) {
+	f := newBackupFixture(t)
+	ctx := context.Background()
+
+	// 两份策略都指向同一个目录，且**加密关闭**——同内容同 digest 才会真的发生。
+	for _, name := range []string{"orders", "orders-copy"} {
+		f.savePolicy(t, name, func(policy *domain.BackupPolicy) {
+			policy.Retention = domain.BackupRetention{KeepLast: 1}
+		})
+	}
+
+	// 先让 orders 有一份 digest=d1 的备份（内容 content-0）。
+	f.populate(t)
+	f.touchSource(t, "content-0")
+	if op := f.runOperation(t, backupRunRequest("orders")); op.Status != domain.StatusSucceeded {
+		t.Fatalf("orders 第一份备份失败：%s", op.ErrorMessage)
+	}
+	// orders-copy 备同样的内容 → 同一个 d1。
+	if op := f.runOperation(t, backupRunRequest("orders-copy")); op.Status != domain.StatusSucceeded {
+		t.Fatalf("orders-copy 备份失败：%s", op.ErrorMessage)
+	}
+	// orders 再备一份不同的内容（digest=d2），于是 d1 那份成了要被清理的。
+	f.touchSource(t, "content-1")
+	if op := f.runOperation(t, backupRunRequest("orders")); op.Status != domain.StatusSucceeded {
+		t.Fatalf("orders 第二份备份失败：%s", op.ErrorMessage)
+	}
+
+	ordersBackups, err := f.rt.Backups.List(ctx, "orders", 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(ordersBackups) != 2 {
+		t.Fatalf("orders 应当有 2 份，got %d", len(ordersBackups))
+	}
+	copyBackups, err := f.rt.Backups.List(ctx, "orders-copy", 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(copyBackups) != 1 {
+		t.Fatalf("orders-copy 应当有 1 份，got %d", len(copyBackups))
+	}
+
+	blobsBefore := len(f.storedBlobs(t))
+	result, err := f.rt.Backups.Prune(ctx, "orders", false)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(result.Removed) != 1 {
+		t.Fatalf("orders 应当删掉 1 份，got %v", result.Removed)
+	}
+	// 内容不能删：orders-copy 还指着同一个 digest。
+	if got := len(f.storedBlobs(t)); got != blobsBefore {
+		t.Fatalf("共享的 blob 被删了：%d → %d", blobsBefore, got)
+	}
+	if result.FreedBytes != 0 {
+		t.Fatalf("没有内容被释放时不该报告字节数，got %d", result.FreedBytes)
+	}
+	if len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0].Reason, "引用") {
+		t.Fatalf("应当报告「内容仍被引用」，got %v", result.Skipped)
+	}
+
+	// 最关键的一条：orders-copy 那份**仍然能恢复出内容**。
+	before := f.fingerprint(t) // 注意此时源目录是 content-1，先记下 orders-copy 该恢复出什么
+	_ = before
+	f.touchSource(t, "wiped")
+	copyRestore := f.runOperation(t, v1.CreateOperationRequest{
+		Kind:     v1.KindBackupRestore,
+		Resource: copyBackups[0].ID,
+		Spec:     mustRestoreOptions(t, domain.RestoreInPlace, true),
+	})
+	if copyRestore.Status != domain.StatusSucceeded {
+		t.Fatalf("另一个策略的备份应当仍能恢复，got %s (%s)", copyRestore.Status, copyRestore.ErrorMessage)
+	}
+	content, err := os.ReadFile(filepath.Join(f.sourceRoot, strings.TrimPrefix(f.declared, "/"), "alpha.txt"))
+	if err != nil {
+		t.Fatalf("读恢复后的内容: %v", err)
+	}
+	if string(content) != "content-0\n" {
+		t.Fatalf("orders-copy 恢复出来的内容不对：%q", content)
+	}
+}
+
+// P7 的兜底：库里可能留着 2a/2b 时期写下的带 gfs 的策略（提交期已经拦住新的）。
+// prune 必须把「这一部分规则没生效」带到调用方看得见的地方，而不是悄悄忽略。
+func TestPruneReportsGFSFromLegacyPolicy(t *testing.T) {
+	f := newBackupFixture(t)
+	ctx := context.Background()
+
+	legacy := &domain.BackupPolicy{
+		APIVersion: domain.BackupPolicyAPIVersion,
+		Kind:       domain.BackupPolicyKind,
+		Name:       "legacy-orders",
+		Resource: domain.BackupResource{
+			Kind:  domain.BackupResourceFiles,
+			Paths: []string{f.declared},
+		},
+		Encoding: domain.BackupEncoding{
+			Compression: domain.CompressionGzip,
+			Encryption:  domain.BackupEncryption{Enabled: false},
+		},
+		Retention: domain.BackupRetention{KeepLast: 1, GFS: domain.BackupGFS{Daily: 7}},
+	}
+	if _, err := f.sqlStore.SaveBackupPolicy(ctx, legacy, "bpl_legacy", time.Now().UTC(), "tester"); err != nil {
+		t.Fatalf("直接落库一份旧策略: %v", err)
+	}
+
+	result, err := f.rt.Backups.Prune(ctx, "legacy-orders", false)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(result.IgnoredRetention) != 1 || result.IgnoredRetention[0] != "gfs" {
+		t.Fatalf("应当报告被忽略的 gfs，got %v", result.IgnoredRetention)
+	}
+}
+
+// P7：声明了 gfs 的策略在**提交期**就被拒。prune 一旦上线，「策略里写着每月留 6 份、
+// 而没人实现它」就是一次静默的假承诺。
+func TestSavePolicyRejectsGFS(t *testing.T) {
+	f := newBackupFixture(t)
+
+	policy := &domain.BackupPolicy{
+		APIVersion: domain.BackupPolicyAPIVersion,
+		Kind:       domain.BackupPolicyKind,
+		Name:       "orders-daily",
+		Resource: domain.BackupResource{
+			Kind:  domain.BackupResourceFiles,
+			Paths: []string{f.declared},
+		},
+		Encoding: domain.BackupEncoding{
+			Compression: domain.CompressionGzip,
+			Encryption:  domain.BackupEncryption{Enabled: false},
+		},
+		Retention: domain.BackupRetention{KeepLast: 7, GFS: domain.BackupGFS{Daily: 7}},
+	}
+	_, err := f.rt.Backups.SavePolicy(context.Background(), policy, "tester")
+	if domain.CodeOf(err) != v1.CodeManifestInvalid {
+		t.Fatalf("want MANIFEST_INVALID, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "gfs") {
+		t.Fatalf("错误信息要指明是 gfs，got %v", err)
+	}
+}
+
+func sortedStrings(values []string) []string {
+	out := append([]string(nil), values...)
+	sort.Strings(out)
+	return out
 }

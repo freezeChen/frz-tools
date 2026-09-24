@@ -127,19 +127,20 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   迭代 0–2 沉淀下来的待定项；**不是规格**，开工前要先升级成迭代文档）。验收标准
   必须给出「命令 / 结果 / 证据类型」。**1d（重试与并发策略）已于 2026-09-24 实现并提交**；
   **迭代 2a（备份）与 2b（PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
-  2d 待做，但其 **GFS 部分已移出**（停放区第 2 节），剩下的范围是只用
-  `keepLast`/`keepDays` 的 `prune` 与验证链（范围推断，见迭代 2 文档第 22 节）。
+  **2d（保留策略与 `prune`）也已实现并验证**，范围是只用 `keepLast`/`keepDays`；
+  **GFS 已移出**并停放在停放区第 2 节（未实现）。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」；不要引用静态推导值或历史快照当结论。
 - **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、
   sudoers/PAM 实际策略、
-  `SudoConfig`（只有模型、零行为）、`prune`（2d 未实现，GFS 已移出见停放区）、真实生产库与大库的备份、
+  `SudoConfig`（只有模型、零行为）、GFS 保留、store-wide 的备份孤儿回收、
+  真实生产库与大库的备份、
   GTID 开启的 MySQL 8、大容量长时间备份。
   SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
   本工具**不提供** SELinux 加固——这是「未实现的能力」，不得写成「已支持」。
 - **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
   因此不进 CI）。2026-09-24 在 Rocky Linux 10.2 / systemd 257 / SELinux enforcing 上
-  实跑 **93 项通过 / 0 项失败**（1c 的 71 项 + 2b 的 22 项），跑完自动清理。
+  实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），跑完自动清理。
   **重启验证**另做了一轮（停机 44 秒、`boot_id` 前后不同、重启后 **21 项通过 / 0 项失败**），
   用 `FRZ_HOST_PHASE=prepare` → 重启 → `FRZ_HOST_PHASE=check`；`check` 阶段**不重新上传**，
   否则会把跨重启状态的记录冲掉。

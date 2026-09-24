@@ -136,3 +136,43 @@ type BackupRestoreRequest struct {
 	CreatedBy      string     `json:"createdBy,omitempty"`
 	Retry          *RetrySpec `json:"retry,omitempty"`
 }
+
+// BackupPruneRequest 触发一次按保留策略的清理。
+//
+// 它是**同步**用例而不是 Operation（与 1a 的制品 GC 一致，见规格决定 5），因此响应里
+// 直接给结果，不返回 operation id。
+type BackupPruneRequest struct {
+	// Policy 是保留策略名（必填）。保留规则是每份策略自己的声明，因此清理也按策略进行——
+	// 一次跨策略的清扫不该长在一个名字看起来只作用于一份策略的命令里。
+	Policy string `json:"policy"`
+	DryRun bool   `json:"dryRun,omitempty"`
+}
+
+// BackupPruneSkip 是一份应当删、但本轮没删的备份及其原因。
+//
+// 它必须出现在响应里而不是只写日志：运维看到「该删 200 份、实际删了 198 份」时，
+// 第一个问题就是那两份去哪了。
+type BackupPruneSkip struct {
+	BackupID string `json:"backupId"`
+	Reason   string `json:"reason"`
+}
+
+// BackupPruneResponse 是一次清理的结果，形状与制品 GC 的响应同源。
+type BackupPruneResponse struct {
+	APIVersion string `json:"apiVersion"`
+	DryRun     bool   `json:"dryRun"`
+	Policy     string `json:"policy"`
+	// Removed 是**本轮标记为已清理**的备份 ID；dry-run 时是「将要标记」的那些。
+	Removed []string `json:"removed"`
+	// Skipped 是应当删但没删的那些（正在被操作、内容仍被引用）。
+	Skipped []BackupPruneSkip `json:"skipped"`
+	// Kept 是保留策略保下来的份数。
+	Kept int `json:"kept"`
+	// FreedBytes 是实际释放（dry-run 时是预计释放）的字节数。
+	FreedBytes int64 `json:"freedBytes"`
+	// IgnoredRetention 是策略里声明了、而这一版没有实现的保留项（当前只可能是 gfs）。
+	// 它是「这个策略里有一部分规则没生效」的唯一信号，因此不能只写日志。
+	IgnoredRetention []string `json:"ignoredRetention,omitempty"`
+	// Truncated 表示扫描撞到了上限，**更老的**备份可能没被看到（因此没被删）。
+	Truncated bool `json:"truncated,omitempty"`
+}

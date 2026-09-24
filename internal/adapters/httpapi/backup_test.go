@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
 	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/adapters/backup/files"
 	"github.com/freezeChen/frz-tools/internal/adapters/blob"
@@ -369,4 +370,214 @@ func seedSucceededBackup(t *testing.T, repo application.Repository) {
 			t.Fatalf("seed backup: %v", err)
 		}
 	}
+}
+
+// seedPrunableBackups 预置两份**可被清理**的备份：keepLast=1 时应当删掉较旧的那份。
+//
+// 两份用不同的 digest，是为了让「删内容」这条路径真的走到：同一个 digest 会被
+// 跨备份引用检查拦下（那是另一条用例覆盖的行为）。
+func seedPrunableBackups(t *testing.T, repo application.Repository) {
+	t.Helper()
+	ctx := context.Background()
+
+	policy, err := repo.SaveBackupPolicy(ctx, &domain.BackupPolicy{
+		APIVersion: domain.BackupPolicyAPIVersion,
+		Kind:       domain.BackupPolicyKind,
+		Name:       "orders",
+		Resource:   domain.BackupResource{Kind: domain.BackupResourceFiles, Paths: []string{"/srv/data"}},
+		Encoding:   domain.BackupEncoding{Encryption: domain.BackupEncryption{Enabled: false}},
+		Retention:  domain.BackupRetention{KeepLast: 1},
+	}, "bpl_seed", time.Now().UTC(), "tester")
+	if err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+
+	now := time.Now().UTC()
+	older := now.Add(-2 * time.Hour)
+	seeds := []struct {
+		id         string
+		digestChar string
+		finishedAt time.Time
+	}{
+		{"bkp_old", "a", older},
+		{"bkp_new", "b", now},
+	}
+	for _, seed := range seeds {
+		finished := seed.finishedAt
+		if err := repo.CreateBackup(ctx, &domain.Backup{
+			ID:            seed.id,
+			PolicyID:      policy.ID,
+			Status:        domain.BackupSucceeded,
+			StorageDigest: domain.Digest("sha256:" + strings.Repeat(seed.digestChar, 64)),
+			StoredBytes:   1024,
+			ResourceKind:  domain.BackupResourceFiles,
+			StartedAt:     finished,
+			FinishedAt:    &finished,
+		}); err != nil {
+			t.Fatalf("seed backup: %v", err)
+		}
+	}
+}
+
+func pruneRequest(t *testing.T, server *httptest.Server, body any) (*http.Response, []byte) {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/backups/prune", strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return response, payload
+}
+
+// prune 是按策略跑的：没有策略名就不知道该按哪套规则清，必须在入口就拒绝。
+func TestPruneEndpointRequiresPolicy(t *testing.T) {
+	server, _ := newFullServer(t, withBackups(t, seedPrunableBackups))
+
+	response, payload := pruneRequest(t, server, v1.BackupPruneRequest{})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", response.StatusCode, string(payload))
+	}
+	if !strings.Contains(string(payload), string(v1.CodeInvalidRequest)) {
+		t.Fatalf("错误码应当是 INVALID_REQUEST：%s", string(payload))
+	}
+}
+
+func TestPruneEndpointDryRunThenReal(t *testing.T) {
+	server, _ := newFullServer(t, withBackups(t, seedPrunableBackups))
+
+	// 预演：报出将要标记的那一份，但什么都不动。
+	response, payload := pruneRequest(t, server, v1.BackupPruneRequest{Policy: "orders", DryRun: true})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", response.StatusCode, string(payload))
+	}
+	var preview v1.BackupPruneResponse
+	if err := json.Unmarshal(payload, &preview); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !preview.DryRun || preview.Policy != "orders" {
+		t.Fatalf("响应应当标明预演与策略名：%+v", preview)
+	}
+	if len(preview.Removed) != 1 || preview.Removed[0] != "bkp_old" {
+		t.Fatalf("keepLast=1 应当只报出较旧的那份，got %v", preview.Removed)
+	}
+	if preview.Kept != 1 {
+		t.Fatalf("应当报告保留 1 份，got %d", preview.Kept)
+	}
+	if preview.FreedBytes != 1024 {
+		t.Fatalf("应当报告预计释放的字节数，got %d", preview.FreedBytes)
+	}
+
+	// 预演之后那份应当还是 succeeded。
+	backup, err := getBackupThroughAPI(t, server, "bkp_old")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if backup.Status != string(domain.BackupSucceeded) {
+		t.Fatalf("预演不该改状态，got %s", backup.Status)
+	}
+
+	// 真跑。
+	response, payload = pruneRequest(t, server, v1.BackupPruneRequest{Policy: "orders"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", response.StatusCode, string(payload))
+	}
+	var real v1.BackupPruneResponse
+	if err := json.Unmarshal(payload, &real); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if real.DryRun || len(real.Removed) != 1 || real.Removed[0] != "bkp_old" {
+		t.Fatalf("实跑结果不对：%+v", real)
+	}
+	backup, err = getBackupThroughAPI(t, server, "bkp_old")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if backup.Status != string(domain.BackupPruned) {
+		t.Fatalf("被清理的备份状态应当是 pruned，got %s", backup.Status)
+	}
+	// 保留的那份不受影响。
+	backup, err = getBackupThroughAPI(t, server, "bkp_new")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if backup.Status != string(domain.BackupSucceeded) {
+		t.Fatalf("保留的那份不该被动，got %s", backup.Status)
+	}
+}
+
+// P7：声明了 gfs 的策略在**提交期**被拒（HTTP 层的证明）。
+func TestPutPolicyRejectsGFS(t *testing.T) {
+	server, _ := newFullServer(t, withBackups(t, nil))
+
+	manifest := `apiVersion: ops.frz.io/v1alpha1
+kind: BackupPolicy
+name: orders
+resource:
+  kind: files
+  paths:
+    - /srv/data
+encoding:
+  encryption:
+    enabled: false
+retention:
+  keepLast: 7
+  gfs:
+    daily: 7
+`
+	body, err := json.Marshal(v1.PutBackupPolicyRequest{Manifest: manifest})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	request, err := http.NewRequest(http.MethodPut, server.URL+"/api/v1/backup-policies/orders",
+		strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("put policy: %v", err)
+	}
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", response.StatusCode, string(payload))
+	}
+	if !strings.Contains(string(payload), string(v1.CodeManifestInvalid)) {
+		t.Fatalf("错误码应当是 MANIFEST_INVALID：%s", string(payload))
+	}
+	if !strings.Contains(string(payload), "gfs") {
+		t.Fatalf("错误信息要指明是 gfs：%s", string(payload))
+	}
+}
+
+func getBackupThroughAPI(t *testing.T, server *httptest.Server, id string) (*v1.Backup, error) {
+	t.Helper()
+	response, err := http.Get(server.URL + "/api/v1/backups/" + id)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(response.Body)
+		return nil, fmt.Errorf("want 200, got %d: %s", response.StatusCode, string(raw))
+	}
+	var out v1.BackupResponse
+	if err := json.NewDecoder(response.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out.Backup, nil
 }

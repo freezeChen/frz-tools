@@ -99,6 +99,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/backups/{id}", s.handleGetBackup)
 	mux.HandleFunc("POST /api/v1/backups/{id}/verify", s.handleVerifyBackup)
 	mux.HandleFunc("POST /api/v1/backups/{id}/restore", s.handleRestoreBackup)
+	// prune 是**同步**端点（与制品 GC 一致）：它删的是备份内容，但结果必须当场看得见。
+	mux.HandleFunc("POST /api/v1/backups/prune", s.handlePruneBackups)
 
 	mux.HandleFunc("POST /api/v1/schedules", s.handleCreateSchedule)
 	mux.HandleFunc("GET /api/v1/schedules", s.handleListSchedules)

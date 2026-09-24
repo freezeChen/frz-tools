@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
@@ -70,6 +71,14 @@ func (s *BackupService) SavePolicy(ctx context.Context, policy *domain.BackupPol
 	}
 	if err := policy.Validate(); err != nil {
 		return nil, err
+	}
+	// GFS 保留本版本尚未实现（停放在 docs/plans/2026-09-24-future-iterations.md 第 2 节）。
+	// 声明了它就在**提交期**拒掉：prune 一旦上线，「策略里写着每月留 6 份、而没人实现它」
+	// 就是一次静默的假承诺。把这个摩擦留在提交期，与「加密默认开启」同一个道理。
+	if policy.Retention.GFS.Declared() {
+		return nil, domain.NewError(v1.CodeManifestInvalid,
+			"retention.gfs 在本版本尚未实现（清理只支持 keepLast / keepDays）；"+
+				"请去掉 gfs，或等未来迭代——见 docs/plans/2026-09-24-future-iterations.md")
 	}
 	// 提交期就走一遍**适配器**的校验，而不只是领域模型的校验：
 	// 「这个 kind 本版本有没有适配器」「这份声明与工具的实际行为一致吗」
@@ -612,4 +621,179 @@ func itoa64(value int64) string {
 		return "-" + string(digits)
 	}
 	return string(digits)
+}
+
+// ---------------------------------------------------------------------------
+// 保留策略：prune
+// ---------------------------------------------------------------------------
+
+// PruneSkip 是一份**本轮没有删除**的备份及其原因。它必须出现在结果里而不是只写日志：
+// 运维看到「该删 200 份、实际删了 198 份」时会立刻想知道那两份去哪了。
+type PruneSkip struct {
+	BackupID string
+	Reason   string
+}
+
+// PruneResult 是一次 prune 的结果。字段刻意与 1a 制品 GC 的 GCResult 同源
+// （DryRun / Removed / Kept / FreedBytes），两者是同一个形状的运维动作。
+type PruneResult struct {
+	DryRun bool
+	Policy string
+
+	// Removed 是**本轮标记为已清理**的备份 ID。dry-run 时是「将要标记」的那些。
+	Removed []string
+	// Skipped 是应当删、但因为别的原因没删的那些。
+	Skipped []PruneSkip
+	// Kept 是保留策略保下来的份数。
+	Kept int
+	// FreedBytes 是实际释放（dry-run 时是预计释放）的字节数。
+	FreedBytes int64
+	// IgnoredRetention 是策略里声明了、而这一版**没有实现**的保留项。
+	//
+	// 提交期已经拒了带 gfs 的新策略（见 SavePolicy），但库里可能留着 2a/2b 时期写下的
+	// 那种策略。与其悄悄忽略，不如把它带到调用方看得见的地方。
+	IgnoredRetention []string
+	// Truncated 表示扫描撞到了上限，**更老的**备份可能没被看到（因此没被删）。
+	// 漏掉的只是不删，方向是保守的，但必须说出来：运维得知道「这次没清干净」。
+	Truncated bool
+}
+
+// 扫描上限与告警阈值。
+//
+// maxBackupScan 取一个远高于实际使用量的值：它不是「设计上的容量」，而是防呆——真撞到
+// 它说明要么部署异常、要么该换一种扫描方式（分页），结果里的 Truncated 会说出来。
+const (
+	maxBackupScan = 5000
+	// 决定 5：数量或删除量超过阈值时打一条 warn。同步 prune 会阻塞 HTTP 处理，
+	// 大到这个量级时值得在日志里留一句，好判断要不要改成异步。
+	pruneWarnThreshold = 200
+)
+
+// Prune 按策略声明的保留规则清理备份（同步用例，不是 Operation——与 1a 的制品 GC 一致）。
+//
+// 它**不含 GFS**：GFS 停放在 docs/plans/2026-09-24-future-iterations.md 第 2 节。
+// 判据只有 `keepLast` 与 `keepDays`，两者的并集，见 domain.PlanRetention。
+//
+// 三条安全边界，缺一条都会变成静默的数据丢失：
+//
+//  1. 只有 Usable()（已完成且校验没失败）的备份会被删；未完成、失败、校验失败的一律
+//     不进入清理范围（D9）。
+//  2. 有未完成 Operation 的备份跳过（排队中或正在跑都算），不让一份正在被用的备份
+//     卡住整批清理。
+//  3. 删内容之前确认没有别的备份记录还指着同一个 digest——**跨策略**确认，因为内容
+//     寻址是按内容去重的。
+func (s *BackupService) Prune(ctx context.Context, policyRef string, dryRun bool) (PruneResult, error) {
+	result := PruneResult{DryRun: dryRun}
+	if !s.Configured() {
+		return result, domain.NewError(v1.CodeConfigInvalid, "本部署未配置备份存储根，无法清理备份")
+	}
+
+	policy, err := s.repo.GetBackupPolicy(ctx, policyRef)
+	if err != nil {
+		return result, err
+	}
+	result.Policy = policy.Name
+
+	// 一次 prune 里只取一次「现在」：cutoff 与审计时间必须同源，否则同一个请求里的
+	// 两次判断会落在不同的时代上。
+	now := s.now()
+
+	backups, err := s.repo.ListBackupsForRetention(ctx, policy.ID, maxBackupScan)
+	if err != nil {
+		return result, err
+	}
+	if len(backups) >= maxBackupScan {
+		result.Truncated = true
+		s.logger.Warn("backup scan hit the cap, older backups were not considered",
+			"policy", policy.Name, "cap", maxBackupScan)
+	}
+
+	plan := domain.PlanRetention(policy, backups, now)
+	result.Kept = len(plan.Keep)
+	result.IgnoredRetention = plan.Ignored
+	if len(plan.Ignored) > 0 {
+		s.logger.Warn("policy declares retention rules this version does not implement, they were ignored",
+			"policy", policy.Name, "ignored", strings.Join(plan.Ignored, ","))
+	}
+
+	byID := make(map[string]domain.Backup, len(backups))
+	for _, backup := range backups {
+		byID[backup.ID] = backup
+	}
+
+	for _, id := range plan.Delete {
+		if err := ctx.Err(); err != nil {
+			return result, domain.NewError(v1.CodeExecCancelled, "清理被取消")
+		}
+		backup := byID[id]
+
+		// 「正在被操作」= 这个备份上还有未完成的 Operation（**排队中**也算）。
+		// 不能用活跃锁代替：锁是 worker 领取时才拿的，排队中的恢复拿不到锁。
+		inUse, err := s.repo.HasIncompleteOperation(ctx, id)
+		if err != nil {
+			return result, err
+		}
+		if inUse {
+			result.Skipped = append(result.Skipped, PruneSkip{BackupID: id, Reason: "正在被操作（恢复或校验），本轮跳过"})
+			continue
+		}
+
+		if dryRun {
+			// dry-run 也要做引用检查：报出来的字节数必须是**真的**会释放的字节数。
+			// 这里还没标记，所以这一行自己仍然算一份引用。
+			references, err := s.countBackupReferences(ctx, backup)
+			if err != nil {
+				return result, err
+			}
+			result.Removed = append(result.Removed, id)
+			if references <= 1 {
+				result.FreedBytes += backup.StoredBytes
+			} else {
+				result.Skipped = append(result.Skipped, PruneSkip{BackupID: id, Reason: "内容仍被其它备份引用，只标记不删内容"})
+			}
+			continue
+		}
+
+		// 先标记元数据、再判断内容能不能删（D9 的顺序）。
+		if err := s.repo.MarkBackupPruned(ctx, id, now); err != nil {
+			return result, err
+		}
+		result.Removed = append(result.Removed, id)
+
+		references, err := s.countBackupReferences(ctx, backup)
+		if err != nil {
+			return result, err
+		}
+		if references > 0 || backup.StorageDigest == "" {
+			if references > 0 {
+				result.Skipped = append(result.Skipped, PruneSkip{BackupID: id, Reason: "内容仍被其它备份引用，只标记不删内容"})
+			}
+			continue
+		}
+		if err := s.store.Delete(ctx, backup.StorageDigest); err != nil {
+			return result, err
+		}
+		result.FreedBytes += backup.StoredBytes
+	}
+
+	if len(result.Removed)+len(result.Skipped) >= pruneWarnThreshold {
+		s.logger.Warn("prune touched a large number of backups, consider whether it should be asynchronous",
+			"policy", policy.Name, "removed", len(result.Removed), "skipped", len(result.Skipped),
+			"dryRun", dryRun)
+	}
+	s.logger.Info("backup prune finished",
+		"policy", policy.Name, "dryRun", dryRun, "removed", len(result.Removed),
+		"skipped", len(result.Skipped), "kept", result.Kept, "freedBytes", result.FreedBytes)
+	return result, nil
+}
+
+// countBackupReferences 数还有多少份未删除的备份指着这份备份的内容。
+//
+// 调用时机决定这个数字的含义：**标记之前**数（dry-run 就是这样）时这一行自己也算一份，
+// 因此「只有它自己」= 1；**标记之后**数（真实路径）时它已经被排除，因此「没人指着」= 0。
+func (s *BackupService) countBackupReferences(ctx context.Context, backup domain.Backup) (int, error) {
+	if backup.StorageDigest == "" {
+		return 0, nil
+	}
+	return s.repo.CountBackupReferencesByDigest(ctx, backup.StorageDigest)
 }

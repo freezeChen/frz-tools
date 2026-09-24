@@ -130,3 +130,15 @@ func policyNameOf(manifest string) string {
 	}
 	return ""
 }
+
+// PruneBackups 按策略声明的保留规则清理备份。
+//
+// 它是**同步**调用（与制品 GC 一致）：服务端当场把结果算完再返回，不产生 Operation。
+func (c *Client) PruneBackups(ctx context.Context, policy string, dryRun bool) (*v1.BackupPruneResponse, error) {
+	var out v1.BackupPruneResponse
+	if err := c.do(ctx, http.MethodPost, "/api/v1/backups/prune", nil,
+		v1.BackupPruneRequest{Policy: policy, DryRun: dryRun}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

@@ -19,7 +19,8 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 
 **迭代 2a（备份：端口、策略模型、文件适配器、传输编码、API+CLI）与 2b
 （PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
-**2d 未开始**，且其中的 **GFS 保留策略已按用户指示移出 2d、停放为未来迭代目标**
+**2d（保留策略与 `prune`）已实现并验证**——范围是**只用 `keepLast` / `keepDays`**，
+**GFS 已按用户指示移出并停放为未来迭代目标**
 （见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）；迭代 3–5 未开始。
 **真实 Linux 主机的证据已于 2026-09-24 取得**（Rocky Linux 10.2 / systemd 257 / SELinux
 enforcing，含一次真实重启，见 `test/host/`）；
@@ -38,8 +39,8 @@ enforcing，含一次真实重启，见 `test/host/`）；
 - `docs/plans/2026-09-21-iteration-1b.md`：调度器（已实现并提交）
 - `docs/plans/2026-09-21-iteration-1c.md`：Linux 适配（已实现并提交）
 - `docs/plans/2026-09-21-iteration-1d.md`：任务引擎的重试、退避与并发策略（已实现并提交）
-- `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b 已实现并验证，2d 未开始，
-  GFS 已移出，见第 22 节）
+- `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b、2d 已实现并验证；
+  GFS 已移出 2d，见第 22 节）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -146,7 +147,7 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 `make verify-host`（`test/host/run.sh` + `test/host/verify.sh`）是**第一类「Linux 主机」证据**：
 在一台真实主机（2026-09-24：**Rocky Linux 10.2 / 内核 6.12 / systemd 257 / SELinux Enforcing** /
 x86_64）上把 opsd 装成 systemd 服务、跑完 RuntimeAdapter 的生命周期与真实的 MySQL 8.4 备份闭环，
-实跑 **93 项通过 / 0 项失败**（1c 的 71 项 + 2b 的 22 项），结束时把主机上创建的一切删干净。
+实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），结束时把主机上创建的一切删干净。
 **重启验证也做了**（用户单独授权重启那台机）：停机 44 秒、`boot_id` 前后不同（这是「真的
 重启过」的硬证据）、重启后 **21 项通过 / 0 项失败**——两个 unit 都 enabled 且自动回到 active、
 **`/run/opsd` 由 systemd 重新创建**（`/run` 是 tmpfs，容器里被 `install -d` 掩盖的那一点）、
