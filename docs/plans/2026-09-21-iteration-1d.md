@@ -516,7 +516,7 @@ CREATE INDEX ix_operations_retry_of ON operations (retry_of) WHERE retry_of IS N
   3. 已就绪过再被 SIGKILL → unit 由 systemd 重启（`NRestarts=1`）、链上仍只有一行。
 - 规格 D6 处已加「2026-09-24 更正」说明，不删原文。
 
-### 发现但**未**修（属本次范围之外）
+### 发现但**未**修（属本次范围之外；**2026-09-24 已修复**，见下）
 
 - **`created_at` 的排序不是严格的时间序**。仓库的时间戳统一用 `time.RFC3339Nano` 格式化，
   而它会裁掉末尾的零、并在小数部分为零时整个省略——于是 `"…T00:00:00Z"` 按字典序**大于**
@@ -526,6 +526,15 @@ CREATE INDEX ix_operations_retry_of ON operations (retry_of) WHERE retry_of IS N
   「重试」这个提交同时承担一次格式迁移的风险。本次只保证**新引入的 `not_before` 不踩同一个坑**
   （用定宽格式）。影响面是同一秒内提交的操作可能被乱序领取，不影响正确性、只影响顺序。
   已作为独立事项记录，待单独处理。
+
+> **2026-09-24 已修复**（提交 `7d15880`，独立于 1d 的功能范围）：`timeLayout` 改为定宽
+> `2006-01-02T15:04:05.000000000Z`（写入侧统一），读回改用 `time.RFC3339Nano`——它能接受
+> 任意小数位数（含没有小数部分），因此新旧值都读得动，**宽读窄写**。1d 里为 `not_before`
+> 单独加的 `notBeforeLayout` / `formatNotBefore` 是同一处理的局部特例，推广后删除，所有时间
+> 列共用 `formatTime`。既有库里的可变宽度值由
+> `migrations/0007_normalize_timestamp_width.sql` 规范化（13 张表的全部时间列，表达式是恒等
+> 变换、可重复执行）。复现用例、迁移用例、影响面与「未验证」项见路线图
+> 「2026-09-24（补记五）」。**上面这段发现记录保留原文，只在此标注状态。**
 
 ## 14. 验证记录
 
