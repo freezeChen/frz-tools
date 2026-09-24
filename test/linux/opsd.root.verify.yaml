@@ -1,0 +1,47 @@
+apiVersion: ops.frz.io/v1alpha1
+kind: OpsdConfig
+
+# 这是 1c RuntimeAdapter 验证专用的实例配置：以 root 运行的 opsd。
+#
+# 为什么需要第二个实例：适配器要建用户（useradd）、改目录属主（chown）、装 unit 并
+# daemon-reload/enable（systemctl）——这些都需要 root。迭代 0 的 harness 以专用系统用户
+# frz-ops 运行 opsd（它覆盖的是不需要权限的操作：executor/sqlite/socket 语义），
+# 那条路径的断言继续打在原实例上，本文件只服务容器里的 runtime 组。
+#
+# socket / 数据库 / 工作目录 / 制品目录全部独立，避免两个实例互相干扰。
+socket:
+  path: /run/opsd-root/opsd.sock
+  mode: "0660"
+
+database:
+  path: /var/lib/opsd-root/opsd.db
+
+runtime:
+  workDirectory: /var/lib/opsd-root/work
+  logDirectory: /var/log/opsd-root
+  workers: 2
+
+execution:
+  defaultTimeoutSeconds: 30
+  maxOutputBytes: 65536
+  allowedPaths:
+    - /bin
+    - /usr/bin
+    - /usr/local/bin
+  sensitiveEnvKeys:
+    - TOKEN
+
+artifactStore:
+  root: /var/lib/opsd-root/artifacts
+  fileMode: "0640"
+  dirMode: "0750"
+  # 与 opsd.verify.yaml 同因：runtime 夹具的制品就是探针二进制本体（约 3.5 MiB）。
+  maxUploadBytes: 8388608
+  quotaBytes: 16777216
+
+secrets:
+  allowedFileDirectories:
+    - /etc/opsd/secrets
+
+sudo:
+  allowedCommands: []

@@ -27,6 +27,9 @@ type Dependencies struct {
 	Service   *application.Service
 	Artifacts *application.ArtifactService
 	Catalogs  *application.CatalogService
+	Specs     *application.SpecService
+	Hosts     *application.HostService
+	Runtimes  *application.RuntimeService
 	Schedules *application.ScheduleService
 	Store     *sqlite.Store
 	Workers   int
@@ -62,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/artifacts", s.handleListArtifacts)
 	mux.HandleFunc("POST /api/v1/artifacts/gc", s.handleCollectArtifacts)
 	mux.HandleFunc("GET /api/v1/artifacts/{id}", s.handleGetArtifact)
+	mux.HandleFunc("GET /api/v1/artifacts/{id}/content", s.handleDownloadArtifact)
 	mux.HandleFunc("POST /api/v1/artifacts/{id}/verify", s.handleVerifyArtifact)
 	mux.HandleFunc("DELETE /api/v1/artifacts/{id}", s.handleDeleteArtifact)
 
@@ -69,8 +73,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/applications", s.handleListApplications)
 	mux.HandleFunc("GET /api/v1/applications/{id}", s.handleGetApplication)
 	mux.HandleFunc("GET /api/v1/applications/{id}/releases", s.handleListApplicationReleases)
+	mux.HandleFunc("PUT /api/v1/applications/{id}/spec", s.handlePutApplicationSpec)
+	mux.HandleFunc("GET /api/v1/applications/{id}/spec", s.handleGetApplicationSpec)
+	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/validate", s.handleValidateRuntime)
+	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/prepare", s.handlePrepareRuntime)
+	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/start", s.handleStartRuntime)
+	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/stop", s.handleStopRuntime)
+	mux.HandleFunc("GET /api/v1/applications/{id}/runtime/health", s.handleRuntimeHealth)
 	mux.HandleFunc("POST /api/v1/releases", s.handleCreateRelease)
 	mux.HandleFunc("GET /api/v1/releases/{id}", s.handleGetRelease)
+
+	mux.HandleFunc("GET /api/v1/hosts", s.handleListHosts)
+	mux.HandleFunc("POST /api/v1/hosts", s.handleCreateHost)
+	mux.HandleFunc("GET /api/v1/hosts/{id}", s.handleGetHost)
+	mux.HandleFunc("GET /api/v1/environments", s.handleListEnvironments)
+	mux.HandleFunc("POST /api/v1/environments", s.handleCreateEnvironment)
+	mux.HandleFunc("GET /api/v1/environments/{id}", s.handleGetEnvironment)
 
 	mux.HandleFunc("POST /api/v1/schedules", s.handleCreateSchedule)
 	mux.HandleFunc("GET /api/v1/schedules", s.handleListSchedules)

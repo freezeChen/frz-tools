@@ -1,7 +1,9 @@
 # Linux 迭代 1c：Linux 适配（RuntimeAdapter 与 systemd）
 
-> 文档日期：2026-09-22
-> 文档状态：Proposed / 待确认设计，未实现
+> 文档日期：2026-09-22（2026-09-23 两次回填实现与验证记录）
+> 文档状态：**实现完成、验证进行中**——A2–A7 已在工作树落地（HEAD 仍为 `747aee9`，改动未提交），
+> 并已在 **Linux 容器**中实跑通过（`make verify-linux` 第 5 轮 **89 通过 / 0 失败**）；
+> 仍缺 `legacy` 档与真实 Linux 主机的证据，见第 16 节末尾与第 17 节
 > 对应路线图：[2026-09-21-linux-ops-tool-roadmap.md](./2026-09-21-linux-ops-tool-roadmap.md)（第 4 节「Linux 适配」）
 > 前置迭代：[2026-09-21-iteration-1a.md](./2026-09-21-iteration-1a.md)（已实现并提交）
 
@@ -35,6 +37,9 @@
 - 发布流程、release 目录、失败清理、健康通过才接流（迭代 3）。
 - slot 与蓝绿、Nginx、切流与回滚（迭代 4）。
 - 远程主机、SSH、mTLS、批量执行（迭代 5）。
+- sudo 白名单（`sudo.allowedCommands`）：配置模型已在迭代 0 冻结，但 1c **未实现任何行为**
+  ——读取该字段的代码不存在。在真实 Linux 主机上验证 sudoers 之前，不得当作已生效的
+  安全控制（迭代 0 遗留项，见 `2026-09-21-iteration-0.md` 第 395 行）。
 - systemd timer：**已决定不生成**（2026-09-22）。调度权威归 1b 的 `opsd` 进程内调度循环，
   1c 只生成 `.service`，避免同一条计划被两套机制各触发一次。详见 1b 第 13 节第 2 条。
 
@@ -120,6 +125,10 @@ systemd:
 `mediaType → 解包方式` 约定：`application/x-tar`→`tar`、`application/gzip`
 与 `application/x-gzip`→`tar-gz`、`application/zip`→`zip`；其余默认 `none`（当作裸二进制）。
 若 manifest 显式声明的策略与 mediaType 冲突，返回 `MANIFEST_CONFLICT`。
+
+> **实现偏差（2026-09-23 补注）**：上面 yaml 里的 `type: tcp  # tcp | http | exec` 是冻结时的
+> 设想，**实现只支持 `tcp` 与 `http`**；`exec` 未实现，理由与影响见第 6 节末尾
+> 「实现比规格更严的三处」第 1 条。
 
 ## 5. Host 与 Environment
 
@@ -243,6 +252,24 @@ systemd 会处理环境文件里的反斜杠转义。实测（systemd 255）确�
 工作目录、日志目录和解包目录，写不进去就说明规格里漏声明了路径，属于需要暴露的错误；
 `legacy` 档做不到同等强度（见上表），降级结论必须写进审计。
 
+### 实现比规格更严的三处（2026-09-23 补注）
+
+以下三处是**实现刻意比本节规格更严格**，不是遗漏；理由都写在代码注释里，并有测试钉住：
+
+1. **`readiness.type` 只有 `tcp` 与 `http`**：本节 yaml 里的 `tcp | http | exec` 是冻结时的设想，
+   `exec` 的 `target` 与参数语义从未定义，凭空实现一套未冻结的语义比明确不支持更危险
+   （`internal/domain/appspec.go` 第 39–44 行的注释；实际取值只有 `ReadinessTCP`/`ReadinessHTTP`，
+   测试钉住了对 `exec` 的拒绝）。**需要 `exec` 时必须先补一份冻结决定再实现**，
+   不能按本节现在的文字当作已支持。
+2. **渲染层拒绝含换行、空白、引号或反斜杠的路径**（`internal/adapters/runtime/unitfile/unit.go`
+   第 253 行的 `checkRenderablePath`）：manifest 只校验「必须是绝对路径」，而这些字节写进 unit
+   会被 systemd 重新解释——换行会直接变成一条新指令（等于把 unit 配置的书写权交给 manifest
+   作者）、空白会切开 `ReadWritePaths=` 的路径列表、引号与反斜杠会按 C 转义把路径悄悄改写。
+   这些指令的反斜杠/引号规则没有在真实主机上验证过，因此宁可显式拒绝。
+3. **健康检查超时必须是整秒**（同文件第 271 行的 `wholeSeconds`）：`health.startTimeoutSeconds`
+   与 `stopTimeoutSeconds` 出现亚秒值时直接报错，而不是截断——渲染层做截断会让「manifest 里写的」
+   与「unit 里生效的」不再一致，而 unit 里出现的数字事后无从解释。
+
 ## 7. 用户、目录、环境文件与凭据
 
 - **用户**：`useradd --system --no-create-home --home-dir <workingDirectory> --shell /usr/sbin/nologin <runUser>`。
@@ -264,6 +291,59 @@ systemd 会处理环境文件里的反斜杠转义。实测（systemd 255）确�
 - 敏感环境文件与凭据文件必须 `0600`、凭据目录 `0700`，属主为运行用户；
 - `opsd` 自身与日志、审计、错误信息中仍按值脱敏；写文件与渲染 unit 的过程不得打印值；
 - 必须在 Linux 容器中验证权限强制效果，并在第 14 节标注真实主机未验证。
+
+### `/etc/opsd` 的权限例外：过路目录补 `0751`（2026-09-23 补注）
+
+本节上面的目录/文件模式描述与迭代 0 §9 的安装约定（`/etc/opsd` 建成 `0750`、属主是 `opsd`）
+对 `kind: file` 的凭据**不成立**，必须显式记下这个例外：
+
+- **为什么必须**：`kind: file` 的凭据是**应用以 `runUser` 身份按路径自己去打开的**（环境变量里
+  传的是路径）。`0750` 且属主是 `opsd` 时，`runUser` 既不是属主也不在主组，命中的是 other 位
+  `---`，**没有 `+x` 就穿不过目录，应用打不开自己的凭据文件**——而这一点在开发机上不可见
+  （本地跑测试时「runUser」就是测试进程本身，走的是属主分支）。`kind: env` 的凭据由 systemd
+  以 root 读环境文件，不受影响。
+- **只加穿越位，不放开读位**：`Prepare` 对**属于 `opsd` 自己**的过路层级
+  （`/etc/opsd`、`/etc/opsd/apps`）执行 `mode | 0111`，即 `0750 → 0751`（更严格时
+  `0700 → 0711`），**只补 `+x`**——`opsd` 自己的 `config.yaml`（`0600`）与 `secrets/`（`0700`）
+  的保护不变，other 依然不能读与列目录；不属于我们的层级（例如 root 拥有的 `/etc`）**不修改**。
+- **不属于我们的层级改为校验并快速失败**：整条链（从 `/etc` 到凭据目录）逐级校验 `runUser`
+  能否穿越，不能就让 `Prepare` 以 `PERMISSION_DENIED` 失败，并给出确切的修复命令
+  （`chmod ...`，只放开穿越位）。宁可 `Prepare` 失败，也不要让应用带着一个打不开的凭据路径启动。
+- **作用域尽量小**：没有 `kind: file` 凭据时，`Prepare` 不改任何共享目录的权限位。
+
+落点：`internal/adapters/runtime/systemd/files.go` 第 186 行 `ensureCredentialReachable`、
+第 196 行的「归我们管理」集合、第 236 行 `credentialPathLevels`、第 258 行 `canChmod`、
+第 265 行 `traversable`、第 110 行 `ensureAncestors`（新目录按 `0751` 建并显式 `Chmod`，
+不受 umask 影响）。
+
+**「归我们管理」只有三级，且 `canChmod` 必须认 root**（这一条是 Linux 容器实跑逼出来的）：
+
+- 可收敛的目录**只有三级**：凭据目录 `/etc/opsd/apps/<app>.secrets`、`/etc/opsd/apps`、
+  `/etc/opsd`（`files.go` 第 196–200 行的 `managed` 映射）。**更高层（`/`、`/etc`）只校验、
+  绝不修改**——一次 `Prepare` 顺手把系统目录权限改宽，属于「本地没人发现、真机上被安全扫描
+  发现」的那类改动。
+- `canChmod(euid, dirUID)`（第 258 行）判定的是**本进程能不能收敛这个目录**：
+  `euid == 0 || dirUID == euid`。**root 这一支是必需的**——适配器要 `useradd`/`chown`/`systemctl`，
+  生产上必须以 root 运行，而安装约定把 `/etc/opsd` 的属主给了 opsd 的**服务用户**
+  （`test/linux/verify.sh` 里是 `frz-ops`），于是「目录属主 == 自己的 euid」这一条会把
+  root 本来修得好的目录判成不可修，让 `Prepare` 在**完全正常的部署**上失败。
+  第一版实现漏了这一支，由 `make verify-linux` 的 `check_runtime` 实跑发现（详见第 17 节）。
+- 单元测试：`TestCanChmod`（`credentialpath_internal_test.go` 第 43 行）用表驱动钉住
+  「root 可以、属主可以、其他人不可以」；`TestTraversable`（第 14 行）、
+  `TestCredentialPathLevels`（第 65 行）覆盖判定与路径分层。
+- 容器断言：`check_runtime` 里 `runuser -u <runUser> -- cat` 成功、`frz-other` 被拒，
+  以及 `Prepare` 后 `/etc/opsd` 为 `0751`（other 有 `+x` 无 `+r`）——**已实跑通过**。
+- 同进程内的单元测试（跑在假 runner / 临时根前缀上）：`TestCredentialPathIsReachableByRunUser`
+  （`systemd_test.go` 第 740 行）、`TestPrepareRepairsInstallerOwnedEtcOpsd`（第 780 行，
+  断言 `0750 → 0751`、`0700 → 0711` 且 other 不得有读位）、
+  `TestPrepareWithoutFileSecretsLeavesSharedDirsAlone`（第 811 行）。
+
+**时序关系（避免误读为自相矛盾）**：`check_filesystem` 第 247 行的「`/etc/opsd` 模式 = `750`」
+发生在 `Prepare` **之前**（那是安装脚本留下的状态，断言保留不变），`check_runtime` 的 `751`
+发生在 `Prepare` **之后**——安装时 `0750`、首次 `Prepare` 后 `0751`，两者都成立。
+
+**仍未验证**：以上都是 **Linux 容器**（Ubuntu 24.04 / systemd 255 / arm64）里的结论；
+真实 Linux 主机上的 umask、挂载选项差异与 SELinux/AppArmor 约束仍未验证（见第 14 节）。
 
 ## 8. 持久化（migration `0004`）
 
@@ -295,7 +375,12 @@ CREATE TABLE environments (
 
 `application_specs` 以 `application_id` 为主键，即**每个应用一份当前规格**。
 迭代 3 若要让规格随 release 版本化，需改为 `(release_id, spec_json)` —— 这属于破坏性变更，
-必须提升 `apiVersion` 或新增表，记在第 16 节。
+必须提升 `apiVersion` 或新增表，决定见第 15 节第 3 条。
+
+> **落地情况（2026-09-23）**：本节的三张表已由 `migrations/0004_hosts_specs.sql` 落地，
+> 内容与本节的 SQL 一致（只 `CREATE TABLE`，且文件头注释重申了「刻意不加永远为 NULL 的
+> `release_id`」）；仓储在 `internal/adapters/sqlite/host.go` 与 `spec.go`，
+> 本机 Host 自举在 `internal/application/host.go`。见第 16 节的 A2。
 
 ## 9. API 与 CLI
 
@@ -323,6 +408,11 @@ opsctl env list
 `runtime/start` 与 `stop` 直接走 `Operation`（`kind=runtime.start` / `runtime.stop`），
 复用既有的锁、状态机、审计与取消——**不新增旁路**，这样 1a 的 `executor.command`
 与 1c 的 `runtime.*` 在查询、日志、取消、重试上完全一致。
+
+> **落地情况（2026-09-23）**：本节的端点与 CLI 全部落地（见第 16 节 A6a/A6b）。
+> 两处如实记录：CLI 除这里列的 `host list`、`env list` 之外，还实现了
+> `host create|inspect` 与 `env create|inspect`（API 本就有 `POST` 与详情端点，属自然补全）；
+> `/runtime/health` 未就绪时返回 `200` + `ready:false`（供轮询），只有确定性失败才 `409`。
 
 ## 10. 错误码与退出码增量
 
@@ -367,6 +457,13 @@ opsctl env list
 - `runtimecontract` 在 `proc` 适配器上全绿（macOS / CI）。
 - 同一套件在 systemd 适配器上于 Linux 容器内全绿。
 
+> **落地现状（2026-09-23）**：`proc` 与 `systemd` **都已经**在本地跑这套合约（systemd 那一份跑在
+> 「假 `systemctl` + 根前缀」上，`internal/adapters/runtime/systemd/contract_test.go`）。
+> 容器内更进了一步：`check_runtime` 用**真实 systemd** 走通了适配器的端到端路径
+> （`runtime prepare/start/health/stop` + `systemctl is-active`），这是比合约套件更强的证据；
+> 但**「Go 合约套件本身在容器里被执行过」这一点没有核实**，所以本小节第二条不完全按
+> 「合约套件在容器内全绿」记，而是记作「容器内真实 systemd 上的适配器行为已通过」。
+
 ### Linux 容器（扩展 `make verify-linux`）
 
 - systemd 适配器 `Prepare` 后：用户存在、目录 `0750`、非敏感环境文件 `0600`、
@@ -377,6 +474,20 @@ opsctl env list
 - `kind: file` 的凭据文件可被运行用户读到、且内容与源一致。
 - `ProtectSystem=strict` 下进程写入未声明路径必须失败。
 - **敏感环境文件缺失时 unit 必须启动失败**（对应 `EnvironmentFile` 不加 `-` 的设计）。
+
+> **落地现状（2026-09-23）**：以上断言**已全部写进** `test/linux/verify.sh` 的 `check_runtime`，
+> 并且**已在容器中实跑通过**：第 5 轮 `make verify-linux` 退出码 0，**89 项通过 / 0 项失败**
+> （其中 `check_runtime` 49 项；证据类型 **Linux 容器**：Ubuntu 24.04 / systemd 255 / arm64）。
+> 前 4 轮暴露了 3 处问题（第 1 轮 25 FAIL）——其中一处是**产品缺陷**（`canChmod` 不认 root），
+> 完整过程见第 17 节 A7。
+>
+> `check_runtime` 打在一个**以 root 运行**的第二个 `opsd` 实例上（配置
+> `test/linux/opsd.root.verify.yaml`；适配器要 `useradd`/`chown`/`systemctl`，必须 root），
+> 其余各组的断言仍打在原来以 `frz-ops` 运行的实例上、前缀未动。
+> **另有一条语义修正**：`Restart=on-failure` 下 unit 失败后 `ActiveState` 只是瞬时 `failed`，
+> 等待自动重启期间是 `activating`（`SubState=auto-restart`），所以「缺凭据必须启动失败」被
+> 断言成「12×0.5s 窗口内从未 `active`，且观察到的状态只能是 `activating`/`failed`」——
+> **不要把「停止」与「失败」混为一谈**（`verify.sh` 第 649–678 行）。
 
 ### 回归
 
@@ -399,7 +510,33 @@ opsctl env list
 11. `make ci` 与 `make verify-linux` 全绿。
 12. 迭代 0、1a、1b 的回归用例全部继续通过。
 
+### 逐条判定（2026-09-23）
+
+证据类型严格区分：**静态 / 单元 / 集成 / e2e / Linux 容器 / Linux 主机**。
+
+| # | 判定 | 证据与类型 |
+| --- | --- | --- |
+| 1 | **达成** | 单元：`internal/adapters/manifest/manifest_test.go:250,271`（断言错误码 `MANIFEST_INVALID`）、`internal/adapters/httpapi/spec_test.go`；集成：同名端点用例；e2e：`TestSpecPutRejectsInvalidManifestThroughCLI`（退出码 17） |
+| 2 | **达成** | 单元：`TestPrepareCommandSequenceIsIdempotent`:137、`TestPrepareDoesNotRewriteUnchangedFiles`:707（mtime 不变）；**Linux 容器**：`check_runtime` 的「第二次 Prepare 幂等且档位不变」（`verify.sh` 第 569–574 行，断言在第 574 行） |
+| 3 | **达成** | **Linux 容器**：`check_runtime` 走完 `runtime start`（Operation 终态 `succeeded`）→ `runtime health` 就绪 → `systemctl is-active` = `active` → `runtime stop` 终态 `succeeded` → 停止后 `inactive`；本地侧另有 `proc` 的合约断言（单元） |
+| 4 | **达成** | **Linux 容器**：`check_runtime` 断言用户存在、目录 `0750` 属主 `runUser`、两个环境文件 `0600`、凭据目录 `0700`、凭据文件 `0600` 且内容与源逐字节一致、unit `0644`、`/etc/opsd` 补 `0751` 后可跨用户读 |
+| 5 | **达成** | 单元：`escape_test.go`（`TestEscapeArg`/`TestEscapeArgs`/`TestEscapeEnvValue*`）+ `unit_test.go` 的 `TestRenderUnitEscapesExecStartArguments`:213（含引号、反斜杠、空参数、含空格的参数） |
+| 6 | **达成** | **Linux 容器**：`check_runtime` 用探针应用比对两类凭据的**长度与 sha256**（值含 `\`、`"`、字面 `\n`、`$`、单引号与首尾空格），与源逐字节一致；单元侧有 `escape_test.go` 的逐字节往返 |
+| 7 | **达成** | 单元：`TestPrepareRejectsMultilineEnvSecret`:254（`SECRET_UNRESOLVED` 且指向字段）、`TestPrepareDeliversMultilineFileSecret`:277（多行文件凭据可交付） |
+| 8 | **部分达成** | `strict` 档渲染：单元（`strictUnit` 黄金文本逐字节比对，`:130`）+ **Linux 容器**（`check_runtime` 从 `runtime prepare` 的返回里核对 `tier`/`systemdVersion`，并在 unit 头注释里核对）；`legacy` 档渲染：只有单元（`legacyUnit` 黄金文本，`:153`）——**`legacy` 档的实际加载/运行本次容器是 systemd 255，零 legacy 证据**，按本条要求仍标注**未验证** |
+| 9 | **达成** | 集成：`httpapi/artifact_test.go` 的下载端点用例；e2e：`TestArtifactDownloadThroughCLI`（按 ID 与摘要各下载一次、字节一致、摘要一致，损坏 blob 时退出码 5 且不留目标文件） |
+| 10 | **达成** | 单元/集成：`internal/application/runtimeops_test.go`（14 用例，含无旁路复用与取消）；**Linux 容器**：`check_runtime` 里 `runtime start/stop` 都是真实 Operation 且以 `operation get` 轮询到终态 `succeeded`；`test/e2e/runtime_test.go`（本机无适配器时的退出码 21 属回归保护） |
+| 11 | **达成** | `make fmt`/`make vet`/`make test`（16 个包）/`make test-race`/交叉编译 exit 0（实现者实跑）；**Linux 容器**：`make verify-linux` 第 5 轮退出码 0、**89 项通过 / 0 项失败** |
+| 12 | **达成** | 单元/集成/e2e：16 个包全绿（实现者实跑）；**Linux 容器**：迭代 0 的既有断言语义仍打在原 `frz-ops` 实例上、全部通过 |
+
+**仍未达成/未验证的只剩一处**：第 8 条的 `legacy` 档（无任何容器或真机证据），
+以及第 14 节的真实 Linux 主机项（reboot 持久化、SELinux/AppArmor、sudoers/PAM）。
+
 ## 14. 未验证内容
+
+> **现状（2026-09-23）**：1c 已经取得 **Linux 容器**证据（`make verify-linux` 第 5 轮 89/0，
+> Ubuntu 24.04 / systemd 255 / arm64）。下面各项**仍然未验证**，且**都不能**由容器证据替代；
+> 逐条现状见第 16 节末尾与第 17 节。
 
 - 真实 Linux 主机上的 **reboot 后 unit 持久化**、`WantedBy=multi-user.target` 实际生效。
 - **SELinux/AppArmor** 对 `ProtectSystem=strict` 与路径写入的实际约束。
@@ -472,3 +609,452 @@ opsctl env list
 2. `legacy` 档在拿到主机前，一律标注为**未验证**，不得声称「已支持」；
 3. 拿到主机后，用第 12 节列出的 Linux 容器断言清单在本机重跑，证据类型记作
    **Linux 主机**（不是 Linux 容器），并单独记录 systemd 版本与发行版。
+
+## 16. 实现记录 2026-09-23
+
+本节记录 1c 的两批落地：2026-09-22 已提交的两个提交（下文「已提交」部分），以及
+2026-09-23 落地在**工作树、尚未提交**的 A2–A7（下文第二部分）。上一版本节曾把 A2–A6b 写成
+「在建工作」快照；它们现已全部落地，本节据此重写并删除那个小节。
+
+> **核对基准**：下文第一部分以已提交状态（HEAD `747aee9`）为基准，第二部分以 **2026-09-23 的
+> 工作树**为基准（HEAD 未变，A2–A7 的改动都在工作树里）。每条都给出 `文件:行`，可在仓库里
+> 逐条核对；未提交这一点在每处都已标明，避免后来者误以为 HEAD 已有这些代码。
+> **代码落地 ≠ 验证通过**：本节把「实现」与「证据」分开写；`legacy` 档与真实 Linux 主机项
+> 至今没有证据，见第 16 节末尾与第 17 节。
+
+### 已实现范围（已提交：`3938db4`、`747aee9`）
+
+| 提交 | 标题 | 落地内容 |
+| --- | --- | --- |
+| `3938db4` | 迭代 1c（一）：manifest 领域模型与 systemd 转义 | 领域模型与应用规格、manifest 严格解码与迁移链、转义函数、1c 错误码 |
+| `747aee9` | 迭代 1c（二）：RuntimeAdapter 端口、共享合约测试与 proc 假适配器 | `RuntimeAdapter` 端口、共享合约套件、`proc` 假适配器、转义函数迁到 `unitfile` |
+
+逐项对应：
+
+- **`internal/domain/appspec.go`（418 行）**：`ApplicationSpec` 与 `artifact`/`unpack`/`exec`/
+  `health`/`logs`/`systemd` 各段模型、`Validate`（第 128 行）、`applyDefaults`（第 296 行，
+  未声明字段填默认值：`unitName` 由应用名派生、`restartPolicy=on-failure`、
+  健康检查超时 60s/30s、`consecutiveSuccesses=1`）、`MediaTypeUnpackStrategy`（第 358 行）
+  与 `CheckUnpackMediaType`（第 375 行），以及集中一处的路径约定函数 `EnvFilePath` /
+  `SecretsEnvFilePath` / `SecretsDir` / `ReleaseDir` / `UnitPath` / `SecretFileVarValue`
+  （第 391–414 行，与第 7 节的路径一致）。`kind=env` / `kind=file` 的凭据分流按第 6 节的表实现。
+- **`internal/domain/runtime.go`（33 行）**：`RuntimeStatus`（`active`/`inactive`/`failed`/
+  `activating`/`deactivating`/`unknown`，与第 3 节一致）、`RuntimeHealth`、`RuntimeInfo`。
+- **`internal/domain/host.go`（42 行）**：`Host`、`Environment` 模型（第 5 节的字段形状），
+  只有身份与标签，`address` 为空表示本机；无持久化、无自举。
+- **`internal/adapters/manifest/manifest.go`（241 行）+ `manifest_test.go`（344 行）**：
+  与配置版本化同一套流程——先非严格解码读 `apiVersion` 信封、按迁移链升级、再
+  `KnownFields(true)` 严格解码，因此删除/改名/改语义仍需提升版本。
+- **`internal/adapters/runtime/unitfile/escape.go` + `escape_test.go`**：`EscapeArg`（第 23 行）、
+  `EscapeArgs`（第 43 行）、`EscapeEnvValue`（第 57 行）、`RenderEnvFile`（第 73 行，
+  按键排序输出以保证字节稳定，否则每次 `Prepare` 都会重写文件）、`HasNewline`（第 92 行）。
+  这些函数在 `3938db4` 中位于 `internal/adapters/runtime/systemd/`，`747aee9` 迁到
+  `unitfile/`，由 `proc` 与将来的 `systemd` 共用。
+- **`api/v1/errors.go`**：第 32–38 行新增错误码常量、第 61–67 行 HTTP 状态、第 104–110 行
+  退出码——`SPEC_NOT_FOUND`（404/2）、`MANIFEST_INVALID`（400/17）、`MANIFEST_CONFLICT`
+  （409/18）、`RUNTIME_NOT_READY`（409/19）、`RUNTIME_UNSUPPORTED`（409/21）、
+  `HOST_NOT_FOUND`（404/2）、`ENVIRONMENT_NOT_FOUND`（404/2，常量名 `CodeEnvNotFound`），
+  与第 10 节一致（第 10 节未列后两个，因为第 5 节当时还没确定要不要建表）。这七个错误码在
+  A6a/A6b 之后都有实际消费方，不再只是定义。
+- **`internal/application/ports.go` 第 94–111 行**：`RuntimeAdapter` 六方法，签名与第 3 节完全相同；
+  端口注释明确「实现方不得假设调用方已经校验过规格，`Prepare`/`Start`/`Health`/`Status`
+  内部都必须先校验」。（行号是 A2 之后的当前值；A2 在该文件里新增了仓储方法与
+  `RuntimePrepareReporter`，把这段从原来的第 78 行起往下推了。）
+- **`internal/application/runtimecontract/contract.go`（279 行）**：共享合约套件，11 项断言
+  （第 42、60、71、80、99、118、143、166、181、205、231 行的 `t.Run`）。第 3 节列了 6 项，
+  实现多出 `Prepare` 幂等（第 80 行）、`Start`/`Stop` 幂等（第 181/166 行）与就绪目标可达/不可达
+  （第 205/231 行）。价值不在「测出 bug」，而在钉住 `proc` 与 `systemd` 的语义一致。
+- **`internal/adapters/runtime/proc/proc.go`（当前 399 行）+ `proc_test.go`（216 行）**：假适配器。
+  把所有绝对路径映射到沙箱根之下（`SandboxPath`，第 285 行），使第 12 节的合约测试能在无特权
+  环境跑通目录、环境文件与权限断言；子进程必须 `Wait` 回收，否则僵尸在 `kill(pid,0)` 下仍算
+  「存在」。就绪探测与「连续成功次数」计数在 A4 里被抽成共享包
+  `internal/adapters/runtime/readiness`（`Check`、`Tracker`），`proc` 与 `systemd` 共用
+  （`proc.go` 第 256 行调用 `readiness.Check`），见下文 A4。
+- **提交内修复（测试直接暴露）**：凭据目录权限建成 `0750` 而不是第 7 节要求的 `0700`——
+  `MkdirAll` 对已存在目录不改权限，目录先被 `0750` 的循环建出来后按 `0700` 创建即无效，
+  同组用户可穿过凭据目录。已改为单独创建并显式 `Chmod` 收敛权限。
+
+### 已实现范围（A2–A7：2026-09-23 工作树，尚未提交）
+
+> HEAD 仍是 `747aee9`；以下文件都在工作树里，**尚未提交**。行号为本次核对时的当前值。
+
+**A2：migration `0004` + 仓储 + 本机 Host 自举**
+
+- `migrations/0004_hosts_specs.sql`：`application_specs`（`application_id` 为主键）、`hosts`、
+  `environments`，只 `CREATE TABLE`；文件头注释重申「迭代 3 才版本化、刻意不加永远为 NULL 的
+  `release_id`」。
+- 仓储：`internal/adapters/sqlite/host.go`（180 行）、`internal/adapters/sqlite/spec.go`（54 行）；
+  `internal/adapters/sqlite/migrate_test.go` 覆盖两条迁移路径——
+  `TestMigrateApplies0004OnFreshDatabase`（第 98 行，全新库）与
+  `TestMigrateUpgradesFrom0003`（第 111 行，从 0003 升级）。
+- 用例层：`internal/application/specstore.go`（一个应用一份当前规格，`put` 即覆盖）、
+  `internal/application/host.go` 的 `HostService.EnsureLocalHost`（第 40 行）——**先查后建、
+  不改动已有记录**（名字与标签可能已被运维调整过，覆盖它们等于每次重启悄悄回滚）；
+  若 `local` 这个名字已被一台远程主机占用，降级为 `local-<id>`（第 66–72 行），
+  不让守护进程因为一个标签冲突起不来。
+- 接线：`cmd/opsd/main.go` 第 138 行在启动时调用 `EnsureLocalHost`，失败即退出。
+- 测试：`internal/application/host_test.go`（`TestEnsureLocalHostIsIdempotent`:25、
+  `TestEnsureLocalHostKeepsExistingRecord`:54、`TestEnsureLocalHostSurvivesNameCollision`:81）、
+  `specstore_test.go`、`test/e2e/host_test.go`（`TestDaemonBootstrapsLocalHost`:13：真实 `opsd`
+  启动后 `hosts` 表恰好一行、`name=local`、`address` 为空，**重启后仍是一行**）。
+  注意该用例断言的是「行数 + 名字 + 空地址」，没有单独比对 `hostId` 字符串。
+
+**A3：unit 渲染 + `strict`/`legacy` 双档 + systemd 版本探测**
+
+- `internal/adapters/runtime/unitfile/unit.go`（280 行）：`Tier`（第 17 行）、
+  `TierStrict`/`TierLegacy`（第 20–23 行）、`MinSupportedSystemdVersion = 219`（第 28 行）、
+  `TierStrictMinVersion = 240`（第 31 行）、`TierFor`（第 47 行：`≥ 240` → `strict`、
+  `219–239` → `legacy`、`< 219` 报错）、`Degradations`（第 60 行）、`Rendered`（第 81 行）、
+  `RenderUnit`（第 92 行）、`RenderForVersion`（第 201 行）、`RenderForHost`（第 210 行）、
+  `writeHeader`（第 220 行）、`ReleaseRootDir`（第 241 行）、`checkRenderablePath`（第 253 行）、
+  `wholeSeconds`（第 271 行）。
+- `internal/adapters/runtime/unitfile/probe.go`（92 行）：`VersionRunner`（第 20 行）、
+  `SystemctlArgv`（第 24 行）、`Prober`（第 27 行）、`Detect`（第 42 行）、
+  `ParseSystemctlVersion`（第 69 行）、`CommandRunner`（第 87 行，`exec.CommandContext` 执行 argv）。
+  探测走注入式接口，「执行器只接受 argv、不经过 shell」的既有不变量不变。
+- 渲染结果：`strict` 档 = `ProtectSystem=strict` + `ReadWritePaths=`（`writable` 覆盖
+  `workingDirectory`、`logs.directory` 与 `ReleaseRootDir`）+ `StandardOutput=append:`；
+  `legacy` 档 = `ProtectSystem=yes` + `ReadWriteDirectories=` + `StandardOutput=journal`
+  （两档的加固指令块在第 159–183 行）。降级语义同时写进 unit 头部注释（第 226–231 行）
+  与 `Rendered.Degradations`。
+- `legacy` 档未在真实主机/容器验证的事实被固化为常量 `tierLegacyUnverifiedNote`（第 42 行）并
+  写进 unit 头部；第 40 行的注释明确「不得写成『已支持 219』」。
+- 测试：`unit_test.go`（398 行）用两份**完整黄金文本** `strictUnit`/`legacyUnit` 逐字节比对
+  （`TestRenderUnitStrictTier`:130、`TestRenderUnitLegacyTier`:153 都是 `got.Content != <golden>`），
+  另有档位与版本必须自洽（`:276`）、路径字节拒绝（`:295`）、亚秒超时拒绝（`:323`）、
+  `TierFor` 边界（`:331`）、头部记录版本与档位（`:187`）；`probe_test.go`（195 行）覆盖版本解析、
+  探测、注入与 argv-only。
+
+**A4：systemd 适配器本体**
+
+- `internal/adapters/runtime/systemd/{systemd.go,runner.go,files.go}`（526 / 79 / 411 行）
+  + 测试 `systemd_test.go`（901 行）、`fakes_test.go`（250 行）、`contract_test.go`（35 行）、
+  `credentialpath_internal_test.go`（81 行）。
+- 注入点：`WithRunner`:79、`WithGOOS`:85、`WithOwnerResolver`:90、`WithClock`:95、
+  `WithProbeTimeout`:100、`WithEUID`:110、`WithLogger`:117；`RootPath`:172、`UnitDecision`:177。
+- **`unitStatus`（第 372 行）刻意不用 `systemctl show --value`**：第 368–370 行的注释记录已比对
+  v219/v228/v229/v230 的 `systemctl.c`——`--value` 是 systemd 230 才加的，而本适配器承诺支持到
+  219，用它等于把 219–229 上的 `Status`/`Start`/`Health` 一起废掉；改为容忍并切分
+  `ActiveState=` 前缀（`parseActiveState`，第 406 行）。
+- **`Prepare`（第 212 行）幂等**：`writeFileIfChanged`（`files.go` 第 348 行）内容未变不重写，
+  也就不会白白触发 `daemon-reload`（`TestPrepareDoesNotRewriteUnchangedFiles`:707 用 mtime 断言）。
+- **`Health`（第 321 行）与 `Status`（第 306 行）分离**：未就绪返回快照；只有确定性失败
+  （unit `failed`、启动超时 `startDeadlineExceeded`，第 419 行）才返回 `RUNTIME_NOT_READY`。
+- **就绪探测抽成共享包**：`internal/adapters/runtime/readiness/readiness.go`（94 行）的
+  `Check`（第 26 行）与 `Tracker`（第 63 行）由 `proc`（`proc.go`:256）与 `systemd`
+  （`systemd.go`:345）共用，避免两个适配器各写一份 `consecutiveSuccesses` 语义
+  （A4 之前这份逻辑在 `proc` 内部）。
+- **凭据交付**：`resolveSecrets`（`files.go` 第 133 行）先全部解析、再统一落盘，使
+  `SECRET_UNRESOLVED` 出现在「还没有写任何文件」的时候；`kind:env` 含换行时报
+  `SECRET_UNRESOLVED` 并指向字段。`kind:file` 的跨用户可读性由 `ensureCredentialReachable`
+  保证——**这是本迭代最容易被漏掉的一处**，单独记在第 7 节的权限例外小节。
+- **合约**：`TestSystemdAdapterContract`（`contract_test.go`:17）在**假 `systemctl` + 根前缀**下
+  跑同一套 `runtimecontract`（11 项子测试）。它证明「适配器与合约的语义一致」；真实 systemd 上的
+  验证由 A7 的容器断言完成。
+
+**A4 的后续修复（由 A7 的 Linux 容器实跑发现，2026-09-23）**
+
+> 这是本迭代最有价值的一条记录：**本地全绿的测试挡不住部署形态差异**。
+
+- **缺陷**：`ensureCredentialReachable` 原先只把「目录属主 == 本进程 euid」当作可收敛
+  （等价于把 `opsd` 当成以服务用户运行）。但适配器要 `useradd`/`chown`/`systemctl`，
+  **必须以 root 运行**；而安装约定把 `/etc/opsd` 的属主给了**服务用户**（harness 里是
+  `frz-ops`）。于是在容器里 root 明明有权限修那个目录，代码却判成「不属于我们」→ 直接
+  走 `PERMISSION_DENIED`，`runtime prepare` 在**完全正常的部署**上失败。
+- **修法**（`files.go`）：新增纯函数 `canChmod(euid, dirUID)`（第 258 行，`euid == 0 || dirUID == euid`），
+  并把可收敛范围显式收敛为「归我们管理」的**三级集合**（第 196–200 行：凭据目录、
+  `/etc/opsd/apps`、`/etc/opsd`）；**`/` 与 `/etc` 只校验、绝不修改**。
+- **测试**：新增表驱动 `TestCanChmod`（`credentialpath_internal_test.go` 第 43 行）。
+- **效果**：修复后容器里该断言由 FAIL 转 PASS，其余 45 项 runtime 断言同时转 PASS
+  （它们是同一个失败原因的下游）；第 5 轮 `make verify-linux` 89/0。
+- **教训（写进 §12 与 §17 的同一句话）**：这类差异只在「以 root 运行 + 目录属主是别人」这种
+  真实部署形态下暴露，**用假的 runner / 临时根前缀永远测不出来**——harness 的第二个 root 实例
+  就是为它存在的。
+
+**A6a：spec / hosts / environments / 制品下载的 API + CLI + client**
+
+- 协议类型：`api/v1/spec.go`（`ApplicationSpec` 与各段共 10 个类型）、`api/v1/host.go`
+  （Host/Environment 的请求与响应）。路由在 `internal/adapters/httpapi/server.go`
+  第 68、76–91 行：`GET /api/v1/artifacts/{id}/content`、`PUT|GET /api/v1/applications/{id}/spec`、
+  `GET|POST /api/v1/hosts`、`GET /api/v1/hosts/{id}`、`GET|POST /api/v1/environments`、
+  `GET /api/v1/environments/{id}`。
+- **制品下载**：`ArtifactService.Download`（`internal/application/artifact.go` 第 156 行）
+  **先 `Verify` 从磁盘重算摘要并与记录比对，再开流**（不是先开流再验）；
+  `handleDownloadArtifact` 设置 `Content-Type`/`Content-Length`/`ETag`
+  （`internal/adapters/httpapi/artifact.go` 第 146–149 行，ETag 就是内容摘要）。
+- client：`internal/adapters/client/spec.go`、`host.go`（含 `CreateHost`/`CreateEnvironment`）。
+- CLI：`opsctl spec put|show`、`opsctl host list|inspect|create`、`opsctl env list|inspect|create`、
+  `opsctl artifact download <id|digest> --output <path>`（`cmd/opsctl/artifact.go` 第 149 行）。
+  第 9 节只要求 `host list` 与 `env list`；多出的 `create`/`inspect` 是对 API 里已有的 `POST`
+  与详情端点的自然补全（如实记录，不是新增能力）。
+- 错误码：`SPEC_NOT_FOUND`/`HOST_NOT_FOUND`/`ENVIRONMENT_NOT_FOUND`/`MANIFEST_INVALID`/
+  `MANIFEST_CONFLICT`/`ARTIFACT_CHECKSUM_MISMATCH` 现在都有实际消费方。
+- 测试：`internal/adapters/httpapi/spec_test.go`、`host_test.go`、
+  `internal/adapters/client/client_test.go`、`test/e2e/spec_test.go`
+  （`TestSpecPutShowRoundTripThroughCLI`:69、`TestSpecPutRejectsInvalidManifestThroughCLI`:143、
+  `TestArtifactDownloadThroughCLI`:220、`TestHostAndEnvironmentCommandsThroughCLI`:267）。
+
+**A6b：`runtime/*` 端点 + `runtime.*` 走 Operation + 适配器装配**
+
+- 协议：`api/v1/runtime.go`（`RuntimeDecision`、`RuntimeActionRequest` 与三个响应类型）；
+  `api/v1/types.go` 第 15–16 行新增 `KindRuntimeStart`/`KindRuntimeStop`。
+- 路由：`server.go` 第 78–82 行——`POST .../runtime/{validate,prepare,start,stop}`、
+  `GET .../runtime/health`。`validate`/`prepare`/`health` 是**同步用例、不进 Operation**
+  （「这份规格能不能执行」「现在有没有就绪」都是查询，排队没有意义）。
+- **无旁路**：`start`/`stop` 走与 `POST /api/v1/operations` 相同的 `Service.Create`
+  （`internal/adapters/httpapi/runtime.go` 第 65 行起），因此锁、幂等键、请求摘要、审计、日志与
+  取消全部复用；执行在 `internal/application/worker.go` 的 `executeRuntime`（第 215 行起）。
+- 三条设计判断（都在代码注释里）：
+  - **(a) 适配器不可用时快速失败、不建 Operation**：适配器可用性是部署属性，可在创建侧同步判定
+    （`internal/application/service.go` 第 91 行 `s.runtime == nil` → `RUNTIME_UNSUPPORTED`）；
+    执行期另有一道兜底（`worker.go` 第 218 行）。
+  - **(b) `runtime.start` = 幂等 `Prepare` + `Start`**：共享合约要求「未 `Prepare` 直接 `Start`
+    必须被拒绝」，所以「把应用跑起来」这一个操作必须自带准备步骤，否则在从未 prepare 的主机上
+    start 永远失败；`runtime.stop` 只 `Stop`（systemd 对未运行的 unit stop 同样成功，天然幂等）。
+    见 `worker.go` 第 208–211 行的注释。
+  - **(c) `dryRun` 对 `runtime.*` 一律拒绝**：适配器端口没有 dry-run 语义，接受它会变成
+    「以为只是预演、其实真的启停进程」，返回 `INVALID_REQUEST` 并提示改用 `runtime validate`
+    （`service.go` 第 85–90 行）。
+- 执行的规格来源：读「应用的**当前**规格」而不是创建时的快照（`op.Spec` 留空），
+  因此 `spec put` 之后重试 `runtime.start` 启动的是最新 manifest；资源规范成应用 ID，
+  同一应用用名字或 ID 提交命中同一把锁（`service.go` 第 94–102 行）。
+- **决策可追溯**：`recordRuntimeDecision`（`worker.go` 第 271 行起）把
+  `tier`/`systemdVersion`/`unitPath`/`degradations` 写进 `phase=prepare` 的 Operation 日志，
+  并追加审计 `runtime.prepared`（`internal/domain/operation.go` 第 21–23 行、
+  `internal/domain/audit.go` 第 25–27 行）。适配器没给出决策时什么都不写，而不是编一个空档位。
+- **装配**：`cmd/opsd/main.go` 第 100–116 行——**平台选择只有这一处**：`GOOS == "linux"` 才装配
+  systemd 适配器，其它平台刻意不注入（`runtime.*` 于是返回 `RUNTIME_UNSUPPORTED`），
+  **刻意不加 `runtime.adapter` 之类的配置开关**，避免生产误选 `proc` 假适配器。
+  `cmd/opsd/runtime.go` 的 `systemdReporter` 把适配器私有的 `UnitDecision` 翻译成
+  `application.RuntimeDecision`：这层翻译只能放在装配层，否则 `systemd`（已 import
+  `application`）与 `application` 会成环。
+- **health 语义**：未就绪 → `200` + `ready:false`（供轮询）；确定性失败 → `409` +
+  `RUNTIME_NOT_READY`（`internal/application/runtimeops.go` 第 75–76 行的注释、
+  `internal/adapters/httpapi/runtime.go` 第 101–124 行）；`opsctl runtime health` 未就绪时
+  退出码 **19**（`cmd/opsctl/runtime.go` 第 121、143 行）。
+- 测试：`internal/application/runtimeops_test.go`（14 个用例：dry-run 拒绝、适配器缺失、
+  manifest 缺失、幂等、取消、决策写入日志与审计等）、`internal/adapters/httpapi/runtime_test.go`、
+  `internal/adapters/client/client_test.go`、`cmd/opsctl/runtime_test.go`、
+  `test/e2e/runtime_test.go`（`TestRuntimeWithoutAdapterThroughCLI`:35——本机没有适配器时退出码
+  21，且未登记 manifest 时 `SPEC_NOT_FOUND`（退出码 2）优先）。
+
+**A7：`test/linux/` 的 1c 容器断言（已在容器中实跑通过）**
+
+- `test/linux/verify.sh` 新增 `check_runtime`（第 431 行起），在 `main()` 里**排在最后**：
+  它的最后一条断言会删掉敏感环境文件、让探针 unit 进入失败/重启循环。
+  当前调用顺序是 `check_filesystem → check_socket_acl → check_executor →
+  check_artifacts_and_secrets → check_schedules → check_systemd → check_runtime`。
+- **两个 opsd 实例**（这是本轮的结构性变化）：原来的实例仍以服务用户 `frz-ops` 运行，
+  **迭代 0 的既有断言（1b 时点共 40 项，历史快照）全部仍打在它上面、前缀未动**；新增一个**以 root 运行**的实例
+  （配置 `test/linux/opsd.root.verify.yaml`，独立 socket `/run/opsd-root/opsd.sock`、
+  独立数据库/工作目录/日志/制品目录），`check_runtime` 只打它——因为适配器要
+  `useradd`/`chown`/`systemctl`，必须 root。`wait_for_socket`/`wait_for_status` 做了参数化，
+  客户端助手是 `runtimectl` / `rq`（`verify.sh:132-133`）。
+- 新增探针应用 `test/linux/probe/main.go`（107 行）：把凭据的**长度与 sha256** 写进报告文件后
+  再监听就绪端口，**绝不打印明文**；同时采集 `ProtectSystem` 允许/拒绝写入的实测结果。
+- 覆盖内容：`Prepare` 产物（用户存在、目录 `0750` 属主 `runUser`、两个环境文件 `0600`、
+  凭据目录 `0700`、凭据文件 `0600` 且内容与源逐字节一致、unit `0644`、头注释含版本与档位、
+  **第二次 `Prepare` 幂等且档位不变**）；`/etc/opsd` 在 `Prepare` 后为 `0751` 且**真实跨用户读取**
+  （`runuser -u <runUser> -- cat` 成功、`frz-other` 被拒）；两类凭据经 `EnvironmentFile` 到达进程后
+  长度与 sha256 与源一致（含 `\`、`"`、字面 `\n`、`$`、单引号与首尾空格）；`runtime start` 走
+  `Operation` 且终态 `succeeded`、`runtime health` 就绪、`systemctl is-active` = `active`、
+  `runtime stop` 终态 `succeeded`、停止后 `inactive`；删掉 `<app>.secrets.env` 后
+  `systemctl start` 必须失败；unit 声明路径可写、未声明路径被 `ProtectSystem=strict` 拒绝。
+- **一次不稳定断言的修正**：`Restart=on-failure` 下 unit 失败后 `ActiveState` 只是瞬时 `failed`，
+  等待自动重启期间是 `activating`（`SubState=auto-restart`），且 `RestartSec=5` 永远凑不满默认
+  start limit，所以「缺凭据必须启动失败」不能断言瞬时状态。现改为「12×0.5s 窗口内从未 `active`，
+  且观察到的状态只能属于 `activating`/`failed`」，并把观察到的状态集合打进输出
+  （`verify.sh` 第 649–678 行）。**不要把「停止」与「失败」混为一谈。**
+- **断言数（只认一个权威口径）**：权威值 = 脚本运行时打印的「`%d` 项通过，`%d` 项失败」
+  （`verify.sh` 第 721 行），本次实跑为 **89 项通过 / 0 项失败**，其中 `check_runtime` 占 49 项。
+  历史快照（仅供对照，不要引用为结论）：1b 时点 40 项；A7 落地时的静态计数推导值 87 项
+  （**该推导偏小**，实跑为 89）。
+- **`/etc/opsd` 的两条断言不矛盾，是时序不同**：`check_filesystem` 第 247 行的
+  「`/etc/opsd` 目录模式 = `750`」发生在 `Prepare` **之前**（安装脚本的状态，保留不变）；
+  `check_runtime` 的 `751`（第 558、560 行）发生在 `Prepare` **之后**。安装时 `0750`、
+  首次 `Prepare` 后 `0751`。
+- **污染检查**：容器内只有 `/sys/fs/cgroup` 一个挂载（外加 `--tmpfs /run /tmp`），
+  **没有仓库 bind mount**，因此容器内的操作结构上不可能写进仓库；`output/` 的 mtime 早于本次
+  运行，未被触碰。
+- **过程本身是 harness 不是空转的证据**：同一份 harness 连跑 5 轮，前 4 轮分别 25 FAIL / 1 FAIL /
+  1 FAIL，第 5 轮 0 FAIL——失败会真的挂住；细节与那处**产品缺陷**（`canChmod` 不认 root）见第 17 节与
+  A4 的「后续修复」。
+
+### 对规格的补充与偏离
+
+1. **`readiness.type` 收缩为 `tcp`/`http`**（`exec` 未实现）：这是实现刻意比规格更严的一处，
+   完整说明与理由见第 6 节末尾「实现比规格更严的三处」第 1 条（`internal/domain/appspec.go`
+   第 39–44 行是判断的落点），此处不再重复。**第 4 节的 yaml 因此是过时的**：`exec` 不在
+   已实现范围内，若确实需要，必须先冻结语义再实现。
+2. **实际路径与第 3/12 节的目录建议有偏移**（目录选择见提交说明，本文档此前未指定）：
+   - 转义函数从 `internal/adapters/runtime/systemd/` 迁到
+     `internal/adapters/runtime/unitfile/`；理由是 `proc` 与 `systemd` 必须共用同一份转义，
+     各写一份等于把「本地能跑、真机不能跑」的故障固化。
+   - 假适配器在 `internal/adapters/runtime/proc/`；合约套件在
+     `internal/application/runtimecontract/`（这一处与第 3 节一致）。
+   - manifest 严格解码放在 `internal/adapters/manifest/`（第 4 节未指定位置）。
+   - 真实 systemd 适配器最终落在 `internal/adapters/runtime/systemd/`（见 A4）；就绪探测与
+     unit 渲染分别抽到 `internal/adapters/runtime/readiness` 与 `runtime/unitfile`，
+     由 `proc` 与 `systemd` 共用。
+3. **新增 `SpecUnpack.StrategyExplicit`**（第 84–88 行）：严格解码后无法区分「显式写了
+   `none`」与「压根没写」，而只有显式声明才可能与制品 `mediaType` 冲突
+   （`MANIFEST_CONFLICT`）。这是第 4 节校验要求的一处必要补充。
+4. **`SecretRef` 校验失败改报 `MANIFEST_INVALID`**（第 230–234 行）：调用方提交的是 manifest，
+   透传 1a 的 `INVALID_REQUEST` 会让错误类型与提交内容不对应。
+5. **`Host`/`Environment` 先有模型、后有持久化与自举**：第 5 节的模型与校验在
+   `internal/domain/host.go`（提交 `3938db4`），表、仓储与「本机 Host 自举」随 A2 落地。
+   第 5 节「不在此迭代做『应用绑定主机』的校验」的结论不变。
+6. **`Host`/`Environment` 的错误码**：第 10 节的表里没写它们，实现新增了
+   `HOST_NOT_FOUND`（404/2）与 `ENVIRONMENT_NOT_FOUND`（404/2，常量名 `CodeEnvNotFound`）；
+   两个新端点的创建重复走 `INVALID_REQUEST`，不再新增错误码（与 1a/1b 处理重名资源一致）。
+7. **CLI 表面比第 9 节多两个子命令组**：除 `host list`、`env list` 外还有
+   `host create|inspect`、`env create|inspect`，理由见 A6a。
+8. **`runtime.start` 的语义补白**：第 9 节只写了「走 `Operation`」，没说它自带 `Prepare`；
+   实现是「幂等 `Prepare` + `Start`」，理由是共享合约要求未 `Prepare` 不得 `Start`（见 A6b）。
+9. **`dryRun` 对 `runtime.*` 一律拒绝**：第 9 节未提，实现返回 `INVALID_REQUEST` 并提示改用
+   `runtime validate`（见 A6b）。
+
+### 未验证清单
+
+第 2 节「1c 实现」全部落地，第 13 节的 12 条验收标准**11 条已达成、1 条部分达成**
+（第 8 条的 `legacy` 档）。剩下的证据缺口只有两类，都**不能**由 Linux 容器证据替代：
+
+| 条目 | 状态 | 说明 |
+| --- | --- | --- |
+| `legacy` 档（systemd 219–239）的实际行为 | **未验证** | 容器是 Ubuntu 24.04 / systemd 255，只覆盖 `strict` 档（≥240），**零 `legacy` 证据**；该档目前只有单元测试（两份黄金文本）+ 静态检查支撑，不得声称「已支持 219」。第 15 节记录了为什么本地容器路走不通。 |
+| 真实 Linux 主机项：reboot 后 unit 持久化、`WantedBy=multi-user.target` 实际生效、SELinux/AppArmor、sudoers/PAM | **未验证** | 容器只验证内核级语义（文件模式、属组、Unix Socket ACL、systemd 生命周期），**不是 Linux 主机**；这几项仍需真实主机。 |
+
+已不再属于缺口的两项（记录一下变化）：**systemd 真实执行端到端**已由容器内的
+`check_runtime` 走通（真实 `systemctl` 的 `Prepare`→`Start`→`is-active`→`Health`→`Stop`）；
+**1c 的 Linux 容器证据**已取得（`make verify-linux` 第 5 轮 89/0）。
+
+第 2 节的其余条目（systemd 适配器、版本分档、`Host`/`Environment` 模型与持久化、制品下载端点、
+manifest 端点、`runtime/*` 端点、hosts/environments 端点、CLI、`runtime.*` 走 Operation、
+适配器装配、容器断言）均已落地，见上文两段「已实现范围」。
+
+## 17. 验证记录 2026-09-23
+
+本节分三段：**已提交基线**（HEAD `747aee9`，A2–A6b 落地之前）、**A2–A6b 落地之后**
+（当前工作树）、以及 **A7 容器断言落地并在容器中跑通**（第 5 轮 89/0）。
+
+### 已提交基线（HEAD `747aee9`）
+
+- 执行者：Command Code agent（只读审计核实 + 文档回填；本次**未修改任何代码**）
+- 变更范围：`3938db4`、`747aee9` 两个提交
+- 证据来源：下表的命令结果为 HEAD `747aee9` 已核实存在的既有证据（只读审计逐项核对）；
+  本次为写文档只重跑了静态计数类检查（`grep -c '^func Test'`、路径存在性），**未重跑测试套件**。
+
+| 命令 | 结果 | 证据类型 |
+| --- | --- | --- |
+| `gofmt -l .` | PASS（无输出） | 静态 |
+| `go vet ./...` | PASS（无输出） | 静态 |
+| `go test ./...` | PASS（12 个包 ok） | 单元 + 集成 + e2e |
+| `go test -race -count=1 ./...` | PASS（全 ok，e2e 44.6s） | 单元 + 集成 + e2e |
+| `go test -v -count=1 ./...` | PASS（181 个顶层用例 0 FAIL 0 SKIP；含子测试共 313 PASS） | 单元 + 集成 + e2e |
+| `GOOS=linux GOARCH=amd64` 与 `arm64` 交叉编译 | PASS | 交叉编译 |
+| GitHub Actions `test` job（HEAD `747aee9`） | success | CI（干净 runner） |
+| GitHub Actions `linux-verify` job（HEAD `747aee9`） | success | **Linux 容器**（CI runner） |
+| `make verify-linux`（本机） | **NOT RUN** | **Linux 容器**（本机 docker daemon 不可达） |
+
+远端 CI 记录：共 3 次 run 全部 success，HEAD 的 `test` 与 `linux-verify` 两个 job 均 success
+（2026-09-22T06:28:30Z–06:31:29Z）。
+
+### A2–A6b 实现落地（2026-09-23 工作树，尚未提交）
+
+- 执行者：实现者实跑；本节的表由文档看守者据其报告 + 静态核对写入，**文档看守者未重跑任何门禁**
+  （只做了文件存在性、行号与测试名的 `grep` 核对）
+- 变更范围：A2 / A3 / A4 / A6a / A6b（工作树，HEAD 未变）
+- 环境：macOS (darwin/arm64)，Go 1.27.1；**没有 systemd、没有 Linux**
+
+| 命令 | 结果 | 证据类型 |
+| --- | --- | --- |
+| `make fmt` | PASS | 静态 |
+| `make vet` | PASS | 静态 |
+| `make test` | PASS（**16 个包 ok**） | 单元 + 集成 + e2e |
+| `make test-race` | PASS（`-count=1` 强制重跑） | 单元 + 集成 + e2e |
+| `GOOS=linux GOARCH=amd64` 与 `arm64` 交叉编译 | PASS | 交叉编译 |
+| `make verify-linux` | 当时未执行（后续在 A7 中实跑：第 5 轮 89/0，见下） | **Linux 容器** |
+
+「16 个包」可由静态清点核对：仓库里含 `func Test` 的包目录共 16 个（`cmd/opsctl`、`blob`、
+`client`、`config`、`executor`、`httpapi`、`manifest`、`runtime/proc`、`runtime/readiness`、
+`runtime/systemd`、`runtime/unitfile`、`secret`、`sqlite`、`application`、`domain`、`test/e2e`）。
+
+**证据类型必须分开读**：
+
+- 上表的**单元 / 集成 / e2e** 三列是真实的：A2–A6b 各自都有对应测试（见第 16 节逐条列出的
+  测试名），`test/e2e/*` 是真实二进制 + 真实 Unix Socket 的端到端用例。
+- **systemd 真实执行已在容器中验证**：A4 的合约测试跑在「假 `systemctl` + 根前缀」上，
+  但 A7 的 `check_runtime` 进一步在**真实 systemd 255** 上走通了
+  `runtime prepare/start/health/stop` 与 `systemctl is-active`（见下一条）。
+- **Linux 容器证据已取得**（见下一条）：`make verify-linux` 第 5 轮退出码 0、89/0。
+- **跨用户凭据读取已由容器验证**：第 7 节那条 `/etc/opsd` 补 `0751` 的行为，
+  在容器里由 `runuser -u <runUser> -- cat` 成功、`frz-other` 被拒两条断言证明。
+- `legacy` 档、真机 reboot 持久化、SELinux/AppArmor、sudoers/PAM 仍未验证（见第 16 节末尾清单）。
+
+### A7 容器断言落地并在容器中跑通（2026-09-23）
+
+- 执行者：A7 实现者（实跑 + 修复）；文档看守者据其报告与静态核对写入，**本人未重跑容器**
+- 变更范围：`test/linux/verify.sh`（新增 `check_runtime`、第二个 root 实例、参数化等待助手）、
+  `test/linux/probe/main.go`（新增探针）、`test/linux/opsd.root.verify.yaml`（新增 root 实例配置）、
+  `internal/adapters/runtime/systemd/files.go`（`canChmod` 修复）+ `credentialpath_internal_test.go`
+  （新增 `TestCanChmod`）；`.github/workflows/ci.yml` **未改**
+- 环境：macOS (darwin/arm64) + OrbStack；容器内 **Ubuntu 24.04 / systemd 255 / arm64**
+
+| 命令 | 结果 | 证据类型 |
+| --- | --- | --- |
+| `make verify-linux`（第 1 轮） | **FAIL：25 项失败 / 共 65 项** | **Linux 容器** |
+| `make verify-linux`（第 3、4 轮） | **FAIL：各 1 项失败 / 共 87、88 项** | **Linux 容器** |
+| `make verify-linux`（第 5 轮） | **exit 0：89 项通过 / 0 项失败**（`check_runtime` 占 49 项） | **Linux 容器** |
+| 修复后门禁：`make fmt` / `make vet` / `make test` / `make test-race` / `bash -n test/linux/verify.sh` | 全部 exit 0（实现者实跑） | 静态 + 单元 + 集成 + e2e |
+| 污染检查：容器挂载只有 `/sys/fs/cgroup`（+ `--tmpfs /run /tmp`），无仓库 bind mount；`output/` mtime 未变 | PASS | 静态 |
+
+**断言数的唯一权威口径**：脚本运行时打印的「`%d` 项通过，`%d` 项失败」（`verify.sh` 第 721 行）
+= **89**。历史快照仅供对照：1b 时点 40 项；A7 落地时的静态推导值 87 项（偏低，实跑 89）。
+
+**这 5 轮过程本身就是 harness 在真实执行的证据**：第 1 轮 25 FAIL 说明断言不是空转，
+失败会真的挂住；随后每修一处就少一批 FAIL，直到 0 FAIL。
+
+#### 本轮跑出来的一处产品缺陷与修复（最重要的一条）
+
+- **现象**：`runtime prepare` 在一个**完全正常**的部署形态下直接失败——`opsd` 以 root 运行
+  （`useradd`/`chown`/`systemctl` 需要），而 `/etc/opsd` 的属主是**服务用户**。
+  `ensureCredentialReachable` 原先只有「目录属主 == 本进程 euid」这一支，于是 root 明明能修
+  却被判成「不属于我们」→ `PERMISSION_DENIED`。第 1 轮的 25 项失败中有 1 项是它，
+  其余 45 项 runtime 断言是它的下游（同一个失败原因）。
+- **修复**：新增纯函数 `canChmod(euid, dirUID)`（`files.go` 第 258 行：`euid == 0 || dirUID == euid`），
+  并把可收敛范围显式收敛为三级「归我们管理」集合（第 196–200 行），
+  **`/` 与 `/etc` 只校验、绝不修改**；新增表驱动 `TestCanChmod`
+  （`credentialpath_internal_test.go` 第 43 行）。
+- **修复后**：该断言转 PASS，其余 45 项 runtime 断言同时转 PASS；第 5 轮 89/0。
+- **教训**：本地全绿的测试挡不住这类**部署形态差异**——假 runner / 临时根前缀下，
+  「进程身份」与「目录属主」的关系永远是测试自己造的那一种。这正是需要第二个
+  **以 root 运行**的 `opsd` 实例的原因。
+
+#### 本轮修正的一条不稳定断言
+
+`Restart=on-failure` 下 unit 失败后 `ActiveState` 只是瞬时 `failed`，等待自动重启期间是
+`activating`（`SubState=auto-restart`），`RestartSec=5` 又凑不满默认 start limit；第一版断言
+瞬时 `failed`，实跑当场挂掉（第 3/4 轮各 1 FAIL 的来源）。现改为「12×0.5s 窗口内从未 `active`，
+且观察到的状态只能属于 `activating`/`failed`」，并把观察到的状态集合打进输出
+（`verify.sh` 第 649–678 行）。**「停止」与「失败」不是一回事**，断言不能混用。
+
+#### 仍未验证（本节不覆盖）
+
+- **`legacy` 档（systemd 219–239）**：本次容器是 systemd **255**，只覆盖 `strict` 档，
+  **零 `legacy` 证据**；不得写成「已验证支持 219」。
+- **真实 Linux 主机**：reboot 后 unit 持久化、`WantedBy` 实际生效、SELinux/AppArmor、
+  sudoers/PAM。容器证据**不能**替代它们。
+
+### 结论汇总（2026-09-23，含本次修订）
+
+- 第 13 节的 12 条验收标准：**11 条达成、1 条部分达成（第 8 条的 `legacy` 档）**。
+  逐条的证据类型见第 13 节末尾的判定表——**单元 / 集成 / e2e** 与 **Linux 容器** 分列，
+  没有把容器与真机混为一谈。
+- 三处曾经成立的旧表述已被替换（保留在此以便追溯）：
+  1. 「A2–A6b 只是工作树里的在建工作、未独立复核」→ 已落地且过门禁（第 16 节两段「已实现范围」）。
+  2. 「第 2/3 条只有 `proc` 上的合约断言，其余各条全部未达成」→ 已不再成立（systemd 也过同一套合约）。
+  3. 「A7 的容器断言只跑过桩、容器未运行」→ 已在容器中实跑：5 轮、第 5 轮 **89/0**。
+- **仍未验证的两项**（不得写成已验证）：`legacy` 档（systemd 219–239）、真实 Linux 主机项
+  （reboot 后 unit 持久化、SELinux/AppArmor、sudoers/PAM）。
+- **本节的数字口径**：断言数一律以运行时输出为准 = **89**；`40`（1b 时点）与 `87`
+  （A7 落地时的静态推导）只作历史快照。

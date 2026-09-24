@@ -48,6 +48,10 @@ func newRootCommand() *cobra.Command {
 		newArtifactCommand(opts),
 		newAppCommand(opts),
 		newReleaseCommand(opts),
+		newSpecCommand(opts),
+		newRuntimeCommand(opts),
+		newHostCommand(opts),
+		newEnvCommand(opts),
 		newScheduleCommand(opts),
 		newConfigCommand(opts),
 	)

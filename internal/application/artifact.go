@@ -147,6 +147,28 @@ func (s *ArtifactService) Verify(ctx context.Context, ref string) (*domain.Artif
 	return artifact, nil
 }
 
+// Download 打开制品内容供下载。它先按 Verify 的规则把存储内容完整读一遍并重算摘要，
+// 确认与记录一致，再重新打开一次交给调用方流式读取。
+//
+// 「先校验、后输出」是唯一能保证不把与记录不一致的内容当成功响应发出去的顺序：
+// 若边发边算，损坏的字节早已出网，而 HTTP 状态码无法追回。代价是下载多读一遍文件，
+// 换来的是不需要把整个制品读进内存（制品可能是几百 MB 的归档）。
+func (s *ArtifactService) Download(ctx context.Context, ref string) (*domain.Artifact, io.ReadCloser, error) {
+	if err := s.requireStore(); err != nil {
+		return nil, nil, err
+	}
+	artifact, err := s.Verify(ctx, ref)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	reader, err := s.store.Open(ctx, artifact.Digest)
+	if err != nil {
+		return nil, nil, err
+	}
+	return artifact, reader, nil
+}
+
 // Delete 软删除制品并移除内容。被 Release 引用时拒绝，不做级联删除。
 func (s *ArtifactService) Delete(ctx context.Context, ref string) error {
 	if err := s.requireStore(); err != nil {

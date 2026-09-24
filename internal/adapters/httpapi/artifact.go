@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
@@ -122,6 +124,51 @@ func (s *Server) handleDeleteArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDownloadArtifact 原样输出制品内容。字节一致性由
+// ArtifactService.Download 保证：它先按记录重算摘要，确认一致之后才打开流，
+// 因此摘要不匹配时返回的是 JSON 错误信封，而不是一份看起来成功的坏内容。
+func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Artifacts == nil {
+		writeError(w, s.logger(), domain.NewError(v1.CodeInternal, "artifact service is not configured"))
+		return
+	}
+
+	artifact, content, err := s.deps.Artifacts.Download(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, s.logger(), err)
+		return
+	}
+	defer content.Close()
+
+	header := w.Header()
+	header.Set("Content-Type", artifactContentType(artifact))
+	header.Set("Content-Length", strconv.FormatInt(artifact.Size, 10))
+	// ETag 用内容摘要：它与内容一一对应，客户端可据此核对下载结果的完整性。
+	header.Set("ETag", `"`+artifact.Digest.String()+`"`)
+	w.WriteHeader(http.StatusOK)
+
+	written, err := io.Copy(w, content)
+	if err != nil {
+		// 响应头已经发出，无法再改状态码，只能记录：客户端会因为字节数不足而
+		// 在自己的摘要校验里失败，不会被当成成功。
+		s.logger().Error("artifact download interrupted", "artifactId", artifact.ID, "error", err)
+		return
+	}
+	if written != artifact.Size {
+		s.logger().Error("artifact download size mismatch",
+			"artifactId", artifact.ID, "want", artifact.Size, "got", written)
+	}
+}
+
+// artifactContentType 在制品没有记录 mediaType 时给出通用二进制类型，
+// 避免让客户端拿到空的 Content-Type。
+func artifactContentType(artifact *domain.Artifact) string {
+	if artifact.MediaType != "" {
+		return artifact.MediaType
+	}
+	return "application/octet-stream"
 }
 
 type collectRequest struct {

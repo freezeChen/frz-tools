@@ -2,7 +2,8 @@
 
 > 文档日期：2026-09-21  
 > 文档状态：Proposed / 供后续实现与交叉验证使用  
-> 项目状态：空目录，尚未初始化 Go 工程和 Git 仓库
+> 项目状态：2026-09-21 撰写时为「空目录，尚未初始化 Go 工程和 Git 仓库」；
+> 截至 2026-09-23 已推进到迭代 1c（**部分实现，进行中**），详见文末调整记录
 
 ## 1. 目标与当前假设
 
@@ -214,7 +215,8 @@
   - **1b**：调度器（cron/interval、时区、错过执行策略、运行历史）
     → [2026-09-21-iteration-1b.md](./2026-09-21-iteration-1b.md)（已实现并提交，验证记录见第 16 节）
   - **1c**：Linux 适配（`RuntimeAdapter`、systemd、Host/Environment、manifest）
-    → [2026-09-21-iteration-1c.md](./2026-09-21-iteration-1c.md)（规格已冻结，待实现）
+    → [2026-09-21-iteration-1c.md](./2026-09-21-iteration-1c.md)（规格已冻结；**部分实现（进行中）**，
+    见「2026-09-23 迭代 1c 部分实现与迭代 0 冻结确认」）
 - **拆分依据**：1a 产出的 `Artifact`/`Release`/`SecretRef` 是 1b 与 1c 的共同词汇；
   1b 的调度语义与 1c 的 systemd 细节彼此独立，可分别设计与验收。
 - **影响迭代**：仅迭代 1；迭代 2（备份）、3（部署）、4（蓝绿）的范围与顺序不变，
@@ -299,4 +301,99 @@
   真实 reboot 后的 unit 持久化、SELinux/AppArmor、sudoers/PAM 依然挂起。
 - **推送方式**：GitHub 已不支持 HTTPS 密码认证，`gh` 配置的是 SSH，
   因此 origin 使用 `git@github.com:freezeChen/frz-tools.git`。
+
+### 2026-09-23 迭代 1c 部分实现与迭代 0 冻结确认
+
+- **变更原因**：1c 的规格文档此前标注「未实现」，但仓库里已有两个 1c 提交；迭代 0 的全部交付物
+  与 8 条验收标准也已实现并有测试覆盖，状态行却仍写「待实现」。本次只回填文档，**未改任何代码**。
+- **迭代 0 判为已完成、可冻结**：8 条验收标准全部有实现与测试。证据：`gofmt -l .` 空、
+  `go vet ./...` 无输出、`go test ./...` 12 个包 ok、`go test -race -count=1 ./...` 全 ok
+  （e2e 44.6s）、linux amd64/arm64 交叉编译成功；`go test -v -count=1 ./...` 为 181 个顶层用例
+  0 FAIL 0 SKIP（含子测试 313 PASS）；远端 GitHub Actions 共 3 次 run 全部 success，
+  HEAD 的 `test` 与 `linux-verify` 两个 job 均 success（2026-09-22T06:28:30Z–06:31:29Z）。
+  **遗留项**：`SudoConfig`（`internal/adapters/config/config.go` 第 90 行）只有模型、零行为，
+  却出现在 `opsd.example.yaml`，示例注释自述「实际行为由 1c 的 Linux 适配实现」——目前仍未
+  实现，已在迭代 0 第 15 节「遗留项」显式标注，不得当作已生效的安全控制。
+- **迭代 1c 已有两次提交，此前未记录，本次补齐**（本记录以 HEAD `747aee9` 的已提交状态为
+  基准；1c 的其余部分正由其它 worker 并行实现，尚未提交，故未反映在下面的清单里）：
+  - `3938db4`：manifest 领域模型（`internal/domain/appspec.go`、`host.go`、`runtime.go`）、
+    `internal/adapters/manifest/`（严格解码与迁移链）、systemd 转义函数、`api/v1/errors.go`
+    的 1c 错误码；
+  - `747aee9`：`RuntimeAdapter` 端口（`internal/application/ports.go`）、共享合约套件
+    （`internal/application/runtimecontract/`，11 项断言）、`proc` 假适配器
+    （`internal/adapters/runtime/proc/`），转义函数迁至 `runtime/unitfile/`。
+  实现范围、与规格的偏差（`readiness.type=exec` 收缩、实际路径偏移）与未实现清单见
+  [1c 第 16 节](./2026-09-21-iteration-1c.md#16-实现记录-2026-09-23)，
+  验证记录见 1c 第 17 节。
+- **新增两项验证债务**：
+  1. **`make verify-linux` 本轮未复核**：本机 docker daemon 不可达（OrbStack 未启动），
+     40 项 Linux 容器断言没有在本机重跑；最近一次证据是 CI 干净 runner 上的 `linux-verify`
+     job（`da70880` 与 HEAD 均 success）。该 job 执行的是 1b 时点的断言，**不含任何 systemd
+     适配器断言**，因此不构成 1c 的证据。
+  2. **`legacy` 档（systemd 219～239）仍无验证主机**，一律标注**未验证**（原因见 1c 第 15 节）。
+  另：真实 Linux 主机的 reboot 后 unit 持久化、SELinux/AppArmor、sudoers/PAM 仍未验证
+  （与迭代 0 的结论相同）。
+- **1d 规格仍待编写**：`docs/plans/` 下不存在 1d 文档；1d（重试、指数退避、断点恢复、
+  并发策略）系 2026-09-22 拍板新建，规格尚未撰写，因此迭代顺序 1c → 1d → 迭代 2 → 3 → 4 → 5
+  目前停在 1c。
+- **Phase A 剩余项**：**无（Phase A 全部落地，并已在 Linux 容器中跑通 89/0）**。
+  下一步是**1d 规格与迭代 2**；仍缺的证据只有 `legacy` 档与真实 Linux 主机项，见补记二。
+
+### 2026-09-23（补记）1c 的 A2–A6b 落地，只剩 A7 与三项验证缺口
+
+- **变更原因**：同日上午的记录把 1c 的其余部分写成「未实现 / 在建」；这些工作已全部落地
+  （在工作树里，HEAD 未变、**尚未提交**），本次按实际状态更新，并修正上一节里
+  「A4/A5/A6 未做」的说法。
+- **已落地**（逐条证据、`文件:行` 与测试名见 1c 第 16 节）：
+  - **A2** migration `0004`（`application_specs`/`hosts`/`environments`）+ SQLite 仓储 +
+    本机 Host 自举（`EnsureLocalHost`，名字冲突时降级 `local-<id>`）；
+  - **A3** unit 渲染与 `strict`/`legacy` 双档（`TierFor`：≥240 strict、219–239 legacy、<219 报错）
+    与 systemd 版本探测（注入式 `VersionRunner`，argv-only）；
+  - **A4** systemd 适配器本体（`Prepare` 幂等、`Health`/`Status` 分离、
+    不用 `systemctl show --value`（230 才有）、`kind:file` 凭据的跨用户可达性处理）；
+  - **A6a** spec/hosts/environments/制品下载的 API+CLI+client；
+  - **A6b** `runtime/*` 端点、`runtime.*` 走 Operation（无旁路；`start` = 幂等 `Prepare` + `Start`；
+    `dryRun` 一律拒绝；适配器不可用则快速失败不建 Operation）、适配器装配（平台选择只有一处，
+    不加配置开关）。
+- **门禁（实现者实跑）**：`make fmt` / `make vet` / `make test`（16 个包） / `make test-race`
+  全绿；linux amd64/arm64 交叉编译通过。**这仍是单元 / 集成 / e2e 证据，不是 Linux 容器证据。**
+- **当时只剩 A7**（已落地，见下方补记二）：`test/linux/` 的 1c 容器断言（systemd 适配器、
+  凭据路径跨用户可达性）。其中「`verify.sh` 的 `750` 断言与 A4 的 `0751` 冲突」这一处，
+  按**保留 `Prepare` 之前的 `750` 断言、在 `Prepare` 之后新增 `0751` 断言**的时序处理，
+  两条断言并不矛盾（见 1c 第 7 节）。
+- **当时的验证缺口**：systemd 真实执行端到端、`legacy` 档（无验证主机）、真实 Linux 主机的
+  reboot 持久化/SELinux/AppArmor/sudoers-PAM。其中 **systemd 真实执行已由容器取得证据**
+  （见补记二），**`legacy` 档与真机项仍未验证**，均不得写成已验证。
+- **1d 规格仍待编写**（同上一条记录）。
+
+### 2026-09-23（补记二）A7 已落地并在容器中跑通 89/0，并据此修掉一个 root 形态下的 Prepare 缺陷
+
+- **变更原因**：上一版补记写「A7 已写好、容器未运行、只有桩证据」。A7 随后**在容器里跑通了**，
+  而且**跑出了一个产品缺陷**——这条比「断言通过」更值得记。
+- **容器证据**：`make verify-linux` 在 macOS + OrbStack（容器内 Ubuntu 24.04 / systemd 255 /
+  arm64）连跑 5 轮：第 1 轮 25 FAIL（共 65 项）→ 第 3/4 轮各 1 FAIL（87/88 项）→ 第 5 轮
+  **exit 0：89 项通过 / 0 项失败**（其中新增的 `check_runtime` 占 49 项）。
+  断言数的权威口径只有一个：脚本运行时打印的「`%d` 项通过，`%d` 项失败」= **89**；
+  历史快照：1b 时点 40 项、A7 落地时的静态推导 87 项（偏低，勿引用）。
+- **harness 结构变化**：新增**第二个以 root 运行**的 `opsd` 实例
+  （`test/linux/opsd.root.verify.yaml`，独立 socket/DB/日志/制品目录）——适配器要
+  `useradd`/`chown`/`systemctl`，必须 root；既有 40 项断言仍打在原来以 `frz-ops` 运行的实例上，
+  前缀未动。另新增探针应用 `test/linux/probe/main.go`（只上报凭据长度与 sha256，不打印明文）。
+- **跑出来的产品缺陷与修复**：`Prepare` 的凭据穿越链原先只承认「目录属主 == 自己 euid」，
+  而生产上 `opsd` **必须以 root 运行**、`/etc/opsd` 的属主却是服务用户 →
+  root 有权限修却拒绝修，`runtime prepare` 在**完全正常的部署**上直接失败。
+  修法：新增纯函数 `canChmod(euid, dirUID)`（root 或属主才可收敛）+ 显式的「归我们管理」三级
+  集合（凭据目录、`/etc/opsd/apps`、`/etc/opsd`；**`/` 与 `/etc` 只校验、绝不修改**）+
+  表驱动 `TestCanChmod`（`internal/adapters/runtime/systemd/files.go`、
+  `credentialpath_internal_test.go`）。修复后该断言转 PASS，其余 45 项 runtime 断言同时转 PASS。
+  **教训：本地全绿的测试挡不住部署形态差异**（假 runner 下「进程身份 vs 目录属主」永远是测试
+  自己造的那种关系）。
+- **同时修正一条不稳定断言**：`Restart=on-failure` 下 unit 失败后 `ActiveState` 只是瞬时
+  `failed`，自动重启期间是 `activating`（`SubState=auto-restart`）；「缺凭据必须启动失败」
+  改为「12×0.5s 窗口内从未 `active`，且状态只能是 `activating`/`failed`」。**「停止」≠「失败」**。
+- **污染检查**：容器内只有 `/sys/fs/cgroup` 一个挂载（外加 `--tmpfs /run /tmp`），无仓库
+  bind mount；`output/` mtime 未变。
+- **结论**：Phase A 的功能与容器断言**全部落地且有容器证据**；第 13 节的 12 条验收标准
+  11 条达成、1 条部分达成（`legacy` 档）。**仍未验证**：`legacy` 档（容器是 255，只覆盖 strict）、
+  真实 Linux 主机的 reboot 持久化/SELinux/AppArmor/sudoers-PAM。下一步：**1d 规格与迭代 2**。
 

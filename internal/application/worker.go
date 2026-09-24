@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -20,6 +21,7 @@ type Pool struct {
 	resolver SecretResolver
 	defaults Defaults
 	cancels  *cancelRegistry
+	runtimes *RuntimeService
 	workers  int
 	idle     time.Duration
 	logger   *slog.Logger
@@ -27,7 +29,7 @@ type Pool struct {
 	now      func() time.Time
 }
 
-func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, workers int, logger *slog.Logger) *Pool {
+func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults Defaults, cancels *cancelRegistry, runtimes *RuntimeService, workers int, logger *slog.Logger) *Pool {
 	if workers < 1 {
 		workers = 1
 	}
@@ -37,6 +39,7 @@ func newPool(repo Repository, exec Executor, resolver SecretResolver, defaults D
 		resolver: resolver,
 		defaults: defaults,
 		cancels:  cancels,
+		runtimes: runtimes,
 		workers:  workers,
 		idle:     defaultIdlePoll,
 		logger:   logger,
@@ -109,6 +112,11 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 		cancel()
 		p.cancels.unregister(op.ID)
 	}()
+
+	if isRuntimeKind(op.Kind) {
+		p.executeRuntime(persistCtx, execCtx, op)
+		return
+	}
 
 	spec, err := BuildCommandSpec(op.Kind, op.Spec, p.defaults)
 	if err != nil {
@@ -192,6 +200,124 @@ func (p *Pool) execute(ctx context.Context, op *domain.Operation) {
 
 	p.finish(persistCtx, op, status, exitCode, errorCode, errorMessage)
 	logger.Info("operation finished", "status", string(status), "errorCode", errorCode)
+}
+
+// executeRuntime 执行 runtime.* 操作。它与 executor 路径共用 Operation 的创建、锁、
+// 状态机、取消与落库，只把「做什么」换成 RuntimeAdapter 调用：
+//
+//   - runtime.start 幂等地先 Prepare 再 Start。先 Prepare 不是可选的：适配器合约明确
+//     要求「未 Prepare 直接 Start 必须被拒绝」，所以「把应用跑起来」这一个操作必须自带
+//     准备步骤，否则在从未 prepare 的主机上 start 永远失败。
+//   - runtime.stop 只 Stop——systemd 的 stop 对未运行的 unit 同样成功，天然幂等。
+//
+// 执行时读「应用的当前规格」而不是创建时的快照：这样 spec put 之后重试 runtime.start
+// 启动的是最新 manifest，与「一个应用一份当前规格」的语义一致。
+func (p *Pool) executeRuntime(persistCtx, execCtx context.Context, op *domain.Operation) {
+	startedAt := p.now()
+
+	if p.runtimes == nil {
+		p.finishRuntimeFailure(persistCtx, op, errRuntimeUnsupported(), startedAt)
+		return
+	}
+	app, spec, err := p.runtimes.Resolve(execCtx, op.Resource)
+	if err != nil {
+		p.finishRuntimeFailure(persistCtx, op, err, startedAt)
+		return
+	}
+	adapter, err := p.runtimes.requireAdapter()
+	if err != nil {
+		p.finishRuntimeFailure(persistCtx, op, err, startedAt)
+		return
+	}
+
+	target := map[string]string{"application": app.Name, "unit": spec.Systemd.UnitName}
+	switch op.Kind {
+	case v1.KindRuntimeStart:
+		p.appendLog(persistCtx, op, nil, "info", domain.PhasePrepare, "开始准备运行时（幂等）", target)
+		if err := adapter.Prepare(execCtx, spec); err != nil {
+			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
+			return
+		}
+		p.recordRuntimeDecision(persistCtx, op, app, spec)
+		if err := adapter.Start(execCtx, spec); err != nil {
+			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
+			return
+		}
+		p.appendLog(persistCtx, op, nil, "info", domain.PhaseExecute, "应用已启动", target)
+	case v1.KindRuntimeStop:
+		if err := adapter.Stop(execCtx, spec); err != nil {
+			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
+			return
+		}
+		p.appendLog(persistCtx, op, nil, "info", domain.PhaseExecute, "应用已停止", target)
+	default:
+		// 创建侧已经限制了 kind；走到这里说明有人绕过 Service 直接写了库。
+		p.finishRuntimeFailure(persistCtx, op,
+			domain.NewError(v1.CodeInvalidRequest, "unsupported runtime kind %q", op.Kind), startedAt)
+		return
+	}
+
+	p.appendLog(persistCtx, op, nil, "info", domain.PhaseFinalize, "operation finished", map[string]string{
+		"status":     string(domain.StatusSucceeded),
+		"durationMs": strconv.FormatInt(time.Since(startedAt).Milliseconds(), 10),
+	})
+	p.finish(persistCtx, op, domain.StatusSucceeded, nil, "", "")
+	p.logger.Info("runtime operation finished", "operationId", op.ID, "kind", op.Kind, "application", app.Name)
+}
+
+// recordRuntimeDecision 把 Prepare 的档位决策写进 Operation 日志与审计：同一份 manifest
+// 在不同 systemd 版本的主机上会生成不同的 unit，这份记录是事后唯一的解释来源。
+// 适配器没提供决策（例如假适配器、没有 reporter）时什么都不写，而不是编一条空档位。
+func (p *Pool) recordRuntimeDecision(ctx context.Context, op *domain.Operation, app *domain.Application, spec *domain.ApplicationSpec) {
+	decision, ok := p.runtimes.decision(ctx, spec)
+	if !ok {
+		return
+	}
+
+	fields := map[string]string{
+		"application": app.Name,
+		"unitName":    decision.UnitName,
+		"unitPath":    decision.UnitPath,
+		"tier":        decision.Tier,
+	}
+	if decision.SystemdVersion > 0 {
+		fields["systemdVersion"] = strconv.Itoa(decision.SystemdVersion)
+	}
+	if len(decision.Degradations) > 0 {
+		fields["degradations"] = strings.Join(decision.Degradations, "; ")
+	}
+	p.appendLog(ctx, op, nil, "info", domain.PhasePrepare, "运行时档位已确定", fields)
+
+	if err := p.repo.AppendAudit(ctx, domain.AuditEvent{
+		EventType:   domain.EventRuntimePrepared,
+		OperationID: op.ID,
+		Resource:    app.ID,
+		Result:      "prepared",
+		Time:        decision.DecidedAt,
+		Details:     fields,
+	}); err != nil {
+		p.logger.Error("failed to append runtime prepare audit", "operationId", op.ID, "error", err)
+	}
+}
+
+// finishRuntimeFailure 把适配器错误映射成终态。取消走 cancelled（与 executor 路径一致），
+// 其余一律 failed，错误码原样保留——RUNTIME_UNSUPPORTED、RUNTIME_NOT_READY、
+// SECRET_UNRESOLVED、MANIFEST_INVALID 都是调用方能据以行动的码，不该被抹成 INTERNAL。
+func (p *Pool) finishRuntimeFailure(ctx context.Context, op *domain.Operation, err error, startedAt time.Time) {
+	code := domain.CodeOf(err)
+	status := domain.StatusFailed
+	if errors.Is(err, context.Canceled) || code == v1.CodeExecCancelled {
+		status = domain.StatusCancelled
+		code = v1.CodeExecCancelled
+	}
+
+	p.appendLog(ctx, op, nil, "error", domain.PhaseExecute, "运行时操作失败: "+domain.MessageOf(err), map[string]string{
+		"errorCode":  string(code),
+		"durationMs": strconv.FormatInt(time.Since(startedAt).Milliseconds(), 10),
+	})
+	p.finish(ctx, op, status, nil, string(code), domain.MessageOf(err))
+	p.logger.Info("runtime operation finished", "operationId", op.ID, "kind", op.Kind,
+		"status", string(status), "errorCode", string(code))
 }
 
 // resolveSecrets 在使用时刻把 SecretRef 解析成明文并合并进命令环境。返回值是

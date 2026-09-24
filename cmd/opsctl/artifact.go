@@ -25,6 +25,7 @@ func newArtifactCommand(opts *rootOptions) *cobra.Command {
 		newArtifactPutCommand(opts),
 		newArtifactListCommand(opts),
 		newArtifactInspectCommand(opts),
+		newArtifactDownloadCommand(opts),
 		newArtifactVerifyCommand(opts),
 		newArtifactDeleteCommand(opts),
 		newArtifactGCCommand(opts),
@@ -139,6 +140,37 @@ func newArtifactInspectCommand(opts *rootOptions) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newArtifactDownloadCommand(opts *rootOptions) *cobra.Command {
+	var output string
+
+	cmd := &cobra.Command{
+		Use:   "download <artifact-id|digest> --output <path>",
+		Short: "下载制品内容到本地文件",
+		Long: "下载制品内容到本地文件。内容按存储的摘要校验后才落盘，因此下载失败或\n" +
+			"内容与记录不一致时，--output 指定的路径不会被写入半截内容。",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if output == "" {
+				return domain.NewError(v1.CodeInvalidRequest, "必须提供 --output")
+			}
+			artifact, err := opts.client().DownloadArtifact(cmd.Context(), args[0], output)
+			if err != nil {
+				return err
+			}
+			if opts.json {
+				return opts.printJSON(artifact)
+			}
+			fmt.Printf("已下载 %s\n", output)
+			fmt.Printf("digest: %s\n", artifact.Digest)
+			fmt.Printf("size:   %d\n", artifact.Size)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&output, "output", "", "输出文件路径")
+	return cmd
 }
 
 func newArtifactVerifyCommand(opts *rootOptions) *cobra.Command {

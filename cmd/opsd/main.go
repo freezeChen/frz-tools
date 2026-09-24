@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	stdruntime "runtime"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/freezeChen/frz-tools/internal/adapters/config"
 	"github.com/freezeChen/frz-tools/internal/adapters/executor"
 	"github.com/freezeChen/frz-tools/internal/adapters/httpapi"
+	"github.com/freezeChen/frz-tools/internal/adapters/runtime/systemd"
 	"github.com/freezeChen/frz-tools/internal/adapters/secret"
 	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
 	"github.com/freezeChen/frz-tools/internal/application"
@@ -95,11 +97,31 @@ func run(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	// 运行时适配器的平台选择只有这一处：Linux 上真的装配 systemd 适配器，其它平台
+	// 刻意不注入——runtime.* 于是返回 RUNTIME_UNSUPPORTED，而不是让一个假适配器在生产
+	// 里假装能用（也不引入让生产误选假适配器的配置开关）。secretResolver 两个用途
+	// 共用同一份，避免「执行器看到的允许目录」与「适配器看到的」不一致。
+	secretResolver := secret.NewResolver(cfg.AllowedSecretDirectories())
+	var (
+		runtimeAdapter  application.RuntimeAdapter
+		prepareReporter application.RuntimePrepareReporter
+	)
+	if stdruntime.GOOS == "linux" {
+		systemdAdapter := systemd.New("/", secretResolver, systemd.WithLogger(logger))
+		runtimeAdapter = systemdAdapter
+		prepareReporter = systemdReporter{adapter: systemdAdapter}
+	} else {
+		logger.Info("runtime adapter is unavailable on this platform, runtime.* will report RUNTIME_UNSUPPORTED",
+			"goos", stdruntime.GOOS)
+	}
+
 	runtime := application.NewRuntime(application.Options{
 		Repo:            store,
 		Executor:        exec,
-		Secrets:         secret.NewResolver(cfg.AllowedSecretDirectories()),
+		Secrets:         secretResolver,
 		Store:           artifactStore,
+		RuntimeAdapter:  runtimeAdapter,
+		PrepareReporter: prepareReporter,
 		AllowExecutable: cfg.ExecutableAllowed,
 		Defaults: application.Defaults{
 			Timeout:          cfg.DefaultTimeout(),
@@ -110,6 +132,14 @@ func run(cmd *cobra.Command, _ []string) error {
 		Workers:        cfg.Runtime.Workers,
 		Logger:         logger,
 	})
+
+	// 本机 Host 记录是「应用挂在哪台主机上」的锚点。每次启动都确保它存在；
+	// 已存在时原样返回，不覆盖运维调整过的名字与标签。
+	localHost, err := runtime.Hosts.EnsureLocalHost(ctx)
+	if err != nil {
+		return domain.NewError(v1.CodeInternal, "确保本机 Host 记录失败: %v", err)
+	}
+	logger.Info("local host is ready", "host", localHost.Name, "hostId", localHost.ID)
 
 	mode, err := cfg.SocketFileMode()
 	if err != nil {
@@ -131,6 +161,9 @@ func run(cmd *cobra.Command, _ []string) error {
 		Service:   runtime.Service,
 		Artifacts: runtime.Artifacts,
 		Catalogs:  runtime.Catalogs,
+		Specs:     runtime.Specs,
+		Hosts:     runtime.Hosts,
+		Runtimes:  runtime.Runtimes,
 		Schedules: runtime.Schedules,
 		Store:     store,
 		Workers:   runtime.Pool.Workers(),

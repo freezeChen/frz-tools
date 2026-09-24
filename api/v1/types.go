@@ -9,6 +9,11 @@ const APIVersion = "ops.frz.io/v1alpha1"
 
 const (
 	KindExecutorCommand = "executor.command"
+
+	// runtime.start / runtime.stop 走 Operation：它们复用同一套锁、状态机、审计、
+	// 日志、取消与重试，因此「启动一个应用」在查询与排查上和「跑一条命令」完全一致。
+	KindRuntimeStart = "runtime.start"
+	KindRuntimeStop  = "runtime.stop"
 )
 
 type CreateOperationRequest struct {

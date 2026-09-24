@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -318,6 +321,163 @@ func TestDeletedArtifactIsReportedAsNotFound(t *testing.T) {
 		t.Fatalf("want 404, got %d", response.StatusCode)
 	}
 	assertEnvelopeCode(t, body, v1.CodeArtifactNotFound)
+}
+
+func TestDownloadArtifactReturnsExactStoredBytes(t *testing.T) {
+	server, _ := newFullServer(t)
+
+	content := "billing-api 1.4.2 tarball bytes\x00\x01\x02"
+	artifact, status, _ := putArtifact(t, server, content, map[string]string{
+		"X-Artifact-Media-Type": "application/gzip",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("upload want 201, got %d", status)
+	}
+
+	// 用 ID 与摘要两种引用都能下载到同一份字节。
+	for _, ref := range []string{artifact.ID, artifact.Digest} {
+		response, err := http.Get(server.URL + "/api/v1/artifacts/" + url.PathEscape(ref) + "/content")
+		if err != nil {
+			t.Fatalf("download %s: %v", ref, err)
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("download %s want 200, got %d: %s", ref, response.StatusCode, string(body))
+		}
+		if string(body) != content {
+			t.Fatalf("下载内容与上传内容不一致：%q != %q", string(body), content)
+		}
+		// 头部要能独立地校验这次下载：媒体类型来自制品记录，长度与摘要都是它的属性。
+		if got := response.Header.Get("Content-Type"); got != "application/gzip" {
+			t.Fatalf("Content-Type want application/gzip, got %q", got)
+		}
+		if got := response.Header.Get("Content-Length"); got != strconv.Itoa(len(content)) {
+			t.Fatalf("Content-Length want %d, got %q", len(content), got)
+		}
+		if got := response.Header.Get("ETag"); got != `"`+artifact.Digest+`"` {
+			t.Fatalf("ETag want %q, got %q", `"`+artifact.Digest+`"`, got)
+		}
+	}
+}
+
+func TestDownloadArtifactReportsChecksumMismatch(t *testing.T) {
+	server, blobs := newFullServer(t)
+
+	content := "original artifact bytes"
+	artifact, _, _ := putArtifact(t, server, content, nil)
+
+	// 直接改坏存储里的 blob：这是唯一能造出「记录与内容不一致」的方式，
+	// 长度保持不变，因此只有摘要校验能发现它。
+	path := blobPath(t, blobs, artifact.Digest)
+	if err := os.WriteFile(path, []byte("tampered artifact byte"), 0o640); err != nil {
+		t.Fatalf("tamper with blob: %v", err)
+	}
+
+	response, err := http.Get(server.URL + "/api/v1/artifacts/" + artifact.ID + "/content")
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	// 校验在写任何字节之前完成，所以这里必须是错误信封，而不是「200 + 坏内容」。
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409, got %d: %s", response.StatusCode, string(body))
+	}
+	assertEnvelopeCode(t, body, v1.CodeArtifactChecksum)
+	if strings.Contains(string(body), "tampered") {
+		t.Fatalf("损坏的内容不得出现在响应里：%s", string(body))
+	}
+}
+
+// 制品未记录 mediaType 时，下载仍必须给出一个可用的 Content-Type，
+// 否则客户端拿到空类型、只能靠猜。
+func TestDownloadArtifactDefaultsContentType(t *testing.T) {
+	server, _ := newFullServer(t)
+
+	content := "bare binary without a declared media type"
+	artifact, _, _ := putArtifact(t, server, content, nil)
+
+	response, err := http.Get(server.URL + "/api/v1/artifacts/" + artifact.ID + "/content")
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", response.StatusCode, string(body))
+	}
+	if got := response.Header.Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("Content-Type want application/octet-stream, got %q", got)
+	}
+	if string(body) != content {
+		t.Fatalf("下载内容与上传内容不一致：%q", string(body))
+	}
+}
+
+func TestDownloadArtifactReportsNotFound(t *testing.T) {
+	server, _ := newFullServer(t)
+
+	response, err := http.Get(server.URL + "/api/v1/artifacts/art_missing/content")
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", response.StatusCode)
+	}
+	assertEnvelopeCode(t, body, v1.CodeArtifactNotFound)
+}
+
+func TestDownloadArtifactRejectsDeletedArtifact(t *testing.T) {
+	server, sqlStore := newArtifactServer(t, application.ArtifactPolicy{})
+	artifact, _, _ := putArtifact(t, server, "to be deleted after upload", nil)
+
+	now := time.Now().UTC()
+	if _, err := sqlStore.DB().ExecContext(context.Background(),
+		`UPDATE artifacts SET deleted_at = ? WHERE id = ?`, now.Format(time.RFC3339Nano), artifact.ID); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+
+	response, err := http.Get(server.URL + "/api/v1/artifacts/" + artifact.ID + "/content")
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", response.StatusCode)
+	}
+	assertEnvelopeCode(t, body, v1.CodeArtifactNotFound)
+}
+
+// blobPath 复刻存储的路径约定：<root>/blobs/sha256/ab/cd/<hex>。用例需要它来制造
+// 损坏的 blob——存储端口只接受 digest，没有「按 ID 取路径」的入口，这是有意的。
+func blobPath(t *testing.T, store *blob.Local, digest string) string {
+	t.Helper()
+
+	hexPart := strings.TrimPrefix(digest, "sha256:")
+	if len(hexPart) < 4 {
+		t.Fatalf("unexpected digest %q", digest)
+	}
+	return filepath.Join(store.Root(), "blobs", "sha256", hexPart[0:2], hexPart[2:4], hexPart)
 }
 
 // assertEnvelopeCode 校验已经读出的错误信封，避免依赖响应体的所有权时机。

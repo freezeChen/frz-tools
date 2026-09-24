@@ -12,8 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +21,7 @@ import (
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
+	"github.com/freezeChen/frz-tools/internal/adapters/runtime/readiness"
 	"github.com/freezeChen/frz-tools/internal/adapters/runtime/unitfile"
 	"github.com/freezeChen/frz-tools/internal/application"
 	"github.com/freezeChen/frz-tools/internal/domain"
@@ -33,7 +32,6 @@ const (
 	nonSecretEnvFile = "app.env"
 	secretEnvFile    = "app.secrets.env"
 	pidFileName      = "app.pid"
-	defaultProbeTime = 3 * time.Second
 )
 
 // state 是 Prepare 的产物，Start 只读它。把它落盘而不是留在内存里，
@@ -53,9 +51,11 @@ type Adapter struct {
 	now      func() time.Time
 	probe    time.Duration
 
-	mu        sync.Mutex
-	running   map[string]*exec.Cmd
-	successes map[string]int
+	mu      sync.Mutex
+	running map[string]*exec.Cmd
+
+	// successes 与 systemd 适配器共用同一份「连续成功」语义，见 readiness 包。
+	successes *readiness.Tracker
 }
 
 func New(root string, resolver application.SecretResolver) *Adapter {
@@ -63,9 +63,9 @@ func New(root string, resolver application.SecretResolver) *Adapter {
 		root:      root,
 		resolver:  resolver,
 		now:       func() time.Time { return time.Now().UTC() },
-		probe:     defaultProbeTime,
+		probe:     readiness.DefaultTimeout,
 		running:   map[string]*exec.Cmd{},
-		successes: map[string]int{},
+		successes: readiness.NewTracker(),
 	}
 }
 
@@ -157,7 +157,7 @@ func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error
 
 	a.mu.Lock()
 	a.running[spec.Systemd.UnitName] = cmd
-	a.successes[spec.Systemd.UnitName] = 0
+	a.successes.Reset(spec.Systemd.UnitName)
 	a.mu.Unlock()
 
 	if err := os.WriteFile(filepath.Join(a.appRoot(spec), pidFileName),
@@ -249,21 +249,17 @@ func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (dom
 		return domain.RuntimeHealth{}, err
 	}
 	if status != domain.RuntimeActive {
-		a.resetSuccesses(spec)
+		a.successes.Reset(spec.Systemd.UnitName)
 		return domain.RuntimeHealth{CheckedAt: now, Detail: "进程未在运行"}, nil
 	}
 
-	ready, detail := a.probeReadiness(ctx, spec)
+	ready, detail := readiness.Check(ctx, spec.Health.Readiness, a.probe)
 	if !ready {
-		a.resetSuccesses(spec)
+		a.successes.Reset(spec.Systemd.UnitName)
 		return domain.RuntimeHealth{CheckedAt: now, Detail: detail}, nil
 	}
 
-	a.mu.Lock()
-	a.successes[spec.Systemd.UnitName]++
-	count := a.successes[spec.Systemd.UnitName]
-	a.mu.Unlock()
-
+	count := a.successes.Record(spec.Systemd.UnitName)
 	required := spec.Health.Readiness.ConsecutiveSuccesses
 	if count < required {
 		return domain.RuntimeHealth{
@@ -272,44 +268,6 @@ func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (dom
 		}, nil
 	}
 	return domain.RuntimeHealth{Ready: true, CheckedAt: now, Detail: detail}, nil
-}
-
-func (a *Adapter) probeReadiness(ctx context.Context, spec *domain.ApplicationSpec) (bool, string) {
-	readiness := spec.Health.Readiness
-	ctx, cancel := context.WithTimeout(ctx, a.probe)
-	defer cancel()
-
-	switch readiness.Type {
-	case domain.ReadinessTCP:
-		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", readiness.Target)
-		if err != nil {
-			return false, "TCP 探测失败: " + err.Error()
-		}
-		_ = conn.Close()
-		return true, "TCP 探测通过: " + readiness.Target
-
-	case domain.ReadinessHTTP:
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, readiness.Target, nil)
-		if err != nil {
-			return false, "构造请求失败: " + err.Error()
-		}
-		response, err := http.DefaultClient.Do(request)
-		if err != nil {
-			return false, "HTTP 探测失败: " + err.Error()
-		}
-		defer response.Body.Close()
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return false, fmt.Sprintf("HTTP 探测返回 %d", response.StatusCode)
-		}
-		return true, fmt.Sprintf("HTTP 探测通过: %d", response.StatusCode)
-	}
-	return false, "不支持的就绪检查类型: " + string(readiness.Type)
-}
-
-func (a *Adapter) resetSuccesses(spec *domain.ApplicationSpec) {
-	a.mu.Lock()
-	a.successes[spec.Systemd.UnitName] = 0
-	a.mu.Unlock()
 }
 
 func (a *Adapter) appRoot(spec *domain.ApplicationSpec) string {

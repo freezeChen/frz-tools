@@ -21,6 +21,10 @@ const (
 	EventScheduleEnabled  = "schedule.enabled"
 	EventScheduleDisabled = "schedule.disabled"
 	EventScheduleDeleted  = "schedule.deleted"
+
+	// EventRuntimePrepared 记录一次运行时准备的档位决策：同一份 manifest 在不同
+	// systemd 版本的主机上生成的 unit 不同，审计里的档位与版本是唯一的解释来源。
+	EventRuntimePrepared = "runtime.prepared"
 )
 
 type AuditEvent struct {

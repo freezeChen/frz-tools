@@ -18,6 +18,9 @@ const (
 
 const (
 	PhaseValidate = "validate"
+	// PhasePrepare 是运行时准备阶段：它只出现在 runtime.* 操作里，
+	// 用来把「建用户/目录/环境文件/unit」与「启停进程」在日志里分开。
+	PhasePrepare  = "prepare"
 	PhaseExecute  = "execute"
 	PhaseFinalize = "finalize"
 )

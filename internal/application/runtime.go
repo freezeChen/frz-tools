@@ -14,6 +14,13 @@ type Options struct {
 	Secrets  SecretResolver
 	Store    StorageBackend
 
+	// RuntimeAdapter 是运行时适配器（systemd / proc）。非 Linux 上装配层刻意不注入：
+	// runtime.* 于是给出 RUNTIME_UNSUPPORTED，而不是让一个假适配器在生产里假装能用。
+	RuntimeAdapter RuntimeAdapter
+	// PrepareReporter 由装配层实现，把适配器私有的 Prepare 决策（unit 档位、systemd
+	// 版本）翻译成 Operation 的日志与审计字段。
+	PrepareReporter RuntimePrepareReporter
+
 	AllowExecutable func(string) bool
 	Defaults        Defaults
 	ArtifactPolicy  ArtifactPolicy
@@ -33,6 +40,9 @@ type Runtime struct {
 	Service   *Service
 	Artifacts *ArtifactService
 	Catalogs  *CatalogService
+	Specs     *SpecService
+	Hosts     *HostService
+	Runtimes  *RuntimeService
 	Schedules *ScheduleService
 	Scheduler *Scheduler
 	Pool      *Pool
@@ -44,8 +54,12 @@ func NewRuntime(opts Options) *Runtime {
 		idGen = idgen.New
 	}
 
+	// 适配器实例只建一次并与 worker 池共享：systemd 的版本探测与就绪计数都是实例态，
+	// 建两份会让同一次 runtime.start 里的探测结果互相不可见。
+	runtimes := newRuntimeService(opts.Repo, opts.RuntimeAdapter, opts.PrepareReporter)
+
 	cancels := newCancelRegistry()
-	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, opts.Workers, opts.Logger)
+	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, opts.Workers, opts.Logger)
 	if opts.Idle > 0 {
 		pool.idle = opts.Idle
 	}
@@ -53,7 +67,7 @@ func NewRuntime(opts Options) *Runtime {
 		pool.now = opts.Now
 	}
 
-	service := newService(opts.Repo, opts.Defaults, opts.AllowExecutable, cancels, func() string {
+	service := newService(opts.Repo, opts.Defaults, opts.AllowExecutable, cancels, runtimes, func() string {
 		return idGen("op")
 	}, opts.Logger)
 	if opts.Now != nil {
@@ -69,6 +83,8 @@ func NewRuntime(opts Options) *Runtime {
 	}
 
 	catalogs := newCatalogService(opts.Repo, idGen, opts.Now)
+	specs := newSpecService(opts.Repo, opts.Now)
+	hosts := newHostService(opts.Repo, idGen, opts.Now)
 
 	// 调度器是触发时刻的唯一权威；它与 worker 池共享唤醒通道，
 	// 计划发生变化时立刻重算等待时间，而不是等兜底周期。
@@ -79,6 +95,9 @@ func NewRuntime(opts Options) *Runtime {
 		Service:   service,
 		Artifacts: artifacts,
 		Catalogs:  catalogs,
+		Specs:     specs,
+		Hosts:     hosts,
+		Runtimes:  runtimes,
 		Schedules: schedules,
 		Scheduler: scheduler,
 		Pool:      pool,

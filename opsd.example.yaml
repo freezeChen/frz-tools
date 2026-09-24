@@ -42,6 +42,7 @@ secrets:
   allowedFileDirectories:
     - /etc/opsd/secrets
 
-# sudo 白名单：模型已冻结，1a 不使用，实际行为由 1c 的 Linux 适配实现。
+# sudo 白名单：模型已冻结，但**没有任何行为**——1c 并未实现它，读取该字段的代码不存在。
+# 这是迭代 0 的遗留项，在真实 Linux 主机上验证 sudoers 之前不得当作已生效的安全控制。
 sudo:
   allowedCommands: []

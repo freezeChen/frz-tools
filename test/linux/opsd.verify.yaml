@@ -27,7 +27,10 @@ artifactStore:
   root: /var/lib/opsd/artifacts
   fileMode: "0640"
   dirMode: "0750"
-  maxUploadBytes: 1048576
+  # 1 MiB 是为 1a/1b 的小制品设的；1c 的 runtime 验证要让 manifest 声明一个真实存在的
+  # 制品，而那个制品就是探针二进制本身（约 3.5 MiB），因此放宽到 8 MiB。
+  # quotaBytes 未变，仍在 16 MiB 上兜底。
+  maxUploadBytes: 8388608
   quotaBytes: 16777216
 
 secrets:
