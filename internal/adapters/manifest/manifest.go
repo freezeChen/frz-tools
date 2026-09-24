@@ -1,4 +1,5 @@
-// Package manifest 负责解析应用的 ApplicationSpec（manifest）。
+// Package manifest 负责解析版本化 manifest：应用的 ApplicationSpec 与备份的
+// BackupPolicy。两者共用 decode.go 里的解码流程（信封 → 迁移链 → 严格解码）。
 //
 // 解码流程与配置版本化保持一致：先用非严格解码读出 apiVersion 信封，按版本走
 // 迁移链，再用 KnownFields(true) 严格解码。这样做的目的是让「新增可选字段」保持
@@ -14,21 +15,11 @@ import (
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/domain"
-
-	"gopkg.in/yaml.v3"
 )
 
-// maxMigrationSteps 防止迁移链配置错误导致死循环。
-const maxMigrationSteps = 16
-
-// migrations 登记「从某个 apiVersion 升级到下一个版本」的函数。当前只有一版，
-// 因此为空；新增版本时在此登记，不要直接改历史版本的语义。
-var migrations = map[string]func(doc map[string]any) error{}
-
-type envelope struct {
-	APIVersion string `yaml:"apiVersion"`
-	Kind       string `yaml:"kind"`
-}
+// appSpecMigrations 登记 ApplicationSpec「从某个 apiVersion 升级到下一个版本」的函数。
+// 当前只有一版，因此为空；新增版本时在此登记，不要直接改历史版本的语义。
+var appSpecMigrations = map[string]func(doc map[string]any) error{}
 
 type wireSpec struct {
 	APIVersion  string       `yaml:"apiVersion"`
@@ -97,41 +88,13 @@ func ParseReader(r io.Reader) (*domain.ApplicationSpec, error) {
 	if err != nil {
 		return nil, domain.NewError(v1.CodeManifestInvalid, "读取 manifest 失败: %v", err)
 	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, domain.NewError(v1.CodeManifestInvalid, "manifest 内容为空")
-	}
 
-	var env envelope
-	if err := yaml.Unmarshal(raw, &env); err != nil {
-		return nil, domain.NewError(v1.CodeManifestInvalid, "manifest 不是合法 YAML: %v", err)
-	}
-	if env.APIVersion == "" {
-		return nil, domain.NewError(v1.CodeManifestInvalid, "manifest 必须声明 apiVersion")
-	}
-	if env.Kind != domain.ManifestKind {
-		return nil, domain.NewError(v1.CodeManifestInvalid,
-			"manifest 的 kind 必须是 %q，got %q", domain.ManifestKind, env.Kind)
-	}
-
-	doc := map[string]any{}
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return nil, domain.NewError(v1.CodeManifestInvalid, "manifest 不是合法 YAML: %v", err)
-	}
-	if err := migrate(doc, env.APIVersion); err != nil {
-		return nil, err
-	}
-
-	normalized, err := yaml.Marshal(doc)
-	if err != nil {
-		return nil, domain.NewError(v1.CodeManifestInvalid, "manifest 无法重新序列化: %v", err)
-	}
-
-	decoder := yaml.NewDecoder(bytes.NewReader(normalized))
-	decoder.KnownFields(true)
-
+	// 解码流程（信封 → 迁移链 → 严格解码）与 BackupPolicy 共用一份实现，
+	// 见 decode.go 的 decodeManifest。
 	var wire wireSpec
-	if err := decoder.Decode(&wire); err != nil {
-		return nil, domain.NewError(v1.CodeManifestInvalid, "manifest 字段非法: %v", err)
+	doc, err := decodeManifest(raw, domain.ManifestKind, domain.ManifestAPIVersion, appSpecMigrations, &wire)
+	if err != nil {
+		return nil, err
 	}
 
 	spec := convert(&wire, doc)
@@ -139,31 +102,6 @@ func ParseReader(r io.Reader) (*domain.ApplicationSpec, error) {
 		return nil, err
 	}
 	return spec, nil
-}
-
-func migrate(doc map[string]any, from string) error {
-	version := from
-	for step := 0; version != domain.ManifestAPIVersion; step++ {
-		if step >= maxMigrationSteps {
-			return domain.NewError(v1.CodeManifestInvalid,
-				"从 %q 开始的 manifest 迁移未收敛", from)
-		}
-		apply, ok := migrations[version]
-		if !ok {
-			return domain.NewError(v1.CodeManifestInvalid,
-				"不支持的 manifest apiVersion %q；本版本只理解 %q", from, domain.ManifestAPIVersion)
-		}
-		if err := apply(doc); err != nil {
-			return domain.NewError(v1.CodeManifestInvalid, "从 %q 迁移 manifest 失败: %v", version, err)
-		}
-		next, _ := doc["apiVersion"].(string)
-		if next == version {
-			return domain.NewError(v1.CodeManifestInvalid,
-				"从 %q 的 manifest 迁移没有推进 apiVersion", version)
-		}
-		version = next
-	}
-	return nil
 }
 
 func convert(wire *wireSpec, doc map[string]any) *domain.ApplicationSpec {
