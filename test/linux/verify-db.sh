@@ -186,10 +186,15 @@ run_engine() { # 名称 目录 DSN 环境变量 测试名
 
   local output="${WORK_DIR}/${name}.log"
   local status=0
-  # PATH 被替换成「包装脚本 + 系统目录」：跑的是哪家的客户端由我们决定，
-  # 不受开发机上装了什么都影响。go 用绝对路径调用。
+  # PATH 里**只有包装脚本**。
+  #
+  # 这条很要紧：CI runner 的镜像里自带 mysql / mysqldump / psql（ubuntu-latest 就有），
+  # 只要 /usr/bin 还在 PATH 里，夹具与适配器就可能解析到**主机上**的那个客户端，
+  # 于是连到一个根本没在监听的主机端口——而报错看起来像「数据库连不上」，
+  # 与真正的原因（跑错了客户端）差得很远。
   # -buildvcs=false：PATH 里没有 git，而 Go 在仓库里构建时会去问 git 要版本信息。
-  if PATH="${bin}:/usr/bin:/bin" env "${env}=${dsn}" \
+  # 注意顺序：`env` 自己要用**当前**的 PATH 才找得到，因此先给变量、再改 PATH。
+  if env "${env}=${dsn}" PATH="${bin}" \
     "$GO" test -count=1 -buildvcs=false ./test/dbbackup/ -run "${test_name}" -v >"$output" 2>&1; then
     status=0
   else
@@ -213,7 +218,12 @@ run_engine() { # 名称 目录 DSN 环境变量 测试名
     pass "${name}：${passed} 项通过（含子用例）"
   else
     fail "${name}：${failed} 项失败（退出码 ${status}）"
-    grep -E -- '--- FAIL:|\.go:[0-9]+:' "$output" | head -20 >&2
+    # 输出**整份** go test 日志，不做二次过滤。
+    # 过滤过一次就吃过亏：用例失败信息是多行的（SQL、stderr 各占一行），
+    # 只挑含 ".go:" 的行会把真正的报错丢掉，剩下的信息只够猜。
+    printf '%s\n' "---- ${name}：go test 完整输出 ----" >&2
+    cat "$output" >&2
+    printf '%s\n' "---- 结束 ----" >&2
   fi
 }
 
