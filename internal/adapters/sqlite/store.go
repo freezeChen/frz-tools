@@ -17,21 +17,18 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const timeLayout = time.RFC3339Nano
+// timeLayout 是所有时间列**写入**时使用的定宽格式。
+//
+// 不用 time.RFC3339Nano：它会裁掉末尾的零、并在小数部分为零时把小数点整段省略，于是同一秒内
+// "…T00:00:00Z" 按字典序大于 "…T00:00:00.5Z" 而时间上更早。SQLite 比的是字符串，凡按时间列
+// 排序或比较的地方（`ORDER BY created_at`、`not_before <= ?`、`schedule_runs` 的
+// `(schedule_id, scheduled_for)` 去重）都会因此出错。固定 9 位小数让字符串序等于时间序。
+// 读回由 parseTime 负责，它比这里宽松（见下）。
+const timeLayout = "2006-01-02T15:04:05.000000000Z"
 
 const operationColumns = `id, kind, resource, status, phase, dry_run, idempotency_key, request_hash,
 	retry_of, exit_code, error_code, error_message, spec_json, created_at, started_at, finished_at, created_by,
 	attempt, not_before, retry_policy_json`
-
-// notBeforeLayout 是 not_before 专用的**定宽**时间格式。
-//
-// 不用仓库通用的 time.RFC3339Nano：它会裁掉末尾的零、并在小数部分为零时整个省略，
-// 于是 "…T00:00:00Z" 按字典序大于 "…T00:00:00.5Z" 而时间上更早。领取查询要在 SQL 里
-// 直接做 `not_before <= ?`，字符串序必须等于时间序，所以固定 9 位小数。
-// 定宽格式仍能被既有的 RFC3339 解析器读出，所以读回不需要额外分支。
-const notBeforeLayout = "2006-01-02T15:04:05.000000000Z"
-
-func formatNotBefore(t time.Time) string { return t.UTC().Format(notBeforeLayout) }
 
 type Store struct {
 	db *sql.DB
@@ -180,7 +177,7 @@ func (s *Store) ClaimNextPending(ctx context.Context, now time.Time) (*domain.Op
 		    WHERE l.resource = o.resource AND l.released_at IS NULL
 		  )
 		ORDER BY o.created_at, o.id
-		LIMIT 1`, formatNotBefore(now)).Scan(&id)
+		LIMIT 1`, formatTime(now)).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -631,7 +628,7 @@ func nullNotBefore(t *time.Time) any {
 	if t == nil {
 		return nil
 	}
-	return formatNotBefore(*t)
+	return formatTime(*t)
 }
 
 func nullBytes(raw []byte) any {
@@ -655,7 +652,7 @@ func insertRetryOperation(ctx context.Context, ex execer, original *domain.Opera
 	details := map[string]string{
 		"retryOf":   original.ID,
 		"attempt":   strconv.Itoa(attempt),
-		"notBefore": formatNotBefore(notBefore),
+		"notBefore": formatTime(notBefore),
 		"automatic": "true",
 	}
 
@@ -882,8 +879,11 @@ func errorDetail(code string) map[string]string {
 
 func formatTime(t time.Time) string { return t.UTC().Format(timeLayout) }
 
+// parseTime 比 formatTime 宽松：time.RFC3339Nano 接受任意小数位数（含完全没有小数部分），
+// 因此既能读定宽的新值，也能读 0007 之前的可变宽度值——升级窗口内不必区分两种格式。
+// **写入**一律走 formatTime：宽读窄写，两个方向都不需要分支。
 func parseTime(value string) (time.Time, error) {
-	return time.Parse(timeLayout, value)
+	return time.Parse(time.RFC3339Nano, value)
 }
 
 func boolToInt(b bool) int {

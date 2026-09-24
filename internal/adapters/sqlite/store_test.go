@@ -341,3 +341,96 @@ func TestUnknownErrorMapsToInternal(t *testing.T) {
 		t.Fatal("uncoded error must map to INTERNAL")
 	}
 }
+
+// SQLite 按**字符串**比较时间列（`ORDER BY created_at`、`not_before <= ?`），所以写入格式
+// 必须让字符串序等于时间序。RFC3339Nano 不满足：它裁掉末尾的零、并在小数部分为零时把小数点
+// 整段省略，于是同一秒内 "…T00:00:00Z" 按字典序**大于** "…T00:00:00.5Z"，而时间上更早。
+// 本用例在修复前失败，修 timeLayout 后才通过——它是这次改动的起点。
+func TestFormatTimeKeepsChronologicalOrder(t *testing.T) {
+	second := time.Date(2026, 9, 24, 2, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name           string
+		earlier, later time.Time
+	}{
+		{"整秒在前、半秒在后", second, second.Add(500 * time.Millisecond)},
+		{"整秒在前、一纳秒在后", second, second.Add(time.Nanosecond)},
+		{"同秒内两个带小数的时刻", second.Add(500 * time.Millisecond), second.Add(900 * time.Millisecond)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.earlier.Before(tc.later) {
+				t.Fatalf("用例本身写反了：%s 不早于 %s", tc.earlier, tc.later)
+			}
+			earlier, later := formatTime(tc.earlier), formatTime(tc.later)
+			if earlier >= later {
+				t.Fatalf("时间上更早的值必须按字典序也更小，got %q >= %q", earlier, later)
+			}
+		})
+	}
+}
+
+// 窄写（定宽）之后仍必须读得回原值，且读回同样吃得下 0007 之前的可变宽度值——升级窗口里
+// 两种格式会短暂共存，parseTime 不能只认其中一种。
+func TestTimeRoundTripsThroughStorage(t *testing.T) {
+	second := time.Date(2026, 9, 24, 2, 0, 0, 0, time.UTC)
+	values := []time.Time{
+		second,
+		second.Add(time.Nanosecond),
+		second.Add(120 * time.Millisecond),
+		second.Add(500 * time.Millisecond),
+		second.Add(123456000 * time.Nanosecond),
+	}
+	for _, want := range values {
+		stored := formatTime(want)
+		got, err := parseTime(stored)
+		if err != nil {
+			t.Fatalf("parseTime(%q): %v", stored, err)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("定宽格式必须读回原值：want %s, got %s（存储值 %q）", want, got, stored)
+		}
+		// 旧格式（RFC3339Nano）也必须读得动。
+		legacy, err := parseTime(want.Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatalf("parseTime(旧格式 %q): %v", want.Format(time.RFC3339Nano), err)
+		}
+		if !legacy.Equal(want) {
+			t.Fatalf("旧格式必须读回原值：want %s, got %s", want, legacy)
+		}
+	}
+}
+
+// 上面的缺陷对查询的实际影响：同一秒内提交的操作会被乱序领取。
+func TestClaimNextPendingOrdersSameSecondOperationsByTime(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	second := time.Date(2026, 9, 24, 2, 0, 0, 0, time.UTC)
+
+	older := newOperation("resource-older")
+	older.CreatedAt = second
+	newer := newOperation("resource-newer")
+	newer.CreatedAt = second.Add(500 * time.Millisecond)
+
+	// 先插新的：领取顺序若只是跟着插入顺序走，这个用例就证明了别的东西。
+	for _, op := range []*domain.Operation{newer, older} {
+		if _, err := store.CreateOperation(ctx, op); err != nil {
+			t.Fatalf("create operation: %v", err)
+		}
+	}
+
+	first, err := store.ClaimNextPending(ctx, second.Add(time.Second))
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if first == nil || first.ID != older.ID {
+		t.Fatalf("应当先领取时间更早的那条（%s），got %+v", older.ID, first)
+	}
+
+	secondClaim, err := store.ClaimNextPending(ctx, second.Add(time.Second))
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if secondClaim == nil || secondClaim.ID != newer.ID {
+		t.Fatalf("第二次应当领取时间更晚的那条（%s），got %+v", newer.ID, secondClaim)
+	}
+}
