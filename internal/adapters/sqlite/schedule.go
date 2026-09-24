@@ -11,7 +11,8 @@ import (
 )
 
 const scheduleColumns = `id, name, enabled, kind, cron, interval_seconds, timezone, resource,
-	spec_json, missed_run_policy, next_run_at, last_run_at, last_result, created_at, updated_at, created_by`
+	operation_kind, spec_json, missed_run_policy, next_run_at, last_run_at, last_result,
+	created_at, updated_at, created_by`
 
 const scheduleRunColumns = `id, schedule_id, scheduled_for, started_at, finished_at,
 	result, operation_id, error_code, error_message`
@@ -22,12 +23,13 @@ func (s *Store) CreateSchedule(ctx context.Context, schedule *domain.Schedule) e
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO schedules (
-			id, name, enabled, kind, cron, interval_seconds, timezone, resource, spec_json,
-			missed_run_policy, next_run_at, last_run_at, last_result, created_at, updated_at, created_by
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?, ?, ?)`,
+			id, name, enabled, kind, cron, interval_seconds, timezone, resource, operation_kind,
+			spec_json, missed_run_policy, next_run_at, last_run_at, last_result, created_at, updated_at, created_by
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?, ?, ?)`,
 		schedule.ID, schedule.Name, boolToInt(schedule.Enabled), string(schedule.Kind),
 		nullString(schedule.Cron), intervalSeconds(schedule.Interval), schedule.Timezone,
-		schedule.Resource, string(schedule.Spec), string(schedule.MissedRunPolicy),
+		schedule.Resource, schedule.OperationKindOrDefault(), string(schedule.Spec),
+		string(schedule.MissedRunPolicy),
 		nullTime(schedule.NextRunAt), formatTime(schedule.CreatedAt), formatTime(schedule.UpdatedAt),
 		nullString(schedule.CreatedBy))
 	if isUniqueViolation(err) {
@@ -282,11 +284,18 @@ func scanSchedule(sc scanner) (*domain.Schedule, error) {
 		updatedAt  string
 		createdBy  sql.NullString
 		spec       string
+		opKind     sql.NullString
 	)
 	if err := sc.Scan(&schedule.ID, &schedule.Name, &enabled, &kind, &cronExpr, &interval,
-		&schedule.Timezone, &schedule.Resource, &spec, &policy, &nextRunAt, &lastRunAt,
+		&schedule.Timezone, &schedule.Resource, &opKind, &spec, &policy, &nextRunAt, &lastRunAt,
 		&lastResult, &createdAt, &updatedAt, &createdBy); err != nil {
 		return nil, err
+	}
+	// 老行没有这一列时取默认值：省略该字段的计划行为逐字节不变。
+	if opKind.Valid && opKind.String != "" {
+		schedule.OperationKind = opKind.String
+	} else {
+		schedule.OperationKind = v1.KindExecutorCommand
 	}
 
 	schedule.Enabled = enabled != 0

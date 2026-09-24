@@ -57,14 +57,19 @@ const MinInterval = time.Minute
 const maxScheduledMoments = 1000
 
 type Schedule struct {
-	ID              string
-	Name            string
-	Enabled         bool
-	Kind            ScheduleKind
-	Cron            string
-	Interval        time.Duration
-	Timezone        string
-	Resource        string
+	ID       string
+	Name     string
+	Enabled  bool
+	Kind     ScheduleKind
+	Cron     string
+	Interval time.Duration
+	Timezone string
+	Resource string
+	// OperationKind 是到点要创建哪种操作，省略时是 executor.command。
+	//
+	// 加这个字段之前调度器写死了 executor.command，于是「按计划跑备份」从模型上就
+	// 做不到（迭代 2 规格 D6）。
+	OperationKind   string
 	Spec            json.RawMessage
 	MissedRunPolicy MissedRunPolicy
 	NextRunAt       *time.Time
@@ -73,6 +78,29 @@ type Schedule struct {
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 	CreatedBy       string
+}
+
+// schedulableKinds 是计划可以触发的操作类型白名单。
+//
+// 刻意列白名单而不是「什么都行」：计划会在无人值守时自动执行，一个写错的操作类型
+// 不该等到半夜才被发现。
+var schedulableKinds = map[string]bool{
+	v1.KindExecutorCommand: true,
+	v1.KindRuntimeStart:    true,
+	v1.KindRuntimeStop:     true,
+	v1.KindBackupRun:       true,
+	v1.KindBackupVerify:    true,
+	v1.KindBackupRestore:   true,
+}
+
+// OperationKindOrDefault 返回落库时要写的操作类型；空值归一为 executor.command，
+// 避免把空串写进一个有 NOT NULL DEFAULT 的列（那会让「省略」与「写了空」在库里不可分）。
+// 导出是因为仓储适配器也要用它。
+func (s *Schedule) OperationKindOrDefault() string {
+	if s.OperationKind == "" {
+		return v1.KindExecutorCommand
+	}
+	return s.OperationKind
 }
 
 func (s *Schedule) Validate() error {
@@ -85,6 +113,14 @@ func (s *Schedule) Validate() error {
 	if len(s.Spec) == 0 {
 		return NewError(v1.CodeScheduleInvalid, "计划必须带 spec")
 	}
+	switch {
+	case s.OperationKind == "":
+		s.OperationKind = v1.KindExecutorCommand
+	case !schedulableKinds[s.OperationKind]:
+		return NewError(v1.CodeScheduleInvalid,
+			"operationKind 取值非法: %q", s.OperationKind)
+	}
+
 	if !s.MissedRunPolicy.Valid() {
 		return NewError(v1.CodeScheduleInvalid, "missedRunPolicy 取值非法: %q", s.MissedRunPolicy)
 	}

@@ -75,12 +75,21 @@ Linux 容器验证真实 systemd 交互；真实 Linux 主机项挂起并标注�
 | `EXEC_EXIT_NONZERO` | 是 | 命令自身偶发失败（资源竞争、临时文件冲突） |
 | `RUNTIME_NOT_READY` | 是 | 预热没完成，正是「等一等再试」的典型 |
 | `DAEMON_RESTARTED` | 是 | 被上一个守护进程中断，与命令本身无关 |
+| `BACKUP_PREFLIGHT_FAILED` | 是 | 空间不足、对端暂时不可达（**2026-09-24 增补，见下**） |
+| `BACKUP_VERIFY_FAILED` | 是 | 流损坏，重新备一次是对的（**2026-09-24 增补**） |
 | `EXEC_CANCELLED` | **否** | 用户主动取消，重试等于违抗指令 |
 | `PERMISSION_DENIED` | **否** | 权限不会因为重试而改变 |
 | `LOCK_BUSY` | **否** | 锁冲突在提交期就返回了，不是执行期失败 |
 | `MANIFEST_INVALID` / `INVALID_REQUEST` / `CONFIG_INVALID` | **否** | 配置错误，重试只会重复同样的错误 |
 | `SECRET_UNRESOLVED` | **否** | 凭据缺失不会自愈；且重试会反复触碰凭据路径 |
 | `INTERNAL` | **否** | 未知原因，默认不重试（宁可让运维看见） |
+| `BACKUP_KEY_UNRESOLVED` / `BACKUP_RESTORE_UNCONFIRMED` | **否** | 配置写错与人没确认，重试只会重复同样的问题 |
+
+> **2026-09-24 修订（实现迭代 2a 时增补）**：白名单加入 `BACKUP_PREFLIGHT_FAILED` 与
+> `BACKUP_VERIFY_FAILED`。原因：迭代 2 的要求是备份「标记失败**并可重试**」，而备份的
+> 瞬时失败（空间不足、上传中断、流损坏）以这两个码呈现；1d 冻结这张表时备份还没实现，
+> 当时无法预见到它们。**刻意不加** `BACKUP_KEY_UNRESOLVED` 与 `BACKUP_RESTORE_UNCONFIRMED`。
+> 这条修订只补瞬时故障，不放宽 D3 的判据（仍然是白名单、仍然只允许请求缩小）。
 
 判定发生在**结束操作的那一刻**（worker 把 `FinishInput` 落库时），不是在恢复时重算。
 

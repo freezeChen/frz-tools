@@ -74,6 +74,13 @@ func defaultRetryableCodes() []v1.ErrorCode {
 		v1.CodeExecExitNonZero, // 命令自身偶发失败（资源竞争、临时文件冲突）
 		v1.CodeRuntimeNotReady, // 预热没完成，正是「等一等再试」的典型
 		v1.CodeDaemonRestarted, // 被上一个守护进程中断，与命令本身无关
+
+		// 迭代 2 增补（见 1d 文档第 3 节 D3 的 2026-09-24 修订）：迭代 2 要求备份
+		// 「标记失败并可重试」，而备份的瞬时失败（空间不足、上传中断、流损坏）
+		// 以这两个码呈现。**不**加 BACKUP_KEY_UNRESOLVED 与 BACKUP_RESTORE_UNCONFIRMED：
+		// 它们是配置写错与人没确认，重试只会重复同样的问题。
+		v1.CodeBackupPreflightFailed, // 空间不足、对端暂时不可达
+		v1.CodeBackupVerifyFailed,    // 流损坏，重新备一次是对的
 	}
 }
 

@@ -21,12 +21,14 @@ const (
 // CreateScheduleInput 是创建计划的入参。spec 与触发时创建的 Operation 完全一致，
 // 因此计划在创建时就能被校验，不必等到触发时才发现它本身是坏的。
 type CreateScheduleInput struct {
-	Name            string
-	Kind            domain.ScheduleKind
-	Cron            string
-	Interval        time.Duration
-	Timezone        string
-	Resource        string
+	Name     string
+	Kind     domain.ScheduleKind
+	Cron     string
+	Interval time.Duration
+	Timezone string
+	Resource string
+	// OperationKind 省略时是 executor.command。
+	OperationKind   string
 	Spec            json.RawMessage
 	MissedRunPolicy domain.MissedRunPolicy
 	CreatedBy       string
@@ -48,10 +50,29 @@ func newScheduleService(repo Repository, defaults Defaults, newID func(prefix st
 }
 
 func (s *ScheduleService) Create(ctx context.Context, in CreateScheduleInput) (*domain.Schedule, error) {
-	// 计划将来会创建 executor.command 类型的 Operation，这里用同一套校验，
-	// 让错误的 spec 在创建计划时就失败。
-	if _, err := BuildCommandSpec(v1.KindExecutorCommand, in.Spec, s.defaults); err != nil {
-		return nil, err
+	// 按**声明出来的**操作类型校验 spec：用与触发时同一套规则，让错误的 spec 在
+	// 创建计划时就失败，而不是等到半夜触发时才发现。
+	kind := in.OperationKind
+	if kind == "" {
+		kind = v1.KindExecutorCommand
+	}
+	switch {
+	case kind == v1.KindExecutorCommand:
+		if _, err := BuildCommandSpec(kind, in.Spec, s.defaults); err != nil {
+			return nil, err
+		}
+	case kind == v1.KindBackupRestore:
+		// 恢复模式写在计划里，因此这里就要能解出来——否则「mode 写错了」要等到
+		// 半夜触发时才被发现。
+		if _, err := DecodeRestoreOptions(in.Spec); err != nil {
+			return nil, err
+		}
+	case isRuntimeKind(kind) || kind == v1.KindBackupRun || kind == v1.KindBackupVerify:
+		// 这几类执行时读**当前**的规格或策略（与手工提交一致），因此计划本身不带 spec。
+		if len(in.Spec) > 0 {
+			return nil, domain.NewError(v1.CodeScheduleInvalid,
+				"%s 执行时读当前的规格/策略，计划里不应带 spec", kind)
+		}
 	}
 
 	now := s.now()
@@ -64,6 +85,7 @@ func (s *ScheduleService) Create(ctx context.Context, in CreateScheduleInput) (*
 		Interval:        in.Interval,
 		Timezone:        in.Timezone,
 		Resource:        in.Resource,
+		OperationKind:   in.OperationKind,
 		Spec:            in.Spec,
 		MissedRunPolicy: in.MissedRunPolicy,
 		CreatedAt:       now,
