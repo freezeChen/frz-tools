@@ -47,6 +47,10 @@ OTHER_USER=frz-other
 RUNTIME_UNIT=frz-probe.service
 RUNTIME_PORT=${FRZ_PROBE_PORT:-28581}
 PROBE_DIR=/etc/opsd/apps/${RUNTIME_APP}
+# 一条**被 DAC 允许、但应被挂载保护拦住**的写入路径：它归运行用户所有，因此「写不进去」
+# 只可能来自 ProtectSystem 的只读挂载。strict 档是整个文件系统只读，legacy 档的 yes 让
+# /usr 只读——两档在这里的期望值都是「被拒」，因此它是唯一一条**跨档都成立**的防护断言。
+MS_DIR=frz-host-verify-ms
 MYSQL_POLICY=frz-verify-mysql
 OPSD_UNIT=frz-opsd-verify.service
 OPSCTL="$FRZ_HOST_DIR/bin/opsctl"
@@ -76,6 +80,12 @@ FAIL_COUNT=0
 SKIP_COUNT=0
 # 前置检查的结论。1 表示「这台机器上本来就有不属于本轮的东西」——此时本轮**既不建也不删**。
 PRECONDITION_FAILED=0
+# 档位相关的期望值：由 check_prepare 探测到的 systemd 版本填好，后面的断言一律读它。
+EXPECT_TIER=""
+EXPECT_PROTECT_SYSTEM=""
+EXPECT_FS_DIRECTIVE=""
+EXPECT_STDOUT=""
+EXPECT_MEMORY_PROP=""
 FINDINGS=()
 
 log()  { printf '\n--- %s\n' "$*"; }
@@ -117,6 +127,45 @@ require_fail() { # 描述 命令…
 mode_of()  { stat -c '%a' "$1" 2>/dev/null || true; }
 owner_of() { stat -c '%U:%G' "$1" 2>/dev/null || true; }
 label_of() { stat -c '%C' "$1" 2>/dev/null || true; }
+
+# unit_prop 取一个 unit 的某个属性值。
+#
+# **不能用 `systemctl show --value`**：那个开关是 systemd 230 才加的，而本工具承诺支持到
+# 219——在这台 CentOS 7（219）上它会直接报 `unrecognized option '--value'`，于是每个用到
+# 它的断言都会拿到一段错误文本当值。产品代码早就刻意避开了它（见 systemd 适配器里
+# unitStatus 的注释），harness 这里跟上同一条规则：解析 `Prop=value` 那一行。
+# 这个写法在 219 与 255 上都能用（两边都实测过）。
+unit_prop() { # unit 属性名
+  systemctl show "$1" -p "$2" 2>/dev/null | sed -n "s/^$2=//p" | head -1
+}
+
+# memory_limit_of / cpu_quota_of：**内核侧**真正生效的那个值。
+#
+# cgroup v1 与 v2 的文件名与目录布局都不同（v1 是 /sys/fs/cgroup/<控制器>/… 下、v2 是
+# /sys/fs/cgroup/<cgroup>/memory.max 与 cpu.max），因此不能写死一条路径。判据用文件是否存在，
+# 而不是猜版本：这台 CentOS 7 是 v1，容器与新版主机是 v2，两边都已实测。
+memory_limit_of() { # unit
+  local cg
+  cg=$(unit_prop "$1" ControlGroup)
+  [ -z "$cg" ] && return 0
+  if [ -f "/sys/fs/cgroup/memory${cg}/memory.limit_in_bytes" ]; then
+    cat "/sys/fs/cgroup/memory${cg}/memory.limit_in_bytes"
+  else
+    cat "/sys/fs/cgroup${cg}/memory.max" 2>/dev/null
+  fi
+}
+
+cpu_quota_of() { # unit —— 输出 "<quota> <period>"，两代的语义与数字都一致
+  local cg
+  cg=$(unit_prop "$1" ControlGroup)
+  [ -z "$cg" ] && return 0
+  if [ -f "/sys/fs/cgroup/cpu${cg}/cpu.cfs_quota_us" ]; then
+    printf '%s %s' "$(cat "/sys/fs/cgroup/cpu${cg}/cpu.cfs_quota_us")" \
+      "$(cat "/sys/fs/cgroup/cpu${cg}/cpu.cfs_period_us")"
+  else
+    cat "/sys/fs/cgroup${cg}/cpu.max" 2>/dev/null
+  fi
+}
 
 # business_java_count 数一数**主机自有的** JVM（排除本轮夹具用户启动的那些）。
 #
@@ -215,7 +264,7 @@ cleanup() {
   # ——生产机上留一棵没人认领的目录树是最不该发生的事。cleanup 敢直接 rm 是因为
   # check_preconditions 已经断言过它本轮之前不存在。
   rm -rf /etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops /opt/opsd
-  rm -rf "/var/lib/$RUNTIME_APP" "/var/log/$RUNTIME_APP" "/var/lib/${RUNTIME_APP}-extra"
+  rm -rf "/var/lib/$RUNTIME_APP" "/var/log/$RUNTIME_APP" "/var/lib/${RUNTIME_APP}-extra" "/usr/local/$MS_DIR"
   rm -rf "$FRZ_HOST_DIR"
 
   printf '已删除：用户/组 frz-ops、%s、%s；unit %s 与 %s；目录 /etc/opsd、/var/lib/opsd、\n' \
@@ -249,7 +298,7 @@ check_preconditions() {
   done
   # /opt/opsd 在列表里是**安全前提**而不是洁癖：cleanup 会删掉整棵 /opt/opsd，因此必须
   # 先确认它本轮之前不存在——否则我们就在一台有既有 release 的机器上删了别人的目录树。
-  for path in /etc/opsd /var/lib/opsd /run/opsd /opt/frz-ops /opt/opsd "/var/lib/$RUNTIME_APP"; do
+  for path in /etc/opsd /var/lib/opsd /run/opsd /opt/frz-ops /opt/opsd "/var/lib/$RUNTIME_APP" "/usr/local/$MS_DIR"; do
     [ -e "$path" ] && { fail "$path 已存在，无法从「干净主机」开始"; dirty=1; }
   done
   [ "$dirty" -eq 0 ] && pass "本轮涉及的用户与目录此时都不存在"
@@ -324,7 +373,7 @@ UNIT
   printf '      /run/opsd 属主           : %s（RuntimeDirectory 属服务运行用户）\n' "$(owner_of /run/opsd)"
   assert_eq "socket 模式" "660" "$(mode_of /run/opsd/opsd.sock)"
   printf '      socket 属主              : %s\n' "$(owner_of /run/opsd/opsd.sock)"
-  printf '      opsd 进程的 SELinux 上下文: %s\n' "$(tr -d '\0' < "/proc/$(systemctl show "$OPSD_UNIT" -p MainPID --value)/attr/current" 2>/dev/null || printf '<不可读>')"
+  printf '      opsd 进程的 SELinux 上下文: %s\n' "$(tr -d '\0' < "/proc/$(unit_prop "$OPSD_UNIT" MainPID)/attr/current" 2>/dev/null || printf '<不可读>')"
   note "以 root 运行的 opsd 建出的 socket 属主是 $(owner_of /run/opsd/opsd.sock)：非 root 用户用不了 opsctl，而配置里没有 socket 属组项——真机暴露出来的部署缺口，本轮不修，记为待定"
 }
 
@@ -385,6 +434,8 @@ exec:
     - /var/log/${RUNTIME_APP}/probe-writable
     - --deny-write
     - /var/lib/${RUNTIME_APP}-extra/out
+    - --deny-write
+    - /usr/local/${MS_DIR}/out
   workingDirectory: /var/lib/${RUNTIME_APP}
   runUser: ${RUNTIME_USER}
   environment:
@@ -425,11 +476,32 @@ MANIFEST
     fail "runtime prepare 失败：$(opsctl runtime prepare --app "$RUNTIME_APP" 2>&1 | head -3 | tr '\n' ' ')"
     return 0
   fi
-  assert_eq "Prepare 返回的 unit 档位" "strict" "$tier"
-  if [ -n "$version" ] && [ "$version" -ge 240 ]; then
-    pass "探测到的 systemd 版本 ${version} 落在 strict 档（≥240）"
+  if [ -z "$version" ]; then
+    fail "Prepare 没有返回 systemd 版本"
+    return 0
+  fi
+  # 档位由探测到的版本决定（两档的分界是 240，见 unitfile.TierFor）。这台主机上跑的是
+  # 哪一档，决定了下面**每一条** unit 内容断言与防护断言——把期望值放在这里算一次，
+  # 后面一律读它，避免每条断言各自判断一次、各自漂移。
+  if [ "$version" -ge 240 ]; then
+    EXPECT_TIER=strict
+    EXPECT_PROTECT_SYSTEM=strict
+    EXPECT_FS_DIRECTIVE=ReadWritePaths
+    EXPECT_STDOUT=append
+    EXPECT_MEMORY_PROP=MemoryMax
   else
-    fail "Prepare 返回的 systemd 版本异常：${version:-<空>}"
+    EXPECT_TIER=legacy
+    EXPECT_PROTECT_SYSTEM=yes
+    EXPECT_FS_DIRECTIVE=ReadWriteDirectories
+    EXPECT_STDOUT=journal
+    # 231 之前那一档的拼法（与 MemoryMax= 同义）。2026-09-24 在真实 219 上实测：
+    # MemoryMax= 毫无效果，MemoryLimit= 真的落到 cgroup。
+    EXPECT_MEMORY_PROP=MemoryLimit
+  fi
+  assert_eq "Prepare 返回的 unit 档位" "$EXPECT_TIER" "$tier"
+  pass "探测到的 systemd 版本 ${version} → 档位 $EXPECT_TIER"
+  if [ "$EXPECT_TIER" = "legacy" ]; then
+    note "这台主机落在 legacy 档（systemd 219～239）：ProtectSystem 只能到 yes、日志走 journal、内存上限用 MemoryLimit= 表达。这些是**语义损失**，不是缺陷——见 unit.Degradations()"
   fi
 
   # unit 落盘位置与内容：真机上这决定了 systemd 会不会加载它、以谁的什么权限跑。
@@ -442,14 +514,31 @@ MANIFEST
   assert_eq "unit 文件模式" "644" "$(mode_of "$unit_path")"
   assert_eq "unit 文件属主" "root:root" "$(owner_of "$unit_path")"
   printf '      unit 的 SELinux 上下文    : %s\n' "$(label_of "$unit_path")"
-  for want in "User=$RUNTIME_USER" "EnvironmentFile=" "ProtectSystem=strict" "Restart=on-failure"; do
+  for want in "User=$RUNTIME_USER" "EnvironmentFile=" \
+    "ProtectSystem=$EXPECT_PROTECT_SYSTEM" "$EXPECT_FS_DIRECTIVE=" "Restart=on-failure"; do
     if grep -q "$want" "$unit_path"; then
       pass "unit 内容含 $want"
     else
       fail "unit 内容缺少 $want"
     fi
   done
-  if grep -qE "^# systemd 版本=[0-9]+ 档位=strict$" "$unit_path"; then
+  # 另一档的指令一个都不能出现：那些取值在旧档上要么不被接受（unit 加载失败）、
+  # 要么被忽略，而「被忽略」意味着 unit 看起来有约束、实际没有。
+  if [ "$EXPECT_TIER" = "legacy" ]; then
+    # **只看指令行**：legacy 的 unit 头注释里就写着「本机无法使用 ProtectSystem=strict、
+    # ReadWritePaths= 与 StandardOutput=append:」，拿整个文件去 grep 只会命中那段注释，
+    # 断言就退化成文字游戏（Go 侧的同名断言有 directiveLines 做同一件事）。
+    local directives
+    directives=$(grep -v '^#' "$unit_path")
+    for forbidden in "ProtectSystem=strict" "ReadWritePaths=" "StandardOutput=append:" "MemoryMax="; do
+      if printf '%s' "$directives" | grep -q "$forbidden"; then
+        fail "legacy 档的 unit 不得含 $forbidden（本机不支持或无效）"
+      else
+        pass "legacy 档的 unit 正确避开了 $forbidden"
+      fi
+    done
+  fi
+  if grep -qE "^# systemd 版本=[0-9]+ 档位=$EXPECT_TIER$" "$unit_path"; then
     pass "unit 头注释记录了探测到的版本与档位"
   else
     fail "unit 头注释没有记录版本与档位"
@@ -490,7 +579,7 @@ MANIFEST
   local second tier2
   second=$(q runtime prepare --app "$RUNTIME_APP" --json)
   tier2=$(printf '%s' "$second" | sed -n 's/.*"tier": *"\([^"]*\)".*/\1/p')
-  assert_eq "第二次 Prepare 幂等且档位不变" "strict" "$tier2"
+  assert_eq "第二次 Prepare 幂等且档位不变" "$EXPECT_TIER" "$tier2"
 }
 
 # ==== 生命周期 ====
@@ -501,6 +590,9 @@ check_lifecycle() {
   # 这样「写不进去」只能归因于 unit 的只读挂载，而不是 DAC 权限。
   require_ok "为 ProtectSystem 断言准备运行用户可写的目录" \
     install -d -m 0750 -o "$RUNTIME_USER" -g "$RUNTIME_USER" "/var/lib/${RUNTIME_APP}-extra"
+  # 这一条归运行用户所有（DAC 允许写），因此探针报「写不进去」只可能来自只读挂载。
+  require_ok "为挂载保护断言准备运行用户可写的 /usr/local 子目录" \
+    install -d -m 0750 -o "$RUNTIME_USER" -g "$RUNTIME_USER" "/usr/local/$MS_DIR"
 
   local started op_id
   started=$(q runtime start --app "$RUNTIME_APP" --json)
@@ -530,7 +622,7 @@ check_lifecycle() {
 
   # 进程的实际身份与 SELinux 上下文：真机这一档最有价值的一类证据。
   local main_pid
-  main_pid=$(systemctl show "$RUNTIME_UNIT" -p MainPID --value 2>/dev/null)
+  main_pid=$(unit_prop "$RUNTIME_UNIT" MainPID)
   if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
     pass "unit 的 MainPID=$main_pid"
     assert_eq "托管进程的运行用户" "$RUNTIME_USER" "$(ps -o user= -p "$main_pid" 2>/dev/null | tr -d ' ')"
@@ -563,11 +655,26 @@ check_lifecycle() {
   fi
 
   # ProtectSystem=strict 在真机上的实际约束。
-  assert_eq "unit 生效的 ProtectSystem" "strict" "$(systemctl show "$RUNTIME_UNIT" -p ProtectSystem --value 2>/dev/null)"
+  assert_eq "unit 生效的 ProtectSystem（本档期望值）" "$EXPECT_PROTECT_SYSTEM" "$(unit_prop "$RUNTIME_UNIT" ProtectSystem)"
   assert_eq "声明允许写入的路径确实可写" "yes" \
     "$(grep -qE "^allow-write .* writable=yes$" "$report" && printf yes || printf no)"
-  assert_eq "未声明路径的写入被拒" "yes" \
-    "$(grep -qE "^deny-write .* writable=no$" "$report" && printf yes || printf no)"
+  # 这一条是**跨档都成立**的防护证据：路径归运行用户所有（DAC 放行），唯一能拦住它的是
+  # ProtectSystem 的只读挂载——strict 档整个文件系统只读，legacy 档的 yes 让 /usr 只读。
+  assert_eq "被挂载保护的路径写不进去（两档都应当如此）" "yes" \
+    "$(grep -qE "^deny-write /usr/local/$MS_DIR/.* writable=no$" "$report" && printf yes || printf no)"
+
+  # /var/lib 下那条探测的是**另一件事**，而它的期望值随档位不同：strict 档连未声明的
+  # /var 路径也只读；legacy 档的 ProtectSystem=yes 只保护 /usr，/var 完全可写。
+  # 因此 legacy 档这里断言的是**相反**的事实，并把它记成语义损失——假装它也被拦住，
+  # 就等于用一个绿色断言掩盖「这一档的隔离弱得多」。
+  if [ "$EXPECT_TIER" = "strict" ]; then
+    assert_eq "未声明的 /var 路径的写入被拒（strict）" "yes" \
+      "$(grep -qE "^deny-write /var/lib/${RUNTIME_APP}-extra/.* writable=no$" "$report" && printf yes || printf no)"
+  else
+    assert_eq "未声明的 /var 路径在 legacy 档**可写**（ProtectSystem=yes 只保护 /usr）" "yes" \
+      "$(grep -qE "^deny-write /var/lib/${RUNTIME_APP}-extra/.* writable=yes$" "$report" && printf yes || printf no)"
+    note "legacy 档的隔离弱于 strict 档：ProtectSystem=yes 只让 /usr 只读，未声明的 /var 路径仍可写（已实测）。工具仍然只声明它需要的路径，但内核不替我们拦——这条写进 unit.Degradations()"
+  fi
 }
 
 # ==== 停止 ====
@@ -864,7 +971,7 @@ MANIFEST
     "$([ -x "$current/bin/frz-probe" ] && printf yes || printf no)"
 
   local main_pid
-  main_pid=$(systemctl show "$DEPLOY_UNIT" -p MainPID --value 2>/dev/null)
+  main_pid=$(unit_prop "$DEPLOY_UNIT" MainPID)
   if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
     assert_eq "托管进程的运行用户" "$app" "$(ps -o user= -p "$main_pid" 2>/dev/null | tr -d ' ')"
     assert_eq "托管进程的工作目录解析到 release 目录" "yes" \
@@ -1011,7 +1118,7 @@ MANIFEST
     printf '      JVM 报告的堆上限         : %s 字节\n' "${max_memory:-<无>}"
 
     local main_pid
-    main_pid=$(systemctl show "$JAVA_UNIT" -p MainPID --value 2>/dev/null)
+    main_pid=$(unit_prop "$JAVA_UNIT" MainPID)
     if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
       assert_eq "托管 JVM 的运行用户" "$app" "$(ps -o user= -p "$main_pid" 2>/dev/null | tr -d ' ')"
       # 最强的一条 argv 证据：进程**实际收**到的参数逐个元素与 manifest 一致
@@ -1031,21 +1138,21 @@ MANIFEST
   # 资源限制：systemd 采纳了，内核按它限制。
   assert_eq "unit 里的 CPUQuota" "CPUQuota=200%" \
     "$(grep -x 'CPUQuota=200%' "/etc/systemd/system/$JAVA_UNIT" || true)"
-  assert_eq "unit 里的 MemoryMax 写的是原始字节数" "MemoryMax=${JAVA_MEMORY_MAX_BYTES}" \
-    "$(grep -x "MemoryMax=${JAVA_MEMORY_MAX_BYTES}" "/etc/systemd/system/$JAVA_UNIT" || true)"
-  assert_eq "systemctl show 报告的 MemoryMax" "$JAVA_MEMORY_MAX_BYTES" \
-    "$(systemctl show "$JAVA_UNIT" -p MemoryMax --value 2>/dev/null)"
+  # 指令名随档位：strict 用 MemoryMax=，legacy 用同义的 MemoryLimit=（见 unitfile.RenderUnit）。
+  assert_eq "unit 里的内存上限写的是原始字节数（$EXPECT_MEMORY_PROP）" "$EXPECT_MEMORY_PROP=${JAVA_MEMORY_MAX_BYTES}" \
+    "$(grep -x "$EXPECT_MEMORY_PROP=${JAVA_MEMORY_MAX_BYTES}" "/etc/systemd/system/$JAVA_UNIT" || true)"
+  assert_eq "systemd 报告的内存上限（$EXPECT_MEMORY_PROP）" "$JAVA_MEMORY_MAX_BYTES" \
+    "$(unit_prop "$JAVA_UNIT" "$EXPECT_MEMORY_PROP")"
   assert_eq "systemctl show 报告的 CPUQuotaPerSecUSec" "2s" \
-    "$(systemctl show "$JAVA_UNIT" -p CPUQuotaPerSecUSec --value 2>/dev/null)"
-  local cgroup
-  cgroup=$(systemctl show "$JAVA_UNIT" -p ControlGroup --value 2>/dev/null)
-  if [ -z "$cgroup" ]; then
+    "$(unit_prop "$JAVA_UNIT" CPUQuotaPerSecUSec)"
+  if [ -z "$(unit_prop "$JAVA_UNIT" ControlGroup)" ]; then
     fail "拿不到 unit 的 cgroup 路径（ControlGroup 为空）"
   else
-    assert_eq "cgroup 的 memory.max（限制真正生效的地方）" "$JAVA_MEMORY_MAX_BYTES" \
-      "$(cat "/sys/fs/cgroup${cgroup}/memory.max" 2>/dev/null || true)"
-    assert_eq "cgroup 的 cpu.max（200% = 200000/100000）" "200000 100000" \
-      "$(cat "/sys/fs/cgroup${cgroup}/cpu.max" 2>/dev/null || true)"
+    # 内核侧的值才是「限制真的生效」的判据（cgroup v1/v2 的读法见 memory_limit_of）。
+    assert_eq "cgroup 里的内存上限（限制真正生效的地方）" "$JAVA_MEMORY_MAX_BYTES" \
+      "$(memory_limit_of "$JAVA_UNIT")"
+    assert_eq "cgroup 里的 CPU 配额（200% = 200000/100000）" "200000 100000" \
+      "$(cpu_quota_of "$JAVA_UNIT")"
   fi
 
   # 解释器预检：JDK 路径写错时必须在**部署之前**、以 MANIFEST_INVALID 失败，
@@ -1147,7 +1254,7 @@ check_post_reboot() {
     journalctl -u "$RUNTIME_UNIT" -n 20 --no-pager >&2 || true
   fi
   local main_pid ctx
-  main_pid=$(systemctl show "$RUNTIME_UNIT" -p MainPID --value 2>/dev/null)
+  main_pid=$(unit_prop "$RUNTIME_UNIT" MainPID)
   if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
     assert_eq "托管进程的运行用户（重启后）" "$RUNTIME_USER" "$(ps -o user= -p "$main_pid" 2>/dev/null | tr -d ' ')"
     ctx=$(tr -d '\0' < "/proc/$main_pid/attr/current" 2>/dev/null || printf '<不可读>')
@@ -1204,7 +1311,7 @@ check_post_reboot() {
     assert_eq "部署的端口重启后自己在监听" "yes" \
       "$(ss -lntH "sport = :$deploy_port" | grep -q . && printf yes || printf no)"
     local deploy_pid
-    deploy_pid=$(systemctl show "$DEPLOY_UNIT" -p MainPID --value 2>/dev/null)
+    deploy_pid=$(unit_prop "$DEPLOY_UNIT" MainPID)
     if [ -n "$deploy_pid" ] && [ "$deploy_pid" != "0" ]; then
       assert_eq "重启后托管进程的工作目录仍在那个 release 上" "yes" \
         "$([ "$(readlink "/proc/$deploy_pid/cwd" 2>/dev/null)" = "/var/lib/$DEPLOY_APP" ] && printf yes || printf no)"

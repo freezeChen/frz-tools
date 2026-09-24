@@ -841,3 +841,30 @@
   （`/home/data/ems/ems-server`）。一次 ad-hoc 冒烟测试里的 `pkill -x java` 把它一起杀了
   （停了约 72 秒才人工恢复）。**在那台主机上停进程必须指名道姓**（`systemctl stop <unit>`
   或明确的 PID），禁止 `pkill` / `killall` 这类宽匹配；这条已写进 `test/host/run.sh` 头部。
+
+### 2026-09-24（补记十二）legacy 档（systemd 219）第一次在真实主机上验证；内存上限改用 MemoryLimit=
+
+- **变更原因**：用户提供了第二台测试主机 `root@43.142.95.141`——**CentOS 7 / systemd 219 /
+  cgroup v1**。这恰好是容器（255）与上一台真机（257）都覆盖不到的 **legacy 档**，也是从 1c
+  起一直标注「未验证」、并且被反复判断为「没有可用的主机所以验不了」的那一项。
+- **结果**：`make verify-host` 在那一档上 **118 项通过 / 0 项失败**（1c 的 Prepare 产物、
+  凭据穿越链、启停与就绪、凭据逐字节到达进程全部成立），外加迭代 3 的部署与迭代 3c 的
+  Java/资源限制。完整记录见 `docs/plans/2026-09-21-iteration-1c.md` 第 19 节。
+- **两处按实测修正的决定**：
+  1. **legacy 档的内存上限从「拒绝」改为「用 `MemoryLimit=` 表达」**。原决定的依据是
+     「`MemoryMax=` 需要 231，这一档有一部分表达不了」；实测确认了前提，但结论反了：在 219 上
+     `MemoryMax=` **毫无效果**（unit 照常加载、`systemctl show` 里没有它、cgroup 里也没有它），
+     而 `MemoryLimit=`——与它同义、231 起只是改名——**真的落到 `memory.limit_in_bytes`**。
+     于是这一档表达得了内存上限，用不着让用户为了「机器老」放弃限制。测试从「断言被拒」
+     改成「断言用对了拼法」。
+  2. **harness 停用 `systemctl show --value`**：该开关 systemd 230 才加入，219 上直接报
+     `unrecognized option`。产品代码早就刻意避开它（且注释里写明了理由），是 harness 没跟上。
+- **同时量到的三件事**：`ProtectSystem=yes` **只保护 `/usr`**（运行用户自有的 `/var/lib` 路径
+  仍可写）——这条现在写进 unit 的注释与 `Degradations()`；`CPUQuota=200%` 在 cgroup v1 上落到
+  `cpu.cfs_quota_us=200000`；legacy 的 unit 模板在 219 上能正常加载并启动进程。
+- **这台机上还装了 JDK**（Temurin 17.0.20.1，sha256 与 Adoptium 官方发布值一致），因此迭代 3c
+  的 Java 那一档也在这台 legacy 主机上验完了：真 JAR、真 JVM、`/proc/<pid>/cmdline` 逐元素
+  一致、`-Xmx256m` 生效、解释器预检在部署**之前**以 `MANIFEST_INVALID` 拦下写错的 JDK 路径。
+- **仍未验证**：`legacy` 档的 **232～239 那一段**（无对应版本的主机，不得写成「整档已验证」）、
+  **重启验证**（`prepare → 重启 → check` 那一轮没做）、以及 strict 档上「修复后的 3c 复跑」
+  （那台主机 `192.168.11.101` 在复跑前整段网段从本机不可达）。

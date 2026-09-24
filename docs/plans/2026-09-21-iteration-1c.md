@@ -1221,3 +1221,71 @@ harness 因此分了三段：`FRZ_HOST_PHASE=prepare`（建状态并启动，**�
   这一档继续标注**未验证**，不得声称「已支持」。
 - AppArmor（RHEL 系没有）与 sudoers/PAM 的**实际策略**仍未验证（`SudoConfig` 至今只有模型、
   零行为）。
+
+## 19. legacy 档真机验证 2026-09-24
+
+**证据类型：Linux 主机**。第 14 节、第 18 节一直挂着的那条「`legacy` 档未验证」，在这里
+第一次落地——而且是在**这一档最老的那一端**（systemd 219）上。
+
+### 为什么之前验不了，这次为什么行
+
+档位由探测到的 systemd 版本决定（`TierFor`）：≥240 走 strict，219～239 走 legacy。
+容器 harness 是 systemd 255（strict），此前那台真机是 257（strict），**两处都证不了 legacy**。
+而 legacy 档的 unit 模板只能用旧指令（`ProtectSystem=yes`、`ReadWriteDirectories=`、
+`StandardOutput=journal`），这些取值在新 systemd 上**不会按老语义生效**，所以拿新机器凑不出
+证据。这一次用户提供的 `root@43.142.95.141` 恰好是 **CentOS 7 / systemd 219 / cgroup v1**。
+
+| 事实 | 值 |
+| --- | --- |
+| 发行版 / 内核 | CentOS Linux 7 (Core) / 3.10.0-1160.119.1.el7 |
+| systemd | **219**（最低支持版本） |
+| cgroup | **v1**（`stat -fc %T /sys/fs/cgroup` = `tmpfs`） |
+| SELinux | Disabled |
+| 其他 | 2 vCPU / 2 GiB / 无 docker / 初始无 JDK |
+
+做法不变：`FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host`。
+
+### 结果
+
+**118 项通过 / 0 项失败**（`full` 阶段）。其中 1c 那一组断言（Prepare 产物、凭据穿越链、
+启停与就绪、凭据逐字节到达进程）在 legacy 档上全部成立，说明**同一套语义在旧档上依然是那套
+语义**——这正是当初把两档分开时要防的事。
+
+### 这一轮第一次量到的事实（都会进 unit 与审计）
+
+| 断言 | 实测结果 |
+| --- | --- |
+| `RuntimeDirectory=opsd` + `RuntimeDirectoryMode=0750` | 219 上有效：`/run/opsd` 被创建、模式 750 |
+| legacy unit 模板能否加载 | 能：`ProtectSystem=yes`、`ReadWriteDirectories=`、`StandardOutput=journal`、`NoNewPrivileges=`、`PrivateTmp=`、`EnvironmentFile=`、`RestartSec=`、`TimeoutStartSec/StopSec=` 全部被接受，进程正常起来 |
+| `ProtectSystem=yes` 的保护范围 | **只保护 `/usr`**：运行用户自有的 `/usr/local/...` 写入被拒，而同样自有的 `/var/lib/...` 写入**成功**（合成实验与 harness 各测一遍） |
+| `CPUQuota=200%` | 落到内核：`cpu.cfs_quota_us=200000`、`cpu.cfs_period_us=100000` |
+| `MemoryMax=536870912` | **毫无效果**：unit 照常加载并启动，`systemctl show` 里没有它，cgroup 里也没有它 |
+| `MemoryLimit=536870912` | 真的生效：`memory.limit_in_bytes=268435456`（探针值）与 `536870912`（harness 值）两次都落到 cgroup |
+| `systemctl show --value` | **219 不支持**（该开关 systemd 230 才加入），报 `unrecognized option` |
+
+由此产生两处改动（都在 3c 那一轮落地）：
+
+1. **legacy 档的内存上限改用 `MemoryLimit=` 表达**（与 `MemoryMax=` 同义，231 起只是改名），
+   不再「这一档拒绝内存上限」——因为实测证明这一档**表达得了**，用不着让用户为了「机器老」
+   放弃限制。
+2. **harness 停用 `systemctl show --value`**，改成解析 `Prop=value` 那一行。有意思的是
+   **产品代码早就刻意避开了它**（`systemd` 适配器 `unitStatus` 的注释里写着「用了会把 legacy
+   档的 Status/Start/Health 一起废掉」），是 harness 自己没跟上同一条规则。
+
+### Java 与资源限制（迭代 3c）也在这台机上验完了
+
+在这台机上装了 Temurin **JDK 17.0.20.1**（`/opt/jdk-17.0.20.1+1`，sha256 与 Adoptium 官方
+发布值逐字节一致），用主机上的 `javac`/`jar` 构建真实 JAR、部署、跑起来，断言：JVM 报告的
+工作目录就是 `current` 解析出的 release 目录、`/proc/<pid>/cmdline` 与 manifest 的 argv
+逐元素一致、`-Xmx256m` 生效（堆上限 259522560 字节）、`MemoryLimit=` 与 `CPUQuota=` 在
+systemd 与 **cgroup v1** 两侧都是声明的值、解释器路径写错时以 `MANIFEST_INVALID` 在部署**之前**
+失败且不留副作用。
+
+### 仍未验证
+
+- **`legacy` 档的 232～239 那一段**：与 219 共享同一套 unit 模板，但没有那个版本段的主机跑过。
+  措辞上不得写成「整档已验证」——代码里的 `tierLegacyNote` 就是这么写的。
+- **重启验证**：这一轮只跑了 `full` 阶段，`prepare → 重启 → check` 那一轮（部署出来的 release
+  跨重启存活）**没有做**。
+- SELinux：这台机是 Disabled，enforcing 下的行为只在 Rocky Linux 那台机上观测过。
+- AppArmor 与 sudoers/PAM 的实际策略：仍未验证。

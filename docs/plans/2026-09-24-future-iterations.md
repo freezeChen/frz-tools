@@ -186,7 +186,7 @@ prune 完全不看它，而运维以为生效了——这正是本仓库最不�
 
 | 事项 | 现状 | 指向 |
 | --- | --- | --- |
-| **`legacy` unit 档（systemd 219–239）** | **未验证**，且验证主机仍未落实。容器路线走不通（CentOS 7 镜像只有 amd64；systemd 219 需要 cgroup v1，而现有环境是 cgroup v2）；已提供的真机是 systemd 257，比容器还新 | 1c 第 14/15 节、第 18 节 |
+| **`legacy` unit 档的 232～239 那一段** | **219 已于 2026-09-24 在真实主机（CentOS 7 / systemd 219 / cgroup v1）上验证：118 项通过 / 0 项失败**，含 `CPUQuota=` 落到 cgroup v1、`MemoryLimit=` 落到 `memory.limit_in_bytes`、`ProtectSystem=yes` 只保护 `/usr`。**仍缺 232～239 那一段**：它与 219 共享同一套 unit 模板，但没有那个版本段的主机跑过（容器是 255、另一台真机是 257，都落在 strict 档） | 1c 第 19 节 |
 | **以 root 运行的 opsd，其 socket 是 `root:root 0660`** | 非 root 用户用不了 `opsctl`，而配置里**没有** socket 属组项。真机暴露的部署缺口；今天的权宜做法是用 root 跑 opsctl | 1c 第 18 节 |
 | **`RuntimeAdapter.Status` 没有对外暴露** | 端口方法已实现、内部在用（启动超时判定），但 CLI 与 HTTP API 都只有 `health`——运维问不出「进程活着但没就绪」，而端口注释里写着这两者刻意不合并 | 1c 第 18 节 |
 | **SELinux 加固** | **未实现**：不为托管应用提供策略模块，进程落在 `unconfined_service_t`，SELinux 的约束等于未生效。enforcing 下的行为**已观测**，但能力没有 | 1c 第 18 节 |

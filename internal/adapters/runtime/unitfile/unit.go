@@ -29,22 +29,25 @@ const (
 	// TierStrictMinVersion 由 StandardOutput=append: 的最低版本决定（240），
 	// 它是两档里门槛最高的那条指令。
 	TierStrictMinVersion = 240
-	// memoryMaxMinVersion 是 MemoryMax= 的最低版本（231）。
-	//
-	// 它落在两档之间：strict 档（≥240）一定支持，legacy 档（219～239）**有一部分不支持**。
-	// 因此它是「legacy 档 + 内存上限 = 拒绝」这条规则的依据（见 RenderUnit）。
-	memoryMaxMinVersion = 231
 )
 
 // RestartSec 是重启间隔。systemd 默认 100ms 对「崩溃即重启」的循环来说太快，
 // 会把日志刷爆，规格 §6 因此固定为 5 秒，这里保持同一取值。
 const RestartSec = 5 * time.Second
 
-// 未验证声明：legacy 档没有在任何真实 Linux 主机或 Linux 容器上跑过。
-// 开发机是 macOS，没有 systemd；仓库的容器验证（make verify-linux）也未覆盖该档。
-// 它的取值依据只有规格 §6 的兼容矩阵与 systemd 官方文档，所以这里不得写成「已支持 219」，
-// 需要真机验证后才能在文档里升级这句话。
-const tierLegacyUnverifiedNote = "legacy 档未在真实主机/容器验证"
+// tierLegacyNote 是 legacy 档的验证状态。它会写进 unit 文件与审计（Degradations），
+// 因此这句话必须与事实同步，不能停留在「待验证」上，也不能比事实说得更满。
+//
+// 2026-09-24 之前它是「未验证」：开发机是 macOS，容器 harness 只有 systemd 255，
+// 而 219 那一档需要 cgroup v1——一直找不到能跑它的机器。当天在一台真实的 CentOS 7 /
+// systemd 219 / cgroup v1 主机上验完了（记录见 docs/plans/2026-09-21-iteration-1c.md
+// 的「legacy 档真机验证」一节）：unit 能加载、进程能起来、凭据照常逐字节到达、
+// CPUQuota= 落到 cpu.cfs_quota_us、MemoryLimit= 落到 memory.limit_in_bytes、
+// ProtectSystem=yes 只保护 /usr。
+//
+// **仍未验证的是 232～239 那一段**：它与 219 共享同一套 unit 模板，但没有那个版本段的
+// 主机跑过，因此不得写成「整档已验证」。
+const tierLegacyNote = "legacy 档已在真实的 systemd 219 上验证；232～239 那一段仍未验证"
 
 // TierFor 把探测到的 systemd 主版本映射为档位。
 // 低于最低支持版本时必须报错，不能挑一个「最接近的档」硬塞：
@@ -69,15 +72,15 @@ func (t Tier) Degradations() []string {
 	case TierLegacy:
 		return []string{
 			"日志改投 journal：legacy 档不支持 StandardOutput=append:，无法实现「每次启动不截断」的追加语义；opsd 当前按文件读日志，按 Operation 查日志需要改走 journalctl。",
-			"文件系统防护降级为 ProtectSystem=yes：写权限不再被限制在显式列出的路径上，隔离强度低于 strict 档。",
-			// MemoryMax= 是 231 才有的指令。而 219～239 这一档里既有「支持」也有
-			// 「不支持」的版本，因此这里不是「降级」而是**拒绝**：声明了内存上限的规格
-			// 在这一档上直接报 RUNTIME_UNSUPPORTED，见 RenderUnit。
-			"不支持 resources.memoryMaxBytes（MemoryMax= 需要 systemd 231，本档覆盖的 219～239 里有一部分表达不了）：声明了内存上限的规格会被显式拒绝，而不是生成一个语义未定的 unit。",
-			tierLegacyUnverifiedNote,
+			"文件系统防护降级为 ProtectSystem=yes：写权限不再被限制在显式列出的路径上，隔离强度低于 strict 档（实测：ProtectSystem=yes 只让 /usr 只读，/var 仍然可写，因此「未声明路径写不进去」这条约束在这一档不成立）。",
+			// 内存上限仍被表达，只是换了那一档的拼法。2026-09-24 在真实 219 上实测过：
+			// 同一份 unit 里 MemoryMax= 毫无效果（unit 照常加载、systemctl show 里没有它、
+			// cgroup 里也没有它），而 MemoryLimit= 落到了 memory.limit_in_bytes。
+			"内存上限用 MemoryLimit= 表达（MemoryMax= 是 systemd 231 才有的拼法，两者语义相同）：指令名随档位不同，审计里记录的是本条。",
+			tierLegacyNote,
 		}
 	}
-	return []string{"未知档位 " + string(t) + "：" + tierLegacyUnverifiedNote}
+	return []string{"未知档位 " + string(t) + "：" + tierLegacyNote}
 }
 
 // Valid 报告 t 是否是本包认识的档位。
@@ -134,18 +137,17 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 		return Rendered{}, err
 	}
 
-	// 资源限制在这一档能不能表达（迭代 3c）。
+	// 内存上限的**指令名随档位不同**（迭代 3c，2026-09-24 按真机实测修正）。
 	//
-	// CPUQuota= 需要 213 —— 两档都满足（本工具的最低支持版本是 219）。
-	// MemoryMax= 需要 231，而 legacy 档覆盖 219～239，**有一部分表达不了**。这里刻意
-	// 拒绝而不是「发出去看看」：我们没有在 219～230 上验证过 systemd 面对一条它不认识的
-	// 指令会怎么处理，而两种可能都不能接受——被忽略意味着 manifest 里写着的内存上限
-	// **静默失效**（服务实际可以吃满整台机器），被拒绝意味着服务直接起不来。二者都不是
-	// 用户声明这条限制时想要的，因此宁可让 Prepare 明确失败。
-	if tier == TierLegacy && spec.Resources.MemoryMaxBytes > 0 {
-		return Rendered{}, domain.NewError(v1.CodeRuntimeUnsupport,
-			"systemd %d 落在 legacy 档（%d～%d）：该档无法表达 resources.memoryMaxBytes（MemoryMax= 需要 %d），拒绝生成一个语义未定的 unit；请升级 systemd 或去掉内存上限",
-			systemdVersion, MinSupportedSystemdVersion, TierStrictMinVersion-1, memoryMaxMinVersion)
+	// 原本这一档是直接拒绝的（理由：MemoryMax= 需要 systemd 231，而 219～239 里有一部分
+	// 没有它）。在真实的 systemd 219 上实测之后这条前提得到了确认，但结论反了：同一份 unit
+	// 里 `MemoryMax=536870912` **毫无效果**（unit 照常加载并启动、`systemctl show` 里没有它、
+	// cgroup 的 memory.limit_in_bytes 里也没有它），而 `MemoryLimit=`——231 之前那一档的拼法，
+	// 与 MemoryMax= 同义（231 起它只是改名）——**真的落到了 cgroup 上**。也就是说这一档
+	// **表达得了**内存上限，用不着让用户为了「机器老」而放弃这条限制。
+	memoryDirective := "MemoryMax"
+	if tier == TierLegacy {
+		memoryDirective = "MemoryLimit"
 	}
 
 	writable := []string{
@@ -196,14 +198,15 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 	// 或 `MemoryMax=0` 能不能被 systemd 正确理解，我们没有在真机上验证过，而「不写」
 	// 的语义是确定的（沿用它自己的默认值）。
 	//
-	// MemoryMax= 写**原始字节数**而不是 `512M` 这种后缀：后缀要经过一次单位换算，而
+	// 内存上限写**原始字节数**而不是 `512M` 这种后缀：后缀要经过一次单位换算，而
 	// 换算一旦写错（K/M 按 1000 还是 1024）就是一个静默的、差一点点生效的限制——那正是
-	// 最难发现的一类错误。字节数没有这个问题，且 systemd 本来就接受它。
+	// 最难发现的一类错误。字节数没有这个问题，且 systemd 本来就接受它（219 上的
+	// MemoryLimit= 也接受，已实测）。
 	if spec.Resources.CPUQuotaPercent > 0 {
 		fmt.Fprintf(&b, "CPUQuota=%d%%\n", spec.Resources.CPUQuotaPercent)
 	}
 	if spec.Resources.MemoryMaxBytes > 0 {
-		fmt.Fprintf(&b, "MemoryMax=%d\n", spec.Resources.MemoryMaxBytes)
+		fmt.Fprintf(&b, "%s=%d\n", memoryDirective, spec.Resources.MemoryMaxBytes)
 	}
 
 	b.WriteString("NoNewPrivileges=true\n")
@@ -280,8 +283,11 @@ func writeHeader(b *strings.Builder, tier Tier, systemdVersion int) {
 	b.WriteString("# 档位 legacy（systemd 219～239）：本机无法使用 ProtectSystem=strict、\n")
 	b.WriteString("# ReadWritePaths= 与 StandardOutput=append:，因此降级为 ProtectSystem=yes、\n")
 	b.WriteString("# ReadWriteDirectories= 与 journal。语义损失：日志不再追加到 <logs.directory>/current.log，\n")
-	b.WriteString("# 按 Operation 查日志需要走 journalctl（opsd 当前按文件读日志）。\n")
-	b.WriteString("# " + tierLegacyUnverifiedNote + "。\n")
+	b.WriteString("# 按 Operation 查日志需要走 journalctl（opsd 当前按文件读日志）；\n")
+	b.WriteString("# ProtectSystem=yes 只保护 /usr，未声明的 /var 路径仍然可写；\n")
+	b.WriteString("# 内存上限用 MemoryLimit= 表达（它与 MemoryMax= 同义，但后者 231 才出现、\n")
+	b.WriteString("# 在 219 上写出去等于没有效果）。\n")
+	b.WriteString("# " + tierLegacyNote + "。\n")
 }
 
 // ReleaseRootDir 返回制品解包目录的父目录。1c 只固定了 domain.ReleaseDir 的路径约定

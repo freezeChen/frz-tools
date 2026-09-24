@@ -6,6 +6,8 @@
 #   bash test/host/run.sh                       # 默认 root@192.168.11.101
 #   FRZ_HOST=root@10.0.0.5 bash test/host/run.sh
 #   FRZ_HOST_KEEP=1 bash test/host/run.sh       # 保留现场用于排查
+#   FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 bash test/host/run.sh   # 主机的 JDK 不在默认路径时
+#                                               （FRZ_PROBE_PORT / FRZ_DEPLOY_PORT / FRZ_JAVA_PORT 同理）
 #
 # 它做三件事：交叉编译 linux/amd64 的两个二进制与探针 → 上传到主机 →
 # 在主机上以 root 执行断言脚本（脚本经 stdin 送入，因此它结尾把自己所在的目录删掉
@@ -42,7 +44,7 @@ mkdir -p "$WORK_DIR/bin"
 if [ "${FRZ_HOST_PHASE:-full}" = "check" ]; then
   log "check 阶段：跳过编译与上传，直接跑重启后的断言"
   ssh -o BatchMode=yes "$FRZ_HOST" \
-    env FRZ_HOST_DIR="$FRZ_HOST_DIR" FRZ_HOST_PHASE=check \
+    env FRZ_HOST_DIR="$FRZ_HOST_DIR" FRZ_HOST_PHASE=check FRZ_HOST_JAVA_HOME="${FRZ_HOST_JAVA_HOME:-}" \
     bash -s < "$REPO_ROOT/test/host/verify.sh"
   exit $?
 fi
@@ -76,6 +78,8 @@ set +e
 ssh -o BatchMode=yes "$FRZ_HOST" \
   env FRZ_HOST_DIR="$FRZ_HOST_DIR" FRZ_HOST_KEEP="$FRZ_HOST_KEEP" FRZ_PROBE_PORT="$FRZ_PROBE_PORT" \
   FRZ_HOST_MYSQL_DSN="${FRZ_HOST_MYSQL_DSN:-}" FRZ_HOST_PHASE="${FRZ_HOST_PHASE:-full}" \
+  FRZ_HOST_JAVA_HOME="${FRZ_HOST_JAVA_HOME:-}" FRZ_DEPLOY_PORT="${FRZ_DEPLOY_PORT:-}" \
+  FRZ_JAVA_PORT="${FRZ_JAVA_PORT:-}" \
   bash -s < "$REPO_ROOT/test/host/verify.sh"
 status=$?
 set -e

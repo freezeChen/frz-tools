@@ -23,11 +23,12 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 **GFS 已按用户指示移出并停放为未来迭代目标**
 （见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）。
 **迭代 3（Go/Java 通用进程部署）的 3a / 3b / 3c 都已实现**（解包与 release 目录、部署与回滚、
-资源限制与 Java 运行时的解释器预检）；其中 **3c 的真机复跑与重启验证未完成**（容器与单元/集成
-证据齐全），迭代 4–5 未开始。
-**真实 Linux 主机的证据已于 2026-09-24 取得**（Rocky Linux 10.2 / systemd 257 / SELinux
-enforcing，含一次真实重启，见 `test/host/`）；
-**仍缺 `legacy` 档（systemd 219–239）的证据**，这一项不得写成已验证。
+资源限制与 Java 运行时的解释器预检）；3c 的真机验证已在 legacy 档主机上完成，
+**仍未做的只有「部署出来的 release 跨重启存活」那一轮**，迭代 4–5 未开始。
+**真实 Linux 主机的证据已于 2026-09-24 取得**，而且**两档都拿到了**：
+Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真实重启）与
+**CentOS 7 / systemd 219 / cgroup v1（legacy 档，118 项通过 / 0 项失败）**，见 `test/host/`。
+**`legacy` 档的 232～239 那一段仍缺证据**（无对应版本的主机），这一项不得写成已验证。
 进度与逐条证据见 `docs/plans/` 下对应迭代文档的第 13 节之后（实现记录与验证记录）。
 
 - `opsd`：目标主机上的守护进程，负责执行需要权限的操作。
@@ -44,8 +45,8 @@ enforcing，含一次真实重启，见 `test/host/`）；
 - `docs/plans/2026-09-21-iteration-1d.md`：任务引擎的重试、退避与并发策略（已实现并提交）
 - `docs/plans/2026-09-21-iteration-2.md`：数据库与资源备份（2a、2b、2d 已实现并验证；
   GFS 已移出 2d，见第 22 节）
-- `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a/3b/3c 已实现；
-  3c 的真机复跑未完成，见 §17）
+- `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a/3b/3c 已实现并验证，
+  见 §12–17）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -148,13 +149,22 @@ root；1c 的 `check_runtime`（49 项）只打 root 实例。探针应用 `test
 **不是**容器验证。
 
 **边界没有变**：以上都是「**Linux 容器**」证据（Ubuntu 24.04 / systemd 255），
-**不等于「Linux 主机」**——sudoers/PAM 实际策略与 `legacy` 档（systemd 219–239，
-容器只有 255）都仍是**未验证**。
+**不等于「Linux 主机」**——sudoers/PAM 实际策略仍未验证；`legacy` 档（systemd 219–239）
+已在真实主机上验证到 **219**，但 **232～239 那一段仍未验证**（容器只有 255，两档都覆盖不到
+中间那一段）。
 
-**在那台主机上排查时不要用 `pkill` / `killall` 这类宽匹配的杀进程方式**：它上面跑着不在
-systemd 下、也不在容器里的业务进程（`/home/data/ems/ems-server` 由 `nohup ./start.sh` 启动），
+**`legacy` 档上的两条兼容性事实**（2026-09-24 在真实的 systemd 219 上实测，写进 unit 与审计）：
+`systemctl show --value` **该版本不支持**（230 才加入，报 `unrecognized option`）——产品代码
+一直只用 `systemctl show -p Prop` 再解析，harness 后来才跟上；内存上限的指令名随档位不同
+（strict 用 `MemoryMax=`，legacy 用同义的 `MemoryLimit=`，因为 `MemoryMax=` 在 219 上
+**毫无效果**）。cgroup 的读法也随之不同：v1 是 `cpu.cfs_quota_us` / `memory.limit_in_bytes`，
+v2 是 `cpu.max` / `memory.max`，判据用文件是否存在而不是猜版本。
+
+**在 `192.168.11.101` 上排查时不要用 `pkill` / `killall` 这类宽匹配的杀进程方式**：它上面跑着
+不在 systemd 下、也不在容器里的业务进程（`/home/data/ems/ems-server` 由 `nohup ./start.sh` 启动），
 杀掉之后没有任何东西会把它拉起来。2026-09-24 一次 `pkill -x java` 就把它一起杀了（停了约
 72 秒才人工恢复）。要停什么就指名道姓：`systemctl stop <unit>`（harness 只这么做）或明确的 PID。
+（另一台 `43.142.95.141` 是我方测试机，没有业务负载，但同一条纪律照样适用。）
 
 `make verify-host`（`test/host/run.sh` + `test/host/verify.sh`）是**第一类「Linux 主机」证据**：
 在一台真实主机（2026-09-24：**Rocky Linux 10.2 / 内核 6.12 / systemd 257 / SELinux Enforcing** /
@@ -172,8 +182,14 @@ x86_64）上把 opsd 装成 systemd 服务、跑完 RuntimeAdapter 的生命周�
 以 root 运行的 opsd 建出的 socket 是 `root:root 0660`，非 root 用户用不了 opsctl（配置里没有
 socket 属组项）；MySQL 的隔离恢复对备份账号的权限要求不只是 CREATEDB（见 `iteration-2.md` 第 21 节）。
 
-迭代 3c 又跑了一轮（`full` 阶段，新增部署、真 JVM 与资源限制）：**111 项通过 / 1 项失败**，
-那一项正是缺陷（预检失败时 Operation 报 `DEPLOY_ROLLED_BACK` 而不是原因码，已修复）。
+第二台主机（**CentOS 7 / systemd 219 / cgroup v1**，`root@43.142.95.141`）覆盖的是 **legacy 档**：
+`FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host` 实跑
+**118 项通过 / 0 项失败**，其中包含迭代 3c 的整段（真实 JAR + 真 JVM + 资源限制 + 解释器预检）。
+那一档的完整记录见 `docs/plans/2026-09-21-iteration-1c.md` 第 19 节。
+
+迭代 3c 在 strict 档主机（`192.168.11.101`）上又跑了一轮（`full` 阶段，新增部署、真 JVM 与
+资源限制）：**111 项通过 / 1 项失败**，那一项正是缺陷（预检失败时 Operation 报
+`DEPLOY_ROLLED_BACK` 而不是原因码，已修复并在 legacy 主机与容器上各验一遍）。
 通过的部分包含真机才有的证据：用 `/opt/jdk-17.0.1` 编译打包的真实 JAR 部署成功并起来、
 **JVM 报告的工作目录就是 `current` 解析出的 release 目录**、**`/proc/<pid>/cmdline` 与
 manifest 的 argv 逐元素一致**、`-Xmx256m` 生效、`systemctl show` 与 **cgroup 的

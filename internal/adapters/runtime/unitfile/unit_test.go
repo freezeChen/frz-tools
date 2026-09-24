@@ -73,16 +73,19 @@ StandardError=append:/var/log/opsd/orders-api/current.log
 WantedBy=multi-user.target
 `
 
-// legacyUnit 是同一份规格在 210～239 主机上的期望产物。
-// 注意：这一档没有在任何真实主机/容器上验证过（见 unit.go 的未验证声明），
-// 期望值来自规格 §6 的兼容矩阵。
+// legacyUnit 是同一份规格在 219～239 主机上的期望产物。
+// 2026-09-24 起它在真实的 CentOS 7 / systemd 219 上验证过（见 unit.go 的 tierLegacyNote），
+// 期望值同时来自规格 §6 的兼容矩阵与那台主机上的实测。
 const legacyUnit = `# 本文件由 opsd 生成，请勿手工编辑；下次 Prepare 会按规格 1c 第 6 节重写。
 # systemd 版本=239 档位=legacy
 # 档位 legacy（systemd 219～239）：本机无法使用 ProtectSystem=strict、
 # ReadWritePaths= 与 StandardOutput=append:，因此降级为 ProtectSystem=yes、
 # ReadWriteDirectories= 与 journal。语义损失：日志不再追加到 <logs.directory>/current.log，
-# 按 Operation 查日志需要走 journalctl（opsd 当前按文件读日志）。
-# legacy 档未在真实主机/容器验证。
+# 按 Operation 查日志需要走 journalctl（opsd 当前按文件读日志）；
+# ProtectSystem=yes 只保护 /usr，未声明的 /var 路径仍然可写；
+# 内存上限用 MemoryLimit= 表达（它与 MemoryMax= 同义，但后者 231 才出现、
+# 在 219 上写出去等于没有效果）。
+# legacy 档已在真实的 systemd 219 上验证；232～239 那一段仍未验证。
 
 [Unit]
 Description=orders-api
@@ -438,35 +441,51 @@ func TestRenderUnitOmitsResourcesWhenUnlimited(t *testing.T) {
 	}
 }
 
-// legacy 档（219～239）里有一部分 systemd 没有 MemoryMax=（需要 231）。
-// 这里刻意**拒绝**而不是发出去：被忽略 = 声明的内存上限静默失效，被拒绝 = 服务起不来，
-// 两种都不能接受，因此宁可让 Prepare 明确失败。
-func TestRenderUnitRefusesMemoryMaxOnLegacyTier(t *testing.T) {
+// legacy 档（219～239）用**那一档的拼法**表达内存上限：`MemoryLimit=` 而不是 `MemoryMax=`。
+//
+// 这条是 2026-09-24 在真实的 systemd 219 上实测之后改的（原来是「这一档直接拒绝」）。
+// 实测结果是：同一份 unit 里 `MemoryMax=536870912` **毫无效果**（unit 照常加载并启动、
+// `systemctl show` 里没有它、cgroup 里也没有它），而 `MemoryLimit=` 落到了 cgroup 的
+// `memory.limit_in_bytes`。也就是说这一档表达得了内存上限——用不着让用户为了「机器老」
+// 而放弃这条限制，只是指令名随档位不同。
+func TestRenderUnitLegacyUsesMemoryLimit(t *testing.T) {
 	spec := validSpec()
-	spec.Resources = domain.SpecResources{MemoryMaxBytes: 536870912}
+	spec.Resources = domain.SpecResources{CPUQuotaPercent: 200, MemoryMaxBytes: 536870912}
 
-	_, err := RenderUnit(spec, TierLegacy, 239)
-	if domain.CodeOf(err) != v1.CodeRuntimeUnsupport {
-		t.Fatalf("want RUNTIME_UNSUPPORTED, got %v", err)
-	}
-
-	// 只声明 CPU 配额时 legacy 档照常工作：CPUQuota= 需要 213，两档都满足。
-	spec.Resources = domain.SpecResources{CPUQuotaPercent: 200}
-	got, err := RenderUnit(spec, TierLegacy, 239)
+	got, err := RenderUnit(spec, TierLegacy, 219)
 	if err != nil {
-		t.Fatalf("legacy 档只声明 CPU 配额时不应当报错: %v", err)
+		t.Fatalf("legacy 档表达内存上限不应当报错: %v", err)
 	}
-	if !strings.Contains(directiveLines(got.Content), "CPUQuota=200%\n") {
+	body := directiveLines(got.Content)
+	// 值仍然是原始字节数（与 strict 档同一条理由：不做单位换算）。
+	if !strings.Contains(body, "MemoryLimit=536870912\n") {
+		t.Fatalf("legacy 档应当渲染 MemoryLimit=:\n%s", got.Content)
+	}
+	// 231 才有的那个拼法在这一档上会出现**静默失效**，绝不能一起写出去。
+	if strings.Contains(body, "MemoryMax=") {
+		t.Fatalf("legacy 档不得出现 MemoryMax=（219 上它没有效果）:\n%s", got.Content)
+	}
+	// CPUQuota= 需要 213，两档都满足（219 上实测生效）。
+	if !strings.Contains(body, "CPUQuota=200%\n") {
 		t.Fatalf("legacy 档应当渲染 CPUQuota=:\n%s", got.Content)
 	}
-	// 语义损失必须能出现在审计里：降级/拒绝这件事不能只存在于这次报错中。
-	refused := false
+	// strict 档用现代的拼法，不受影响。
+	strict, err := RenderUnit(spec, TierStrict, 255)
+	if err != nil {
+		t.Fatalf("strict 档: %v", err)
+	}
+	if !strings.Contains(directiveLines(strict.Content), "MemoryMax=536870912\n") ||
+		strings.Contains(directiveLines(strict.Content), "MemoryLimit=") {
+		t.Fatalf("strict 档应当用 MemoryMax=:\n%s", strict.Content)
+	}
+	// 指令名随档位变化这件事必须能在审计里看到。
+	noted := false
 	for _, degradation := range TierLegacy.Degradations() {
-		if strings.Contains(degradation, "memoryMaxBytes") {
-			refused = true
+		if strings.Contains(degradation, "MemoryLimit=") {
+			noted = true
 		}
 	}
-	if !refused {
-		t.Fatal("legacy 档的语义损失里应当写明无法表达内存上限")
+	if !noted {
+		t.Fatal("legacy 档的语义损失里应当写明内存上限用 MemoryLimit= 表达")
 	}
 }

@@ -3,6 +3,8 @@
 // 它的职责是把「进程实际收到了什么」写成可断言的事实，而**不打印凭据值**：
 // 报告里只有长度与 sha256，凭据明文永远不出现在文件、日志或断言输出中。
 //
+// --allow-write / --deny-write 可以重复出现，一次启动探多条路径。
+//
 // 它同时扮演一个真实的长驻服务：先写报告、再监听就绪端口。这个顺序是必需的——
 // 就绪探测通过就意味着报告已经落盘，断言不必与启动时序赛跑。
 package main
@@ -22,8 +24,13 @@ func main() {
 	listenAddr := flag.String("listen", "", "就绪监听地址 host:port")
 	hashEnv := flag.String("hash-env", "", "对该环境变量的值取长度与 sha256")
 	hashFileEnv := flag.String("hash-file-env", "", "把该环境变量的值当作路径，读取文件内容后取长度与 sha256")
-	allowWrite := flag.String("allow-write", "", "期望可写的路径（unit 已声明）")
-	denyWrite := flag.String("deny-write", "", "期望不可写的路径（unit 未声明，ProtectSystem 应拦截）")
+	// 这两条**可重复**：一次启动里探多个路径是常态（例如「strict 档下 /var 也不许写，
+	// legacy 档下 /usr 不许写」要靠两条不同的路径分别证明）。Go 的 flag 默认是「后一个
+	// 覆盖前一个」，用 flag.String 的话第二条会静默吃掉第一条——断言于是少测一条，
+	// 而且看起来是绿的。2026-09-24 在 CentOS 7 上真的踩到了。
+	var allowWrite, denyWrite stringList
+	flag.Var(&allowWrite, "allow-write", "期望可写的路径（unit 已声明）；可重复")
+	flag.Var(&denyWrite, "deny-write", "期望不可写的路径（unit 未声明，ProtectSystem 应拦截）；可重复")
 	flag.Parse()
 
 	if *reportPath == "" || *listenAddr == "" {
@@ -64,11 +71,11 @@ func main() {
 		}
 	}
 
-	if *allowWrite != "" {
-		lines = append(lines, fmt.Sprintf("allow-write %s writable=%s", *allowWrite, writable(*allowWrite)))
+	for _, path := range allowWrite {
+		lines = append(lines, fmt.Sprintf("allow-write %s writable=%s", path, writable(path)))
 	}
-	if *denyWrite != "" {
-		lines = append(lines, fmt.Sprintf("deny-write %s writable=%s", *denyWrite, writable(*denyWrite)))
+	for _, path := range denyWrite {
+		lines = append(lines, fmt.Sprintf("deny-write %s writable=%s", path, writable(path)))
 	}
 
 	if err := os.WriteFile(*reportPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
@@ -99,6 +106,16 @@ func writable(path string) string {
 		return "no"
 	}
 	return "yes"
+}
+
+// stringList 是「可重复的字符串旗标」。
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(value string) error {
+	*l = append(*l, value)
+	return nil
 }
 
 func digest(value string) string {

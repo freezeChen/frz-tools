@@ -138,22 +138,25 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   **迭代 2a（备份）与 2b（PostgreSQL/MySQL/MariaDB 适配器、数据库隔离恢复）均已实现并验证**；
   **2d（保留策略与 `prune`）也已实现并验证**，范围是只用 `keepLast`/`keepDays`；
   **GFS 已移出**并停放在停放区第 2 节（未实现）。
-  **迭代 3 的 3a / 3b / 3c 都已实现**（制品解包成 release 目录、部署与回滚、资源限制与
-  Java 运行时的解释器预检）；**3c 的真机复跑与重启验证未完成**（容器与单元/集成证据齐全）。
+  **迭代 3 的 3a / 3b / 3c 都已实现并验证**（制品解包成 release 目录、部署与回滚、资源限制与
+  Java 运行时的解释器预检）；**仍未做的只有「部署出来的 release 跨重启存活」那一轮**。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」（迭代 3c 落地后为 **170 项**）；不要引用静态推导值或历史快照当结论。
-- **不得把未验证项写成已验证**。当前明确未验证：`legacy` unit 档（systemd 219–239）、
+- **不得把未验证项写成已验证**。当前明确未验证：`legacy` 档的 **232～239 那一段**
+  （219 已在真实主机上验证，见 `2026-09-21-iteration-1c.md` 第 19 节）、
   sudoers/PAM 实际策略、
   `SudoConfig`（只有模型、零行为）、GFS 保留、store-wide 的备份孤儿回收、
   真实生产库与大库的备份、
-  GTID 开启的 MySQL 8、大容量长时间备份、**迭代 3c 的真机复跑与重启持久化**。
+  GTID 开启的 MySQL 8、大容量长时间备份、**「部署出来的 release 跨重启存活」**（两档都没做）。
   SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
   本工具**不提供** SELinux 加固——这是「未实现的能力」，不得写成「已支持」。
 - **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
   因此不进 CI）。2026-09-24 在 Rocky Linux 10.2 / systemd 257 / SELinux enforcing 上
   实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），跑完自动清理。
-  迭代 3c 的那一轮实测 **111 项通过 / 1 项失败**（失败项是一个真实缺陷，已修复），
-  **修复后的复跑与重启验证尚未执行**——不得写成已完成。
+  迭代 3c 在 strict 档上那一轮实测 **111 项通过 / 1 项失败**（失败项是一个真实缺陷，已修复）。
+  **legacy 档（CentOS 7 / systemd 219 / cgroup v1）另跑一轮：118 项通过 / 0 项失败**，
+  含 3c 整段（真 JAR、真 JVM、`MemoryLimit=` 落到 cgroup v1、解释器预检）；
+  用 `FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host`。
   **在那台主机上禁止 `pkill` / `killall` 这类宽匹配的杀进程方式**：上面跑着不在 systemd 下的
   业务 JVM（`/home/data/ems/ems-server`），一次 `pkill -x java` 把它一起杀了。
   **重启验证**另做了一轮（停机 44 秒、`boot_id` 前后不同、重启后 **21 项通过 / 0 项失败**），
