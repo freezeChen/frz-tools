@@ -182,20 +182,21 @@ x86_64）上把 opsd 装成 systemd 服务、跑完 RuntimeAdapter 的生命周�
 以 root 运行的 opsd 建出的 socket 是 `root:root 0660`，非 root 用户用不了 opsctl（配置里没有
 socket 属组项）；MySQL 的隔离恢复对备份账号的权限要求不只是 CREATEDB（见 `iteration-2.md` 第 21 节）。
 
-第二台主机（**CentOS 7 / systemd 219 / cgroup v1**，`root@43.142.95.141`）覆盖的是 **legacy 档**：
+第二台主机（**CentOS 7 / systemd 219 / cgroup v1**，`root@43.142.95.141`）覆盖的是 **legacy 档**
+——容器（255）与上一台真机（257）都够不到的那一档：
 `FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host` 实跑
-**118 项通过 / 0 项失败**，其中包含迭代 3c 的整段（真实 JAR + 真 JVM + 资源限制 + 解释器预检）。
+**118 项通过 / 0 项失败**，含迭代 3c 的整段（真实 JAR + 真 JVM + `MemoryLimit=` 落到 cgroup v1 +
+解释器预检）。**重启验证也做了**（用户授权重启那台 VM）：`prepare` **116/0** + `check` **28/0**
+——`boot_id` 前后不同、`/run/opsd` 由 `RuntimeDirectory=` 重建、两档的应用都自己回到 active、
+**部署出来的 release 自己回来且 `current` 未变**、重启前创建的 Operation 仍可查。
+自动重启的编排**必须等它先下线再上线**：关机过程中 ssh 几秒内仍可用，只等「ssh 恢复」会让
+`check` 跑在同一代 boot 上，而那条 `boot_id` 断言会（正确地）拒绝。
 那一档的完整记录见 `docs/plans/2026-09-21-iteration-1c.md` 第 19 节。
 
-迭代 3c 在 strict 档主机（`192.168.11.101`）上又跑了一轮（`full` 阶段，新增部署、真 JVM 与
-资源限制）：**111 项通过 / 1 项失败**，那一项正是缺陷（预检失败时 Operation 报
-`DEPLOY_ROLLED_BACK` 而不是原因码，已修复并在 legacy 主机与容器上各验一遍）。
-通过的部分包含真机才有的证据：用 `/opt/jdk-17.0.1` 编译打包的真实 JAR 部署成功并起来、
-**JVM 报告的工作目录就是 `current` 解析出的 release 目录**、**`/proc/<pid>/cmdline` 与
-manifest 的 argv 逐元素一致**、`-Xmx256m` 生效、`systemctl show` 与 **cgroup 的
-`memory.max` / `cpu.max`** 都是声明的值。**修复后的复跑与「部署出来的 release 跨重启存活」
-那一轮尚未执行**（复跑前那台主机从本机完全不可达：整个 `192.168.11.0/24` 连同网关都不通），
-因此 **3c 的真机验证未完成，不得写成已验证**——见 `iteration-3.md` §17。
+迭代 3c 在 **strict 档**主机（`192.168.11.101`）上那一轮实跑 **111 项通过 / 1 项失败**：
+唯一的失败项是一个真实缺陷（预检失败时 Operation 报 `DEPLOY_ROLLED_BACK` 而不是原因码），
+已修复并在 legacy 主机与容器上各验一遍；**修复后没有在 strict 档的真机上复跑**
+（那台主机整段网段从本机不可达），因此 strict 档的这一条目前以容器证据为准。
 
 `make verify-db`（`test/linux/verify-db.sh`）是**另一类**容器证据：它在真实的
 PostgreSQL / MySQL / MariaDB 实例上跑备份适配器的共享合约（`test/dbbackup`，由

@@ -151,21 +151,21 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
   本工具**不提供** SELinux 加固——这是「未实现的能力」，不得写成「已支持」。
 - **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
-  因此不进 CI）。2026-09-24 在 Rocky Linux 10.2 / systemd 257 / SELinux enforcing 上
-  实跑 **95 项通过 / 0 项失败**（1c 的 73 项 + 2b 的 22 项），跑完自动清理。
-  **legacy 档（CentOS 7 / systemd 219 / cgroup v1）也验完了**：`full` 118/0，
-  重启验证 `prepare` 116/0 + `check` 28/0（`boot_id` 前后不同、`/run/opsd` 重建、
-  **部署出来的 release 自己回来且 `current` 未变**）。自动重启的编排**必须等它先下线再上线**，
-  否则 `check` 会跑在同一代 boot 上——那条断言会（正确地）拒绝。
-  迭代 3c 在 strict 档上那一轮实测 **111 项通过 / 1 项失败**（失败项是一个真实缺陷，已修复）。
-  **legacy 档（CentOS 7 / systemd 219 / cgroup v1）另跑一轮：118 项通过 / 0 项失败**，
-  含 3c 整段（真 JAR、真 JVM、`MemoryLimit=` 落到 cgroup v1、解释器预检）；
-  用 `FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host`。
-  **在那台主机上禁止 `pkill` / `killall` 这类宽匹配的杀进程方式**：上面跑着不在 systemd 下的
-  业务 JVM（`/home/data/ems/ems-server`），一次 `pkill -x java` 把它一起杀了。
-  **重启验证**另做了一轮（停机 44 秒、`boot_id` 前后不同、重启后 **21 项通过 / 0 项失败**），
-  用 `FRZ_HOST_PHASE=prepare` → 重启 → `FRZ_HOST_PHASE=check`；`check` 阶段**不重新上传**，
-  否则会把跨重启状态的记录冲掉。
+  因此不进 CI）。两台主机、两个档位都已跑过：
+  - **strict 档**（Rocky Linux 10.2 / systemd 257 / SELinux enforcing，`192.168.11.101`）：
+    `full` **95/0**（1c 的 73 + 2b 的 22），重启验证 **21/0**（停机 44 秒）；迭代 3c 那一轮
+    **111/1**——唯一失败项是一个真实缺陷（已修复），**修复后没在这台上复跑**（那台机后来
+    整段网段不可达）。
+  - **legacy 档**（CentOS 7 / systemd 219 / cgroup v1，`43.142.95.141`）：`full` **118/0**，
+    含迭代 3c 整段（真 JAR、真 JVM、`MemoryLimit=` 落到 cgroup v1、解释器预检）；重启验证
+    `prepare` **116/0** + `check` **28/0**——`boot_id` 前后不同、`/run/opsd` 由
+    `RuntimeDirectory=` 重建、**部署出来的 release 自己回来且 `current` 未变**。
+    跑法：`FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host`。
+  - 重启验证用 `FRZ_HOST_PHASE=prepare` → 重启 → `FRZ_HOST_PHASE=check`；`check` 阶段
+    **不重新上传**（否则会把跨重启的记录冲掉），自动重启时必须**等它先下线再上线**，
+    否则 `check` 跑在同一代 boot 上——那条 `boot_id` 断言会（正确地）拒绝。
+  - **在 `192.168.11.101` 上禁止 `pkill` / `killall` 这类宽匹配的杀进程方式**：上面跑着
+    不在 systemd 下的业务 JVM（`/home/data/ems/ems-server`），一次 `pkill -x java` 把它一起杀了。
 - 备份适配器的真实实例验证用 `make verify-db`（`test/linux/verify-db.sh` + `test/dbbackup`，
   由 `FRZ_TEST_*_DSN` 控制，未设置时跳过）。它跑的是 `internal/application/backupcontract`
   的共享合约——**新增任何 `BackupAdapter` 实现都必须过同一套**。
