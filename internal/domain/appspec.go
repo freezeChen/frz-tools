@@ -465,7 +465,11 @@ func (s *SpecSystemd) validate() error {
 }
 
 func (s *ApplicationSpec) applyDefaults() {
-	if s.Systemd.UnitName == "" {
+	// 蓝绿应用**不补 unit 名**：它按槽位派生（`UnitNameFor`），而「有没有手写 unit 名」
+	// 是 validateBlueGreen 的一条互斥规则。补上默认值会让这条规则在**第二次校验**时
+	// 自己绊倒自己——applyDefaults 会把名字写回规格，而规格是同一份（生产里
+	// PrepareDeploy 校验一次、执行时再校验一次，每次都带着上一次补上的默认值）。
+	if s.Systemd.UnitName == "" && !s.BlueGreen() {
 		s.Systemd.UnitName = s.Application + ".service"
 	}
 	if s.Systemd.RestartPolicy == "" {

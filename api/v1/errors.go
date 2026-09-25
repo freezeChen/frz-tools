@@ -62,6 +62,15 @@ const (
 	// 哪个版本」。刻意不加进 1d 的重试白名单：部署失败通常不是瞬时故障，自动重试会把
 	// 同一个坏版本反复推上去。
 	CodeDeployRolledBack ErrorCode = "DEPLOY_ROLLED_BACK"
+	// CodeNginxConfigInvalid 是**候选配置没通过校验**，或受管文件没有被主配置加载
+	// （迭代 4）。两种情况都意味着「切流这件事现在不能做」，而**流量一点都没动**——
+	// 它与 DEPLOY_ROLLED_BACK 刻意分开：那个码说的是「改动过线上并撤销了它」，
+	// 而这个码回答的是「什么都没发生，去改配置」。
+	CodeNginxConfigInvalid ErrorCode = "NGINX_CONFIG_INVALID"
+	// CodeNginxReloadFailed 是 **reload 失败且换回原配置也没成功**：流量现在处于
+	// 不确定状态，必须人工介入。刻意不复用 CONFIG_INVALID：那个码是「拒绝切流」，
+	// 这个码是「切到一半出事了」，运维要做的事完全不同。
+	CodeNginxReloadFailed ErrorCode = "NGINX_RELOAD_FAILED"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -101,6 +110,8 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeBackupRestoreFailed:      409,
 	CodeArtifactUnpackFailed:     409,
 	CodeDeployRolledBack:         409,
+	CodeNginxConfigInvalid:       409,
+	CodeNginxReloadFailed:        409,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -154,6 +165,8 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeBackupRestoreFailed:      28,
 	CodeArtifactUnpackFailed:     30,
 	CodeDeployRolledBack:         29,
+	CodeNginxConfigInvalid:       31,
+	CodeNginxReloadFailed:        32,
 }
 
 func ExitCode(code ErrorCode) int {

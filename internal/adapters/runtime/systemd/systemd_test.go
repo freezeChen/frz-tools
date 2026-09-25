@@ -933,7 +933,7 @@ func TestPrepareDoesNotCreateReleaseTreeInternals(t *testing.T) {
 	if err := os.MkdirAll(releaseDir, 0o750); err != nil {
 		t.Fatalf("建 release 目录: %v", err)
 	}
-	if err := releases.Activate(context.Background(), spec, "rel_1"); err != nil {
+	if err := releases.Activate(context.Background(), spec, "", "rel_1"); err != nil {
 		t.Fatalf("Prepare 之后 Activate 必须成功: %v", err)
 	}
 	if target, err := os.Readlink(currentLink); err != nil || target != "rel_1" {

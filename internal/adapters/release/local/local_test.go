@@ -453,7 +453,7 @@ func TestActivateSwitchesCurrentAtomically(t *testing.T) {
 		}
 	}
 
-	if err := adapter.Activate(context.Background(), spec, "rel_1"); err != nil {
+	if err := adapter.Activate(context.Background(), spec, "", "rel_1"); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 	current := filepath.Join(adapter.RootPath(domain.ReleaseRootDir(spec.Application)), "current")
@@ -466,7 +466,7 @@ func TestActivateSwitchesCurrentAtomically(t *testing.T) {
 		t.Fatalf("current 应当指向相对名字 rel_1，got %q", target)
 	}
 
-	if err := adapter.Activate(context.Background(), spec, "rel_2"); err != nil {
+	if err := adapter.Activate(context.Background(), spec, "", "rel_2"); err != nil {
 		t.Fatalf("第二次 Activate: %v", err)
 	}
 	target, err = os.Readlink(current)
@@ -494,7 +494,7 @@ func TestActivateRejectsMissingRelease(t *testing.T) {
 	adapter, _ := newTestAdapter(t)
 	spec := goSpec(domain.SpecUnpack{Strategy: domain.UnpackNone}, "server")
 
-	err := adapter.Activate(context.Background(), spec, "rel_missing")
+	err := adapter.Activate(context.Background(), spec, "", "rel_missing")
 	if domain.CodeOf(err) != v1.CodeReleaseNotFound {
 		t.Fatalf("want RELEASE_NOT_FOUND, got %v", err)
 	}
@@ -511,7 +511,7 @@ func TestRemoveRefusesCurrentAndIsIdempotent(t *testing.T) {
 			t.Fatalf("Materialize %s: %v", id, err)
 		}
 	}
-	if err := adapter.Activate(context.Background(), spec, "rel_1"); err != nil {
+	if err := adapter.Activate(context.Background(), spec, "", "rel_1"); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 
@@ -542,7 +542,7 @@ func TestListSkipsCurrentAndStaging(t *testing.T) {
 			t.Fatalf("Materialize %s: %v", id, err)
 		}
 	}
-	if err := adapter.Activate(context.Background(), spec, "rel_1"); err != nil {
+	if err := adapter.Activate(context.Background(), spec, "", "rel_1"); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 	// 手工造一个暂存目录：它不该出现在「有哪些 release」的答案里。
@@ -593,4 +593,130 @@ func TestMaterializeLeavesReadableContent(t *testing.T) {
 	if len(content) != 1024 {
 		t.Fatalf("内容长度不对: %d", len(content))
 	}
+}
+
+// ==== 槽位（迭代 4）====
+
+// 两个槽位各有自己的 current 指针：这正是「两个版本同时运行」的物质基础。
+func TestActivateSlotKeepsPointersIndependent(t *testing.T) {
+	adapter, root := newTestAdapter(t)
+	spec := goSpec(domain.SpecUnpack{Strategy: domain.UnpackNone}, "server")
+	// 蓝绿应用：两个槽位各声明一个端口。
+	spec.Exec.Slots = map[domain.Slot]domain.SpecSlot{
+		domain.SlotBlue: {Ports: []int{18081},
+			Readiness: domain.SpecReadiness{Type: domain.ReadinessTCP, Target: "127.0.0.1:18081"}},
+		domain.SlotGreen: {Ports: []int{18082},
+			Readiness: domain.SpecReadiness{Type: domain.ReadinessTCP, Target: "127.0.0.1:18082"}},
+	}
+	spec.Exec.Ports = nil
+	spec.Health.Readiness = domain.SpecReadiness{}
+	spec.Nginx = domain.SpecNginx{Listen: 8080}
+	spec.Systemd.UnitName = ""
+
+	for _, id := range []string{"rel_1", "rel_2"} {
+		if err := adapter.Materialize(context.Background(), spec, id, strings.NewReader(id)); err != nil {
+			t.Fatalf("Materialize %s: %v", id, err)
+		}
+	}
+	if err := adapter.Activate(context.Background(), spec, domain.SlotBlue, "rel_1"); err != nil {
+		t.Fatalf("Activate blue: %v", err)
+	}
+	if err := adapter.Activate(context.Background(), spec, domain.SlotGreen, "rel_2"); err != nil {
+		t.Fatalf("Activate green: %v", err)
+	}
+
+	blue := filepath.Join(root, domain.SlotCurrentDir(spec.Application, domain.SlotBlue))
+	green := filepath.Join(root, domain.SlotCurrentDir(spec.Application, domain.SlotGreen))
+
+	// 目标写成**相对路径**：从 <app>/slots/<slot>/current 上跳两级回到 <app>，再进 releases。
+	// 相对而不是绝对，是为了让整个目录树可以被整体搬走（与单槽 current 同一条理由）。
+	blueTarget, err := os.Readlink(blue)
+	if err != nil {
+		t.Fatalf("readlink blue: %v", err)
+	}
+	if want := filepath.Join("..", "..", "releases", "rel_1"); blueTarget != want {
+		t.Fatalf("blue 的目标 want %q, got %q", want, blueTarget)
+	}
+	greenTarget, err := os.Readlink(green)
+	if err != nil {
+		t.Fatalf("readlink green: %v", err)
+	}
+	if want := filepath.Join("..", "..", "releases", "rel_2"); greenTarget != want {
+		t.Fatalf("green 的目标 want %q, got %q", want, greenTarget)
+	}
+
+	// 两个指针解析到的目录必须存在，且是各自的 release。
+	for slot, want := range map[domain.Slot]string{domain.SlotBlue: "rel_1", domain.SlotGreen: "rel_2"} {
+		resolved, err := filepath.EvalSymlinks(filepath.Join(root, domain.SlotCurrentDir(spec.Application, slot)))
+		if err != nil {
+			t.Fatalf("解析 %s 的 current: %v", slot, err)
+		}
+		// 期望值也过一遍 EvalSymlinks：macOS 上 /var 是指向 /private/var 的符号链接，
+		// 只解析一边会让两个「同一个目录」的写法比不相等。
+		expected, err := filepath.EvalSymlinks(releaseDir(t, adapter, spec, want))
+		if err != nil {
+			t.Fatalf("解析期望目录: %v", err)
+		}
+		if resolved != expected {
+			t.Fatalf("%s 的 current 应当指向 %s，got %s", slot, want, resolved)
+		}
+	}
+
+	// 单槽那个 current 不该被建出来：蓝绿应用没有「一个 current」这回事，
+	// 建出来只会让「现在跑的是哪个版本」多一个错误的答案。
+	if _, err := os.Lstat(filepath.Join(root, domain.ReleaseRootDir(spec.Application), "current")); !os.IsNotExist(err) {
+		t.Fatal("蓝绿应用的 Activate 不该建出单槽的 current 指针")
+	}
+
+	// CurrentIn 按槽位回答「这一侧跑的是哪个版本」。
+	for slot, want := range map[domain.Slot]string{domain.SlotBlue: "rel_1", domain.SlotGreen: "rel_2"} {
+		got, err := adapter.CurrentIn(spec, slot)
+		if err != nil || got != want {
+			t.Fatalf("CurrentIn(%s) want %s, got %q err=%v", slot, want, got, err)
+		}
+	}
+}
+
+// 保留策略的「永不删正在服务的目录」这条保底要按**槽位**生效：删掉任何一侧正指向的目录，
+// 那一侧的下一次重启就会起不来，而另一侧还好好跑着——故障看起来会很随机。
+func TestRemoveRefusesReleaseUsedByAnySlot(t *testing.T) {
+	adapter, root := newTestAdapter(t)
+	spec := goSpec(domain.SpecUnpack{Strategy: domain.UnpackNone}, "server")
+	spec.Exec.Slots = map[domain.Slot]domain.SpecSlot{
+		domain.SlotBlue: {Ports: []int{18081},
+			Readiness: domain.SpecReadiness{Type: domain.ReadinessTCP, Target: "127.0.0.1:18081"}},
+		domain.SlotGreen: {Ports: []int{18082},
+			Readiness: domain.SpecReadiness{Type: domain.ReadinessTCP, Target: "127.0.0.1:18082"}},
+	}
+	spec.Exec.Ports = nil
+	spec.Health.Readiness = domain.SpecReadiness{}
+	spec.Nginx = domain.SpecNginx{Listen: 8080}
+	spec.Systemd.UnitName = ""
+
+	for _, id := range []string{"rel_1", "rel_2"} {
+		if err := adapter.Materialize(context.Background(), spec, id, strings.NewReader(id)); err != nil {
+			t.Fatalf("Materialize %s: %v", id, err)
+		}
+	}
+	if err := adapter.Activate(context.Background(), spec, domain.SlotBlue, "rel_1"); err != nil {
+		t.Fatalf("Activate blue: %v", err)
+	}
+	if err := adapter.Activate(context.Background(), spec, domain.SlotGreen, "rel_2"); err != nil {
+		t.Fatalf("Activate green: %v", err)
+	}
+
+	// 两侧都不许删，而且报错要说清是哪一侧在用。
+	for _, id := range []string{"rel_1", "rel_2"} {
+		err := adapter.Remove(context.Background(), spec, id)
+		if domain.CodeOf(err) != v1.CodeReleaseConflict {
+			t.Fatalf("删除 %s want RELEASE_CONFLICT, got %v", id, err)
+		}
+		if !strings.Contains(err.Error(), "槽位") {
+			t.Fatalf("报错要说清是哪一侧在用：%v", err)
+		}
+		if _, statErr := os.Stat(releaseDir(t, adapter, spec, id)); statErr != nil {
+			t.Fatalf("被拒的删除不该真的删掉东西（%s）: %v", id, statErr)
+		}
+	}
+	_ = root
 }

@@ -145,7 +145,7 @@ func (a *Adapter) Materialize(ctx context.Context, spec *domain.ApplicationSpec,
 //
 // 切换是**一次原子 rename**：先建 `current.tmp` 再改名覆盖。运维可能在切换的任意瞬间
 // 重启 systemd，而「读到一个半成品链接」会让服务起在一个不存在的目录上。
-func (a *Adapter) Activate(ctx context.Context, spec *domain.ApplicationSpec, releaseID string) error {
+func (a *Adapter) Activate(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot, releaseID string) error {
 	if spec == nil {
 		return domain.NewError(v1.CodeInvalidRequest, "release 适配器需要非空的应用规格")
 	}
@@ -164,13 +164,22 @@ func (a *Adapter) Activate(ctx context.Context, spec *domain.ApplicationSpec, re
 	}
 
 	link := filepath.Join(root, currentLink)
+	linkTarget := releaseID
+	if slot != "" {
+		// 蓝绿：指针住在该槽位目录里（`<app>/slots/<slot>/current`），目标是**相对路径**
+		// ——从槽位目录上跳两级正好回到 `<app>`，再进 releases。与单槽 current 用相对目标
+		// 同一个理由：整个 releases 根可以被整体搬走或换前缀。
+		link = a.RootPath(domain.SlotCurrentDir(spec.Application, slot))
+		linkTarget = domain.SlotCurrentLinkTarget(releaseID)
+		if err := os.MkdirAll(filepath.Dir(link), releaseDirMode); err != nil {
+			return domain.NewError(v1.CodeInternal, "创建槽位目录 %q 失败: %v", filepath.Dir(link), err)
+		}
+	}
 	tmp := link + ".tmp"
-	// 符号链接的目标写**相对名字**（`<releaseID>`）而不是绝对路径：整个 releases 根可以
-	// 被整体搬走或换前缀（测试里的 RootPath 就是这么做的），绝对路径会在那时失效。
 	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
 		return domain.NewError(v1.CodeInternal, "清理 %q 失败: %v", tmp, err)
 	}
-	if err := os.Symlink(releaseID, tmp); err != nil {
+	if err := os.Symlink(linkTarget, tmp); err != nil {
 		return domain.NewError(v1.CodeInternal, "创建 %q 失败: %v", tmp, err)
 	}
 	if err := os.Rename(tmp, link); err != nil {
@@ -197,9 +206,17 @@ func (a *Adapter) Remove(ctx context.Context, spec *domain.ApplicationSpec, rele
 	}
 
 	root := a.releaseRoot(spec)
+	// 单槽的 current 与**每个槽位**的 current 都不许删：删掉任何一侧正指向的目录，
+	// 那一侧的下一次重启就会起不来（而另一侧还好好跑着，故障看起来会很随机）。
 	if current, ok := a.readCurrent(root); ok && current == releaseID {
 		return domain.NewError(v1.CodeReleaseConflict,
 			"%s 是当前激活的 release，不能删除", releaseID)
+	}
+	for _, slot := range domain.Slots {
+		if current, ok := a.readSlotCurrent(spec, slot); ok && current == releaseID {
+			return domain.NewError(v1.CodeReleaseConflict,
+				"%s 正被槽位 %s 使用，不能删除", releaseID, slot)
+		}
 	}
 	target := filepath.Join(root, releaseID)
 	if _, err := os.Lstat(target); err != nil {
@@ -254,11 +271,31 @@ func (a *Adapter) List(ctx context.Context, spec *domain.ApplicationSpec) ([]str
 // 它不在端口上（端口只有物化/切换/删除/列举四件事），但部署流程需要它来判断
 // 「上一次成功的是哪个版本」——回滚目标就是从这里读出来的。
 func (a *Adapter) Current(spec *domain.ApplicationSpec) (string, error) {
+	return a.CurrentIn(spec, "")
+}
+
+// CurrentIn 读某个槽位（空 = 单槽）的 current 指针。部署流程要问的是「这一侧现在跑的是
+// 哪个版本」——蓝绿的每一侧都有自己的答案。
+func (a *Adapter) CurrentIn(spec *domain.ApplicationSpec, slot domain.Slot) (string, error) {
 	if spec == nil {
 		return "", domain.NewError(v1.CodeInvalidRequest, "release 适配器需要非空的应用规格")
 	}
+	if slot != "" {
+		current, _ := a.readSlotCurrent(spec, slot)
+		return current, nil
+	}
 	current, _ := a.readCurrent(a.releaseRoot(spec))
 	return current, nil
+}
+
+// readSlotCurrent 读某个槽位的 current 指针。与 readCurrent 同一条纪律：只回答
+// 「指针指着谁」，不去校验目标在不在。
+func (a *Adapter) readSlotCurrent(spec *domain.ApplicationSpec, slot domain.Slot) (string, bool) {
+	target, err := os.Readlink(a.RootPath(domain.SlotCurrentDir(spec.Application, slot)))
+	if err != nil {
+		return "", false
+	}
+	return filepath.Base(target), true
 }
 
 // readCurrent 读 current 指针。它刻意**不跟随**链接去校验目标存在：那是调用方的判断，
@@ -326,15 +363,19 @@ var errPathEscape = errors.New("条目名逃出了 release 目录")
 //
 // 用在「第一次部署就失败」那条路上：没有可回退的版本，只能把它停下来，而留下的 current
 // 会指向一个马上要被删掉的目录——于是「现在跑的是哪个版本」这句话指向了不存在的东西。
-func (a *Adapter) Deactivate(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) Deactivate(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	if spec == nil {
 		return domain.NewError(v1.CodeInvalidRequest, "release 适配器需要非空的应用规格")
 	}
 	if err := ctx.Err(); err != nil {
 		return domain.NewError(v1.CodeExecCancelled, "撤销激活被取消")
 	}
-	if err := os.Remove(filepath.Join(a.releaseRoot(spec), currentLink)); err != nil && !os.IsNotExist(err) {
-		return domain.NewError(v1.CodeInternal, "移除 current 指针失败: %v", err)
+	link := filepath.Join(a.releaseRoot(spec), currentLink)
+	if slot != "" {
+		link = a.RootPath(domain.SlotCurrentDir(spec.Application, slot))
+	}
+	if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+		return domain.NewError(v1.CodeInternal, "移除 current 指针 %q 失败: %v", link, err)
 	}
 	return nil
 }

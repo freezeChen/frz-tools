@@ -181,6 +181,32 @@ type RuntimeAdapter interface {
 	Status(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeStatus, error)
 }
 
+// NginxAdapter 把「蓝绿的对外入口」落到具体的 Nginx 上（迭代 4）。
+//
+// 它**只服务蓝绿应用**：单槽应用没有「对外入口」这一层——那些应用的端口由应用自己监听。
+// 因此这个端口上的每个方法都要求 spec 是蓝绿形态，否则报错而不是「什么都不做」。
+//
+// 受管文件是**唯一**承载「现在指向哪个槽位」的线上事实（迭代 4 规格 D2）：库里的
+// `serving_slot` 是它的镜像，对账以它为准。
+type NginxAdapter interface {
+	// Validate 检查这台主机能不能承担蓝绿的入口：nginx 可执行、受管目录可用。
+	// 它必须能在 **Prepare 阶段**就跑，而不是等切流时才发现——那时新槽位已经起来了。
+	Validate(ctx context.Context, spec *domain.ApplicationSpec) error
+	// CheckLoaded 断言受管文件**真的被主配置加载**（`nginx -T` 的输出里能找到它）。
+	//
+	// 「配置写对了但没生效」是最危险的中间态：切流看起来成功了，流量却还在旧版本
+	// （或者根本没经过 Nginx）。因此切流之前必须过这一关。
+	CheckLoaded(ctx context.Context, spec *domain.ApplicationSpec) error
+	// Apply 把 upstream 指向给定槽位：写候选文件 → 校验 → **原子替换** → reload。
+	//
+	// reload 失败时把原内容换回并再 reload 一次；换回也失败时返回的错误必须让调用方
+	// 知道「流量现在处于不确定状态」（迭代 4 规格 D4/D5）。
+	Apply(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error
+	// Current 读回受管文件现在指向哪个槽位（对账用）。文件不存在时返回空槽位与 nil
+	// ——「还没部署过」不是错误。
+	Current(ctx context.Context, spec *domain.ApplicationSpec) (domain.Slot, error)
+}
+
 // BackupAdapter 把「一份备份策略」映射到具体的资源类型（目录、数据库……）。
 //
 // 它只产出**逻辑备份流**：压缩、加密、摘要与原子提交到 StorageBackend 由应用层统一
@@ -230,14 +256,19 @@ type ReleaseAdapter interface {
 	// 「同一个版本号下换了内容」。
 	Materialize(ctx context.Context, spec *domain.ApplicationSpec, releaseID string, artifact io.Reader) error
 	// Activate 把 current 指针切到该 release（原子替换符号链接）。
-	Activate(ctx context.Context, spec *domain.ApplicationSpec, releaseID string) error
-	// Remove 删掉一个 release 目录；实现必须**拒绝删除 current 指向的那个**。
+	//
+	// slot 为空 = 单槽形态（`<releases 根>/current`，迭代 3 的语义）；非空 = 该槽位自己的
+	// 指针（`<app>/slots/<slot>/current`）。**两个槽位的指针互不影响**——那正是「两个版本
+	// 同时运行」的物质基础。
+	Activate(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot, releaseID string) error
+	// Remove 删掉一个 release 目录；实现必须**拒绝删除任何槽位（或单槽 current）正指向的
+	// 那一个**——删掉它等于让那一侧在下一次重启时起不来。
 	Remove(ctx context.Context, spec *domain.ApplicationSpec, releaseID string) error
 	// List 列出磁盘上实际存在的 release 目录，供发现「库里有记录、盘上没目录」这类不一致。
 	List(ctx context.Context, spec *domain.ApplicationSpec) ([]string, error)
-	// Deactivate 撤掉 current 指针（幂等）。用于「第一次部署就失败」：那时没有可回退的
-	// 版本，只能把它停下来，而留下的 current 会指向一个马上要被删掉的目录。
-	Deactivate(ctx context.Context, spec *domain.ApplicationSpec) error
+	// Deactivate 撤掉某个槽位的 current 指针（幂等）。用于「第一次部署就失败」：那时没有
+	// 可回退的版本，只能把它停下来，而留下的指针会指向一个马上要被删掉的目录。
+	Deactivate(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error
 }
 
 // RuntimePrepareReporter 让装配层把适配器独有的 Prepare 决策（systemd 的 unit 档位与

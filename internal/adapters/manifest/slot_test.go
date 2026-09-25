@@ -255,3 +255,29 @@ func TestParseSingleSlotManifestStaysSingleSlot(t *testing.T) {
 		t.Fatalf("单槽的就绪目标应当照原样解出来: %+v", spec.Health.Readiness)
 	}
 }
+
+// 同一份蓝绿规格**连续校验两次**都必须通过。
+//
+// 这条回归测试钉的是一个真实的 bug：`applyDefaults` 会给规格补上 `systemd.unitName`，而
+// 「蓝绿应用不得手写 unit 名」是一条互斥规则——于是第二次校验时，规格带着**上一次自己补的
+// 默认值**撞上了自己的规则。生产里的路径正是「两次校验」：`PrepareDeploy` 校验一次并把
+// （已被默认值改写的）规格存进库，执行部署时把规格读回来再校验一次。少了这条，每一次蓝绿
+// 部署都会在执行阶段以「不得手写 systemd.unitName」失败——而那份 manifest 里根本没写过它。
+func TestBlueGreenSpecValidatesRepeatedly(t *testing.T) {
+	spec, err := Parse([]byte(blueGreenManifest))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// 第一次校验已经把默认值写回规格了（这是 spec.Validate 既有的语义）。
+	if err := spec.Validate(); err != nil {
+		t.Fatalf("第二次校验不该失败: %v", err)
+	}
+	if spec.Systemd.UnitName != "" {
+		t.Fatalf("蓝绿规格不该被补上 unit 名（按槽位派生），got %q", spec.Systemd.UnitName)
+	}
+	// 而**手写** unit 名仍然必须被拒：那是真的写错了。
+	spec.Systemd.UnitName = "orders-api.service"
+	if err := spec.Validate(); domain.CodeOf(err) != v1.CodeManifestInvalid {
+		t.Fatalf("手写 unit 名必须被拒，got %v", err)
+	}
+}

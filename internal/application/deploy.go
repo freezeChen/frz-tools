@@ -374,7 +374,7 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 		if err := s.materializeIfMissing(ctx, spec, releaseID, release.ArtifactID, logf); err != nil {
 			return fail(err)
 		}
-		if err := s.releases.Activate(ctx, spec, releaseID); err != nil {
+		if err := s.releases.Activate(ctx, spec, "", releaseID); err != nil {
 			return fail(err)
 		}
 		switched = true
@@ -459,7 +459,7 @@ func (s *DeployService) restorePrevious(
 		return err
 	}
 	if previousSpec.Materializes() {
-		if err := s.releases.Activate(ctx, previousSpec, previous.ID); err != nil {
+		if err := s.releases.Activate(ctx, previousSpec, "", previous.ID); err != nil {
 			return err
 		}
 	}
@@ -478,7 +478,7 @@ func (s *DeployService) teardownFirstDeploy(
 ) error {
 	logf("warn", domain.PhaseRollback, "这是本应用的第一次部署，没有可回退的版本，停止它", nil)
 	stopErr := s.runtime.Stop(ctx, spec, "")
-	deactivateErr := s.releases.Deactivate(ctx, spec)
+	deactivateErr := s.releases.Deactivate(ctx, spec, "")
 	if stopErr != nil {
 		return stopErr
 	}
