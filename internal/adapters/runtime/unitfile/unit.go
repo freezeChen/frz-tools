@@ -103,11 +103,16 @@ type Rendered struct {
 	Argv []string
 }
 
-// RenderUnit 按 tier 渲染 spec 对应的 unit 文件正文。
+// RenderUnit 按 tier 渲染 spec 在**某个槽位**上的 unit 文件正文。
+//
+// slot 为空表示单槽形态（迭代 3 的语义）：unit 名取自规格、argv 解析到 `releases/current`、
+// 环境文件是 `<app>.env`。非空表示蓝绿（迭代 4）：unit 名按槽位派生、argv 解析到该槽位的
+// `current`、环境文件与凭据目录都按槽位分开——**两个 unit 同时存在且各自跑不同版本**，
+// 用同一套路径会让它们互相踩。
 //
 // systemdVersion 是探测到的版本，与 tier 必须自洽（TierFor 的结果），
 // 否则头部注释会记录一个与正文不符的档位——可追溯信息一旦不真实就毫无价值。
-func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Rendered, error) {
+func RenderUnit(spec *domain.ApplicationSpec, slot domain.Slot, tier Tier, systemdVersion int) (Rendered, error) {
 	if spec == nil {
 		return Rendered{}, domain.NewError(v1.CodeManifestInvalid, "渲染 unit 需要非空的应用规格")
 	}
@@ -132,7 +137,7 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 	// current 目录。**这是 argv 最后一次被使用的地方**，把解析放在这里而不是散在调用点，
 	// 是因为「怎么解析」与「谁来执行」是同一条信息——分开就会漂移，而漂移的后果是
 	// 启动一个不该启动的东西。
-	resolvedArgv, err := domain.ResolveArgv(spec.Application, spec.Exec.Argv)
+	resolvedArgv, err := domain.ResolveArgv(spec.Application, slot, spec.Exec.Argv)
 	if err != nil {
 		return Rendered{}, err
 	}
@@ -155,6 +160,12 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 		spec.Logs.Directory,
 		domain.ReleaseRootDir(spec.Application),
 	}
+	if slot != "" {
+		// 槽位目录也要可写：`exec.workingDirectory` 的常见写法就是该槽位的 `current`
+		// （应用要按工作目录找自己的文件），而 unit 的 ReadWritePaths= 不解开这份授权的话，
+		// ProtectSystem=strict 下那一步 chdir 之后的写入会被拒。
+		writable = append(writable, domain.SlotDir(spec.Application, slot))
+	}
 	for _, p := range writable {
 		if err := checkRenderablePath("unit 中的路径", p); err != nil {
 			return Rendered{}, err
@@ -174,7 +185,13 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 	writeHeader(&b, tier, systemdVersion)
 
 	b.WriteString("\n[Unit]\n")
-	fmt.Fprintf(&b, "Description=%s\n", spec.Application)
+	// 蓝绿的两个 unit 描述必须能分辨：`systemctl list-units` 里两个都叫 orders-api
+	// 的话，出问题时第一眼就看不出是哪一侧。
+	description := spec.Application
+	if slot != "" {
+		description = fmt.Sprintf("%s（槽位 %s）", spec.Application, slot)
+	}
+	fmt.Fprintf(&b, "Description=%s\n", description)
 	b.WriteString("After=network.target\n")
 	b.WriteString("Wants=network.target\n")
 
@@ -186,8 +203,8 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 	fmt.Fprintf(&b, "WorkingDirectory=%s\n", spec.Exec.WorkingDirectory)
 	// 两个 EnvironmentFile 的 `-` 前缀是有意区别对待的：非敏感文件缺失可以继续，
 	// 敏感文件缺失必须让 unit 启动失败，否则应用会在缺凭据的状态下起来。
-	fmt.Fprintf(&b, "EnvironmentFile=-%s\n", domain.EnvFilePath(spec.Application))
-	fmt.Fprintf(&b, "EnvironmentFile=%s\n", domain.SecretsEnvFilePath(spec.Application))
+	fmt.Fprintf(&b, "EnvironmentFile=-%s\n", domain.EnvFilePathFor(spec.Application, slot))
+	fmt.Fprintf(&b, "EnvironmentFile=%s\n", domain.SecretsEnvFilePathFor(spec.Application, slot))
 	fmt.Fprintf(&b, "ExecStart=%s\n", EscapeArgs(resolvedArgv))
 	fmt.Fprintf(&b, "Restart=%s\n", spec.Systemd.RestartPolicy)
 	fmt.Fprintf(&b, "RestartSec=%d\n", int(RestartSec/time.Second))
@@ -255,21 +272,21 @@ func RenderUnit(spec *domain.ApplicationSpec, tier Tier, systemdVersion int) (Re
 
 // RenderForVersion 是给定 systemd 版本时的入口：先选档再渲染。
 // 需要先把档位展示给用户或写进审计的调用方可以直接用 RenderUnit。
-func RenderForVersion(spec *domain.ApplicationSpec, systemdVersion int) (Rendered, error) {
+func RenderForVersion(spec *domain.ApplicationSpec, slot domain.Slot, systemdVersion int) (Rendered, error) {
 	tier, err := TierFor(systemdVersion)
 	if err != nil {
 		return Rendered{}, err
 	}
-	return RenderUnit(spec, tier, systemdVersion)
+	return RenderUnit(spec, slot, tier, systemdVersion)
 }
 
 // RenderForHost 把探测与渲染串起来，是 systemd 适配器最常用的入口。
-func RenderForHost(ctx context.Context, spec *domain.ApplicationSpec, prober *Prober) (Rendered, error) {
+func RenderForHost(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot, prober *Prober) (Rendered, error) {
 	version, err := prober.Detect(ctx)
 	if err != nil {
 		return Rendered{}, err
 	}
-	return RenderForVersion(spec, version)
+	return RenderForVersion(spec, slot, version)
 }
 
 // writeHeader 写可追溯头注释：探测到的版本与所选档位。

@@ -108,7 +108,7 @@ func TestPrepareWritesSandboxedFilesWithExpectedModes(t *testing.T) {
 		}},
 		Logs: domain.SpecLogs{Directory: "/var/log/modes"},
 	}
-	if err := adapter.Prepare(context.Background(), spec); err != nil {
+	if err := adapter.Prepare(context.Background(), spec, ""); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
@@ -171,7 +171,7 @@ func TestPrepareWritesSandboxedFilesWithExpectedModes(t *testing.T) {
 	if err := os.Chmod(sandbox(domain.EnvFilePath("modes")), 0o644); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	if err := adapter.Prepare(context.Background(), spec); err != nil {
+	if err := adapter.Prepare(context.Background(), spec, ""); err != nil {
 		t.Fatalf("second Prepare: %v", err)
 	}
 	info, err := os.Stat(sandbox(domain.EnvFilePath("modes")))
@@ -209,7 +209,7 @@ func TestPrepareRejectsMultilineEnvSecret(t *testing.T) {
 		Logs: domain.SpecLogs{Directory: "/var/log/multiline"},
 	}
 
-	err := adapter.Prepare(context.Background(), spec)
+	err := adapter.Prepare(context.Background(), spec, "")
 	if domain.CodeOf(err) != v1.CodeSecretUnresolved {
 		t.Fatalf("want SECRET_UNRESOLVED, got %v", err)
 	}

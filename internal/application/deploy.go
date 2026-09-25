@@ -354,14 +354,14 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 		return domain.NewError(v1.CodeDeployRolledBack, "%s", domain.MessageOf(cause))
 	}
 
-	if err := s.runtime.Prepare(ctx, spec); err != nil {
+	if err := s.runtime.Prepare(ctx, spec, ""); err != nil {
 		return fail(err)
 	}
 	// **先停掉上一个版本**：`Start` 的语义是「把应用跑起来」，对已经 active 的 unit 它是
 	// 幂等的 no-op——那是 runtime.start 要的性质（重复提交无害），但部署要的是**换版本**，
 	// 不重启根本换不过去：旧进程会继续占着它自己的端口，而新版本的就绪检查永远等不到。
 	if previousSpec != nil {
-		if err := s.runtime.Stop(ctx, previousSpec); err != nil {
+		if err := s.runtime.Stop(ctx, previousSpec, ""); err != nil {
 			return fail(err)
 		}
 		// 从这一刻起线上是被动过的：旧版本已经停了。后面任何一步失败都必须把它放回去
@@ -379,7 +379,7 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 		}
 		switched = true
 	}
-	if err := s.runtime.Start(ctx, spec); err != nil {
+	if err := s.runtime.Start(ctx, spec, ""); err != nil {
 		return fail(err)
 	}
 	// **健康通过才算发布成功**：1c 的 runtime.start 只负责把进程起来（「启动 ≠ 就绪」是它
@@ -455,7 +455,7 @@ func (s *DeployService) restorePrevious(
 	// 与正向部署同一条道理，方向相反：先把失败的这一版停掉，再把旧版本起来。
 	// 少了这一步，`Start` 会因为 unit 已经 active 而变成 no-op——于是库里写着"已回滚"，
 	// 而进程仍然是那个坏版本在跑。这是最难查的一类不一致。
-	if err := s.runtime.Stop(ctx, current); err != nil {
+	if err := s.runtime.Stop(ctx, current, ""); err != nil {
 		return err
 	}
 	if previousSpec.Materializes() {
@@ -463,10 +463,10 @@ func (s *DeployService) restorePrevious(
 			return err
 		}
 	}
-	if err := s.runtime.Prepare(ctx, previousSpec); err != nil {
+	if err := s.runtime.Prepare(ctx, previousSpec, ""); err != nil {
 		return err
 	}
-	return s.runtime.Start(ctx, previousSpec)
+	return s.runtime.Start(ctx, previousSpec, "")
 }
 
 // teardownFirstDeploy 处理「第一次部署就失败」：停下 unit、撤掉 current 指针。
@@ -477,7 +477,7 @@ func (s *DeployService) teardownFirstDeploy(
 	ctx context.Context, spec *domain.ApplicationSpec, releaseID string, logf DeployLogf,
 ) error {
 	logf("warn", domain.PhaseRollback, "这是本应用的第一次部署，没有可回退的版本，停止它", nil)
-	stopErr := s.runtime.Stop(ctx, spec)
+	stopErr := s.runtime.Stop(ctx, spec, "")
 	deactivateErr := s.releases.Deactivate(ctx, spec)
 	if stopErr != nil {
 		return stopErr
@@ -547,7 +547,7 @@ func (s *DeployService) waitForReady(ctx context.Context, spec *domain.Applicati
 	logf("info", domain.PhaseExecute, "等待就绪", map[string]string{"target": spec.Health.Readiness.Target, "timeout": timeout.String()})
 
 	for {
-		health, err := s.runtime.Health(ctx, spec)
+		health, err := s.runtime.Health(ctx, spec, "")
 		if err != nil {
 			// 适配器自己也可能报「超时未就绪」（systemd 那边在超过 startTimeout 之后会
 			// 直接给出 RUNTIME_NOT_READY），那种错误原样上抛。

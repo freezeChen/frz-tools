@@ -71,7 +71,7 @@ func TestResolveArgv(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ResolveArgv(app, tc.argv)
+			got, err := ResolveArgv(app, "", tc.argv)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("应当被拒: %v", tc.argv)

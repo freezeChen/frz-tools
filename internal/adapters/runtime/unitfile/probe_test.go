@@ -151,7 +151,7 @@ func TestCommandRunnerIsArgvOnly(t *testing.T) {
 
 	// 用固定 argv 的探测器串起「执行→解析→选档→渲染」的完整链路。
 	prober := &Prober{run: CommandRunner, argv: []string{echo, "systemd", "255"}}
-	got, err := RenderForHost(context.Background(), validSpec(), prober)
+	got, err := RenderForHost(context.Background(), validSpec(), "", prober)
 	if err != nil {
 		t.Fatalf("RenderForHost 报错: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestRenderForHostUsesProbedVersion(t *testing.T) {
 	spec := validSpec()
 
 	newHost := NewProber(fakeRunner("systemd 255\n+PAM\n", nil, nil))
-	got, err := RenderForHost(context.Background(), spec, newHost)
+	got, err := RenderForHost(context.Background(), spec, "", newHost)
 	if err != nil {
 		t.Fatalf("RenderForHost 报错: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestRenderForHostUsesProbedVersion(t *testing.T) {
 	}
 
 	oldHost := NewProber(fakeRunner("systemd 219\n+PAM\n", nil, nil))
-	got, err = RenderForHost(context.Background(), spec, oldHost)
+	got, err = RenderForHost(context.Background(), spec, "", oldHost)
 	if err != nil {
 		t.Fatalf("RenderForHost 报错: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestRenderForHostUsesProbedVersion(t *testing.T) {
 
 	// 探测失败时渲染必须整体失败，不能退回某个默认档。
 	broken := NewProber(fakeRunner("", errors.New("no systemctl"), nil))
-	if _, err := RenderForHost(context.Background(), spec, broken); err == nil {
+	if _, err := RenderForHost(context.Background(), spec, "", broken); err == nil {
 		t.Fatal("探测失败时不得渲染出任何 unit")
 	}
 }

@@ -11,13 +11,13 @@
 //   - 传给 systemd 与应用的路径永远是规格里的真实路径；RootPath 只重定向 opsd 自己的
 //     文件操作，不参与 unit 文本生成。
 //
-// 未验证声明（仓库约定，未验证必须显式标注）：
+// 验证状态（仓库约定，未验证必须显式标注）：
 //
-//   - legacy unit 档（systemd 219～239）没有在任何真实主机或容器上验证过，
-//     它只有单元测试与规格 §6 的兼容矩阵支撑。
-//   - 真实主机上的重启后 unit 持久化、SELinux/AppArmor、sudoers/PAM 语义未验证。
+//   - legacy unit 档**已在真实的 systemd 219（CentOS 7 / cgroup v1）上验证**（2026-09-24，
+//     118 项通过 / 0 项失败，含重启验证）；232～239 那一段仍无对应版本的主机。
+//   - 真实主机上的重启后 unit 持久化**已验证**；SELinux/AppArmor 与 sudoers/PAM 语义未验证。
 //   - 本包的单元测试跑在 macOS 上：断言的是命令序列、文件内容与权限，不是 systemd 的
-//     实际行为。这些都记为 Linux 容器验证（A7）的内容。
+//     实际行为——真机与容器上的行为由 test/host 与 test/linux 覆盖。
 package systemd
 
 import (
@@ -224,11 +224,11 @@ func (a *Adapter) validateSpec(ctx context.Context, spec *domain.ApplicationSpec
 // Prepare 创建运行用户、目录、环境文件、凭据与 unit，并让 systemd 重新加载与启用。
 // 幂等：重复调用不会重复 useradd、不会重写内容与权限已经正确的文件，
 // 因此重复调用也不会白白触发 daemon-reload。
-func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	if err := a.Validate(ctx, spec); err != nil {
 		return err
 	}
-	unitName := spec.Systemd.UnitName
+	unitName := spec.UnitNameFor(slot)
 
 	// 先解析凭据，再落任何文件：凭据解析失败（SECRET_UNRESOLVED）时不该留下半套产物，
 	// 否则下一次 Prepare 面对的是一个「看起来已经准备好」的目录树。
@@ -243,20 +243,20 @@ func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) err
 	if err != nil {
 		return err
 	}
-	if err := a.ensureDirectories(spec, owner); err != nil {
+	if err := a.ensureDirectories(spec, slot, owner); err != nil {
 		return err
 	}
 	if len(spec.SecretFileNames()) > 0 {
 		// 只有 kind=file 的凭据需要运行用户自己去读。没有它就不要碰共享目录的权限位。
-		if err := a.ensureCredentialReachable(spec, owner); err != nil {
+		if err := a.ensureCredentialReachable(spec, slot, owner); err != nil {
 			return err
 		}
 	}
-	if err := a.writeEnvFiles(spec, secrets, owner); err != nil {
+	if err := a.writeEnvFiles(spec, slot, secrets, owner); err != nil {
 		return err
 	}
 
-	rendered, unitChanged, err := a.writeUnit(ctx, spec)
+	rendered, unitChanged, err := a.writeUnit(ctx, spec, slot)
 	if err != nil {
 		return err
 	}
@@ -272,21 +272,21 @@ func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) err
 		return err
 	}
 
-	a.recordDecision(spec, rendered)
+	a.recordDecision(spec, slot, rendered)
 	return nil
 }
 
 // Start 启动 unit。已在运行时是空操作（幂等）。
-func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	if err := a.Validate(ctx, spec); err != nil {
 		return err
 	}
-	unitName := spec.Systemd.UnitName
-	if err := a.prepared(spec); err != nil {
+	unitName := spec.UnitNameFor(slot)
+	if err := a.prepared(spec, slot); err != nil {
 		return err
 	}
 
-	status, err := a.unitStatus(ctx, spec)
+	status, err := a.unitStatus(ctx, spec, slot)
 	if err != nil {
 		return err
 	}
@@ -301,28 +301,29 @@ func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error
 }
 
 // Stop 停止 unit。未运行时 systemctl stop 本身成功，所以重复调用是幂等的。
-func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	if err := a.validateSpec(ctx, spec); err != nil {
 		return err
 	}
-	if err := a.prepared(spec); err != nil {
+	if err := a.prepared(spec, slot); err != nil {
 		return err
 	}
-	if _, err := a.mustRun(ctx, v1.CodeInternal, systemctlBin, "stop", spec.Systemd.UnitName); err != nil {
+	unitName := spec.UnitNameFor(slot)
+	if _, err := a.mustRun(ctx, v1.CodeInternal, systemctlBin, "stop", unitName); err != nil {
 		return err
 	}
-	a.clearTracking(spec.Systemd.UnitName)
+	a.clearTracking(unitName)
 	return nil
 }
 
 // Status 把 systemd 的 ActiveState 映射成 domain.RuntimeStatus。
 // 认不出来的取值一律落到 unknown，绝不落到 active——把未知状态当成「在运行」会让
 // 上层在应用其实没起来的时候继续往下走。
-func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error) {
+func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeStatus, error) {
 	if err := a.validateSpec(ctx, spec); err != nil {
 		return domain.RuntimeUnknown, err
 	}
-	return a.unitStatus(ctx, spec)
+	return a.unitStatus(ctx, spec, slot)
 }
 
 // Health 返回「能否接流量」。它与 Status 刻意不合并：进程活着不等于已就绪。
@@ -333,14 +334,14 @@ func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec) (dom
 //   - unit 处于 failed、或从本次启动起已超过 startTimeoutSeconds 仍未就绪：
 //     返回 RUNTIME_NOT_READY 硬错误，这是确定性失败，再给快照只会让调用方一直等；
 //   - 探活连续通过 consecutiveSuccesses 次：Ready=true。
-func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeHealth, error) {
+func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeHealth, error) {
 	if err := a.validateSpec(ctx, spec); err != nil {
 		return domain.RuntimeHealth{}, err
 	}
-	unitName := spec.Systemd.UnitName
+	unitName := spec.UnitNameFor(slot)
 	now := a.now()
 
-	status, err := a.unitStatus(ctx, spec)
+	status, err := a.unitStatus(ctx, spec, slot)
 	if err != nil {
 		return domain.RuntimeHealth{}, err
 	}
@@ -351,22 +352,24 @@ func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (dom
 
 	if status != domain.RuntimeActive {
 		a.successes.Reset(unitName)
-		if err := a.startDeadlineExceeded(spec, now, status); err != nil {
+		if err := a.startDeadlineExceeded(spec, slot, now, status); err != nil {
 			return domain.RuntimeHealth{}, err
 		}
 		return domain.RuntimeHealth{CheckedAt: now, Detail: "unit 未在运行（" + string(status) + "）"}, nil
 	}
 
-	ready, detail := readiness.Check(ctx, spec.Health.Readiness, a.probe)
+	// 就绪目标按槽位取：蓝绿的两个槽位听不同端口，探错目标的后果是**把没起来的那一侧
+	// 当成已就绪**——而那正是切流时最不该发生的事。
+	ready, detail := readiness.Check(ctx, spec.ReadinessFor(slot), a.probe)
 	if !ready {
 		a.successes.Reset(unitName)
-		if err := a.startDeadlineExceeded(spec, now, status); err != nil {
+		if err := a.startDeadlineExceeded(spec, slot, now, status); err != nil {
 			return domain.RuntimeHealth{}, err
 		}
 		return domain.RuntimeHealth{CheckedAt: now, Detail: detail}, nil
 	}
 
-	required := spec.Health.Readiness.ConsecutiveSuccesses
+	required := spec.ReadinessFor(slot).ConsecutiveSuccesses
 	count := a.successes.Record(unitName)
 	if count < required {
 		return domain.RuntimeHealth{
@@ -384,8 +387,8 @@ func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (dom
 // 的 systemctl.c 里没有它，v230 起才有），而本适配器承诺支持到 219。在 219～229 的主机上
 // 带 --value 会直接失败，等于把 legacy 档的 Status/Start/Health 一起废掉。
 // 代价是输出多一个 `ActiveState=` 前缀，下面按「有前缀就去掉」解析。
-func (a *Adapter) unitStatus(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error) {
-	unitName := spec.Systemd.UnitName
+func (a *Adapter) unitStatus(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeStatus, error) {
+	unitName := spec.UnitNameFor(slot)
 	result, err := a.runner(ctx, []string{systemctlBin, "show", "-p", "ActiveState", unitName})
 	if err != nil {
 		return domain.RuntimeUnknown, domain.NewError(v1.CodeInternal,
@@ -394,7 +397,7 @@ func (a *Adapter) unitStatus(ctx context.Context, spec *domain.ApplicationSpec) 
 	if result.ExitCode != 0 {
 		// systemctl 对「没有这个 unit」的报错里带本地化文案，靠 stderr 判断语言相关、
 		// 不可靠；这里用我们自己掌握的证据：unit 文件不存在，就没有在运行的东西。
-		if exists, statErr := a.unitFileExists(spec); statErr == nil && !exists {
+		if exists, statErr := a.unitFileExists(spec, slot); statErr == nil && !exists {
 			return domain.RuntimeInactive, nil
 		}
 		return domain.RuntimeUnknown, domain.NewError(v1.CodeInternal,
@@ -431,8 +434,8 @@ func parseActiveState(stdout string) string {
 // 的 unit 生效：一个已经就绪过的应用偶发探活失败，不该被误判成启动失败。
 // opsd 重启后内存里没有启动时刻，这条判定就不再触发——这是刻意留下的缺口，
 // 因为唯一可靠的替代来源（systemd 的 ActiveEnterTimestamp）解析起来不可测且与本地化有关。
-func (a *Adapter) startDeadlineExceeded(spec *domain.ApplicationSpec, now time.Time, status domain.RuntimeStatus) error {
-	unitName := spec.Systemd.UnitName
+func (a *Adapter) startDeadlineExceeded(spec *domain.ApplicationSpec, slot domain.Slot, now time.Time, status domain.RuntimeStatus) error {
+	unitName := spec.UnitNameFor(slot)
 	a.mu.Lock()
 	startedAt, started := a.startedAt[unitName]
 	readyOnce := a.becameReady[unitName]
@@ -506,18 +509,19 @@ func (a *Adapter) detectVersion(ctx context.Context) (int, error) {
 	return version, nil
 }
 
-func (a *Adapter) recordDecision(spec *domain.ApplicationSpec, rendered unitfile.Rendered) {
+func (a *Adapter) recordDecision(spec *domain.ApplicationSpec, slot domain.Slot, rendered unitfile.Rendered) {
+	unitName := spec.UnitNameFor(slot)
 	decision := UnitDecision{
 		Application:    spec.Application,
-		UnitName:       spec.Systemd.UnitName,
-		UnitPath:       domain.UnitPath(spec.Systemd.UnitName),
+		UnitName:       unitName,
+		UnitPath:       domain.UnitPath(unitName),
 		Tier:           rendered.Tier,
 		SystemdVersion: rendered.SystemdVersion,
 		Degradations:   rendered.Degradations,
 		DecidedAt:      a.now(),
 	}
 	a.mu.Lock()
-	a.decisions[spec.Systemd.UnitName] = decision
+	a.decisions[unitName] = decision
 	a.mu.Unlock()
 
 	// 日志里只放档位、版本、unit 路径与降级说明，没有任何凭据值。

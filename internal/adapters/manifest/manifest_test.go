@@ -472,7 +472,7 @@ func TestRenderUnitResolvesRelativeArgv(t *testing.T) {
 		"  argv: [bin/billing-api, --config, /etc/billing-api/config.yaml]", 1)
 	spec := mustParse(t, text)
 
-	rendered, err := unitfile.RenderUnit(spec, unitfile.TierStrict, 255)
+	rendered, err := unitfile.RenderUnit(spec, "", unitfile.TierStrict, 255)
 	if err != nil {
 		t.Fatalf("RenderUnit: %v", err)
 	}

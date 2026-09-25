@@ -190,6 +190,82 @@ func ManagedNginxFile(confDir, application string) string {
 	return path.Join(ManagedNginxDir(confDir), application+".conf")
 }
 
+// InSlotTree 报告 candidate 是否落在某个槽位目录的**内部**（槽位目录自身不算）。
+//
+// 与 InReleaseTree 是同一条分工的两半：槽位目录本身是运行时适配器建的容器目录
+// （unit 的 ReadWritePaths= 可能指着它，路径不存在会让 systemd 的命名空间设置失败），
+// 而它**里面**唯一常驻的东西是 `current` 指针——那个归 ReleaseAdapter 写。
+// 少了这条判断，`exec.workingDirectory` 写成槽位的 `current` 时就会被 Prepare 建成
+// 一个实体目录，紧接着的符号链接切换以「改名失败」收场（迭代 3c 在 releases 树里
+// 踩过同一个坑，这里是它换了个位置）。
+func InSlotTree(application, candidate string) bool {
+	cleaned := path.Clean(candidate)
+	for _, slot := range Slots {
+		root := SlotDir(application, slot)
+		if cleaned != root && strings.HasPrefix(cleaned, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// ==== 按槽位取路径 ====
+//
+// 这四个 `*For` 是**单槽与蓝绿共用的取值入口**：单槽传空槽位就得到 1c 起就在用的那些路径，
+// 蓝绿传槽位就得到该槽位自己的文件。unit 渲染、环境文件写入、凭据落盘、断言四处都走它们——
+// 每一处各自判断一次「是不是蓝绿」，迟早会出现「unit 指向槽位 A 的文件、写入写到槽位 B」。
+
+// EnvFilePathFor 返回该槽位的非敏感环境文件路径。
+func EnvFilePathFor(application string, slot Slot) string {
+	if slot == "" {
+		return EnvFilePath(application)
+	}
+	return SlotEnvFilePath(application, slot)
+}
+
+// SecretsEnvFilePathFor 返回该槽位的敏感环境文件路径。
+func SecretsEnvFilePathFor(application string, slot Slot) string {
+	if slot == "" {
+		return SecretsEnvFilePath(application)
+	}
+	return SlotSecretsEnvFilePath(application, slot)
+}
+
+// SecretsDirFor 返回该槽位存放 kind=file 凭据副本的目录。
+func SecretsDirFor(application string, slot Slot) string {
+	if slot == "" {
+		return SecretsDir(application)
+	}
+	return SlotSecretsDir(application, slot)
+}
+
+// SecretFileVarValueFor 是 kind=file 的凭据在该槽位环境里承载的值（文件路径）。
+func SecretFileVarValueFor(application string, slot Slot, name string) string {
+	if slot == "" {
+		return SecretFileVarValue(application, name)
+	}
+	return SlotSecretFileVarValue(application, slot, name)
+}
+
+// UnitNameFor 返回该应用在某个槽位上的 unit 名。
+//
+// 单槽用规格里声明的名字（1c 起就允许显式声明）；蓝绿**必须**用派生的名字，
+// 手写在 domain 的校验里已经被拒（见 validateBlueGreen）。
+func (s *ApplicationSpec) UnitNameFor(slot Slot) string {
+	if slot == "" {
+		return s.Systemd.UnitName
+	}
+	return SlotUnitName(s.Application, slot)
+}
+
+// ReadinessFor 返回该槽位的就绪规格：单槽取 health.readiness，蓝绿取该槽位自己声明的。
+func (s *ApplicationSpec) ReadinessFor(slot Slot) SpecReadiness {
+	if slot == "" {
+		return s.Health.Readiness
+	}
+	return s.Exec.Slots[slot].Readiness
+}
+
 // ==== 校验 ====
 
 // validateSlots 校验蓝绿形态的槽位声明。全部返回 MANIFEST_INVALID。

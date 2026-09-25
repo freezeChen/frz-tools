@@ -120,15 +120,30 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		if s.runtime == nil {
 			return nil, false, errRuntimeUnsupported()
 		}
-		resolved, err := s.runtime.ResolveRuntimeOperation(ctx, req.Kind, req.Resource)
+		var options v1.RuntimeOpSpec
+		if len(req.Spec) > 0 {
+			if err := json.Unmarshal(req.Spec, &options); err != nil {
+				return nil, false, domain.NewError(v1.CodeInvalidRequest,
+					"%s 的参数无法解析: %v", req.Kind, err)
+			}
+		}
+		resolved, slot, err := s.runtime.ResolveRuntimeOperation(ctx, req.Kind, req.Resource, options.Slot)
 		if err != nil {
 			return nil, false, err
 		}
-		// 资源规范成应用 ID：同一个应用无论用名称还是 ID 提交，都命中同一把锁；
-		// op.Spec 留空，执行时以「应用的当前规格」为准（与 spec put 的语义一致），
-		// 因此重试 runtime.start 用的是最新 manifest，而不是创建时的快照。
+		// 资源规范成应用 ID：同一个应用无论用名称还是 ID 提交，都命中同一把锁。
+		// op.Spec **只**承载槽位（见 v1.RuntimeOpSpec）：应用的规格仍在执行时现读
+		// （与 spec put 的语义一致），因此重试 runtime.start 用的是最新 manifest；
+		// 而槽位推不出来，必须随操作存下来。
 		resource = resolved
 		specJSON = nil
+		if slot != "" {
+			encoded, err := json.Marshal(v1.RuntimeOpSpec{Slot: string(slot)})
+			if err != nil {
+				return nil, false, domain.NewError(v1.CodeInternal, "无法序列化操作参数: %v", err)
+			}
+			specJSON = encoded
+		}
 	} else if isBackupKind(req.Kind) {
 		if req.DryRun {
 			// 与 runtime.* 同样的理由：适配器端口没有 dry-run 语义。备份的预演请用

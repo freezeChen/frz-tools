@@ -59,7 +59,7 @@ func newRuntimeValidateCommand(opts *rootOptions) *cobra.Command {
 }
 
 func newRuntimePrepareCommand(opts *rootOptions) *cobra.Command {
-	var app string
+	var app, slot string
 
 	cmd := &cobra.Command{
 		Use:   "prepare --app <name>",
@@ -69,7 +69,7 @@ func newRuntimePrepareCommand(opts *rootOptions) *cobra.Command {
 			if err := requireApp(app); err != nil {
 				return err
 			}
-			result, err := opts.client().PrepareRuntime(cmd.Context(), app)
+			result, err := opts.client().PrepareRuntime(cmd.Context(), app, slot)
 			if err != nil {
 				return err
 			}
@@ -83,6 +83,7 @@ func newRuntimePrepareCommand(opts *rootOptions) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&app, "app", "", "应用名称或 ID")
+	cmd.Flags().StringVar(&slot, "slot", "", slotFlagHelp)
 	return cmd
 }
 
@@ -115,7 +116,7 @@ func newRuntimeStopCommand(opts *rootOptions) *cobra.Command {
 }
 
 func newRuntimeHealthCommand(opts *rootOptions) *cobra.Command {
-	var app string
+	var app, slot string
 
 	cmd := &cobra.Command{
 		Use:   "health --app <name>",
@@ -125,7 +126,7 @@ func newRuntimeHealthCommand(opts *rootOptions) *cobra.Command {
 			if err := requireApp(app); err != nil {
 				return err
 			}
-			health, err := opts.client().RuntimeHealth(cmd.Context(), app)
+			health, err := opts.client().RuntimeHealth(cmd.Context(), app, slot)
 			if err != nil {
 				return err
 			}
@@ -148,11 +149,14 @@ func newRuntimeHealthCommand(opts *rootOptions) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&app, "app", "", "应用名称或 ID")
+	cmd.Flags().StringVar(&slot, "slot", "", slotFlagHelp)
 	return cmd
 }
 
 type runtimeActionFlags struct {
-	app            string
+	app string
+	// slot 是操作打在哪一侧（迭代 4 的蓝绿）：蓝绿应用必填，单槽应用不能给。
+	slot           string
 	idempotencyKey string
 	createdBy      string
 	retryMax       int
@@ -162,6 +166,7 @@ type runtimeActionFlags struct {
 
 func (f *runtimeActionFlags) bind(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&f.app, "app", "", "应用名称或 ID")
+	cmd.Flags().StringVar(&f.slot, "slot", "", slotFlagHelp)
 	cmd.Flags().StringVar(&f.idempotencyKey, "idempotency-key", "", "幂等键：相同请求重复提交会返回同一个操作")
 	cmd.Flags().StringVar(&f.createdBy, "created-by", "", "调用方标识")
 	cmd.Flags().IntVar(&f.retryMax, "retry-max", 0,
@@ -203,6 +208,7 @@ func runRuntimeAction(cmd *cobra.Command, opts *rootOptions, kind string, flags 
 		return err
 	}
 	in := client.RuntimeActionInput{
+		Slot:           flags.slot,
 		IdempotencyKey: flags.idempotencyKey,
 		CreatedBy:      flags.createdBy,
 		Retry:          retry,
@@ -255,3 +261,7 @@ func printRuntimeDecision(decision *v1.RuntimeDecision) {
 		fmt.Printf("降级:     %s\n", degradation)
 	}
 }
+
+// slotFlagHelp 是 --slot 的统一说明。蓝绿应用与单槽应用的要求刚好相反，
+// 因此这句话在四处（prepare/health/start/stop）逐字相同——分开写迟早会不一致。
+const slotFlagHelp = "槽位（blue 或 green）：蓝绿应用必填，单槽应用不能给"

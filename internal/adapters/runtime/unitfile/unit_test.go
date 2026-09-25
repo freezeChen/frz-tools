@@ -132,7 +132,7 @@ func directiveLines(content string) string {
 
 func TestRenderUnitStrictTier(t *testing.T) {
 	spec := validSpec()
-	got, err := RenderUnit(spec, TierStrict, 255)
+	got, err := RenderUnit(spec, "", TierStrict, 255)
 	if err != nil {
 		t.Fatalf("RenderUnit(strict) 报错: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestRenderUnitStrictTier(t *testing.T) {
 
 func TestRenderUnitLegacyTier(t *testing.T) {
 	spec := validSpec()
-	got, err := RenderUnit(spec, TierLegacy, 239)
+	got, err := RenderUnit(spec, "", TierLegacy, 239)
 	if err != nil {
 		t.Fatalf("RenderUnit(legacy) 报错: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestRenderUnitHeaderRecordsProbedVersionAndTier(t *testing.T) {
 		{version: 239, tier: TierLegacy, wantLine: "# systemd 版本=239 档位=legacy\n"},
 		{version: 219, tier: TierLegacy, wantLine: "# systemd 版本=219 档位=legacy\n"},
 	} {
-		got, err := RenderUnit(validSpec(), tc.tier, tc.version)
+		got, err := RenderUnit(validSpec(), "", tc.tier, tc.version)
 		if err != nil {
 			t.Fatalf("RenderUnit(%s, %d) 报错: %v", tc.tier, tc.version, err)
 		}
@@ -223,7 +223,7 @@ func TestRenderUnitEscapesExecStartArguments(t *testing.T) {
 		"--mode='prod'",
 	}
 
-	got, err := RenderUnit(spec, TierStrict, 255)
+	got, err := RenderUnit(spec, "", TierStrict, 255)
 	if err != nil {
 		t.Fatalf("RenderUnit 报错: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestRenderUnitEscapesExecStartArguments(t *testing.T) {
 	// 空参数在 domain 层被拒绝（exec.argv 不允许空字符串），
 	// 因此渲染层不会静默产出 `""`；这个边界由 escape_test.go 的 EscapeArgs 用例钉住。
 	spec.Exec.Argv = []string{"/opt/opsd/apps/orders-api/bin/start", ""}
-	if _, err := RenderUnit(spec, TierStrict, 255); err == nil {
+	if _, err := RenderUnit(spec, "", TierStrict, 255); err == nil {
 		t.Fatal("含空参数的非法规格必须被拒绝")
 	} else if code := domain.CodeOf(err); code != v1.CodeManifestInvalid {
 		t.Fatalf("错误码不对: %s", code)
@@ -254,19 +254,19 @@ func TestRenderUnitEscapesExecStartArguments(t *testing.T) {
 
 // 同一输入必须字节一致：Prepare 是幂等的，unit 内容抖动会导致无意义的 daemon-reload 与重启。
 func TestRenderUnitIsDeterministic(t *testing.T) {
-	first, err := RenderUnit(validSpec(), TierStrict, 255)
+	first, err := RenderUnit(validSpec(), "", TierStrict, 255)
 	if err != nil {
 		t.Fatalf("RenderUnit 报错: %v", err)
 	}
 	for i := 0; i < 8; i++ {
-		again, err := RenderUnit(validSpec(), TierLegacy, 239)
+		again, err := RenderUnit(validSpec(), "", TierLegacy, 239)
 		if err != nil {
 			t.Fatalf("RenderUnit 报错: %v", err)
 		}
 		if again.Content != legacyUnit {
 			t.Fatalf("第 %d 次渲染不稳定:\n%s", i, again.Content)
 		}
-		same, err := RenderUnit(validSpec(), TierStrict, 255)
+		same, err := RenderUnit(validSpec(), "", TierStrict, 255)
 		if err != nil {
 			t.Fatalf("RenderUnit 报错: %v", err)
 		}
@@ -277,18 +277,18 @@ func TestRenderUnitIsDeterministic(t *testing.T) {
 }
 
 func TestRenderUnitRejectsTierVersionMismatch(t *testing.T) {
-	if _, err := RenderUnit(validSpec(), TierLegacy, 255); err == nil {
+	if _, err := RenderUnit(validSpec(), "", TierLegacy, 255); err == nil {
 		t.Fatal("版本 255 却按 legacy 渲染必须被拒绝")
 	} else if code := domain.CodeOf(err); code != v1.CodeManifestInvalid {
 		t.Fatalf("错误码不对: %s", code)
 	}
-	if _, err := RenderUnit(validSpec(), TierStrict, 219); err == nil {
+	if _, err := RenderUnit(validSpec(), "", TierStrict, 219); err == nil {
 		t.Fatal("版本 219 却按 strict 渲染必须被拒绝")
 	}
-	if _, err := RenderUnit(validSpec(), Tier("unknown"), 255); err == nil {
+	if _, err := RenderUnit(validSpec(), "", Tier("unknown"), 255); err == nil {
 		t.Fatal("未知档位必须被拒绝")
 	}
-	if _, err := RenderUnit(nil, TierStrict, 255); err == nil {
+	if _, err := RenderUnit(nil, "", TierStrict, 255); err == nil {
 		t.Fatal("空规格必须被拒绝")
 	}
 }
@@ -313,7 +313,7 @@ func TestRenderUnitRejectsPathsThatBreakUnitSyntax(t *testing.T) {
 	for name, mutate := range cases {
 		spec := validSpec()
 		mutate(spec)
-		_, err := RenderUnit(spec, TierStrict, 255)
+		_, err := RenderUnit(spec, "", TierStrict, 255)
 		if err == nil {
 			t.Fatalf("%s: 必须被拒绝", name)
 		}
@@ -326,7 +326,7 @@ func TestRenderUnitRejectsPathsThatBreakUnitSyntax(t *testing.T) {
 func TestRenderUnitRejectsSubSecondTimeouts(t *testing.T) {
 	spec := validSpec()
 	spec.Health.StartTimeout = 1500 * time.Millisecond
-	if _, err := RenderUnit(spec, TierStrict, 255); err == nil {
+	if _, err := RenderUnit(spec, "", TierStrict, 255); err == nil {
 		t.Fatal("亚秒超时必须报错而不是截断")
 	}
 }
@@ -381,21 +381,21 @@ func TestTierValid(t *testing.T) {
 }
 
 func TestRenderForVersionPicksTierFromVersion(t *testing.T) {
-	strict, err := RenderForVersion(validSpec(), 255)
+	strict, err := RenderForVersion(validSpec(), "", 255)
 	if err != nil {
 		t.Fatalf("RenderForVersion(255) 报错: %v", err)
 	}
 	if strict.Content != strictUnit {
 		t.Fatalf("255 应走 strict 档:\n%s", strict.Content)
 	}
-	legacy, err := RenderForVersion(validSpec(), 219)
+	legacy, err := RenderForVersion(validSpec(), "", 219)
 	if err != nil {
 		t.Fatalf("RenderForVersion(219) 报错: %v", err)
 	}
 	if !strings.Contains(legacy.Content, "ProtectSystem=yes\n") {
 		t.Fatalf("219 应走 legacy 档:\n%s", legacy.Content)
 	}
-	if _, err := RenderForVersion(validSpec(), 218); err == nil {
+	if _, err := RenderForVersion(validSpec(), "", 218); err == nil {
 		t.Fatal("218 必须报错")
 	}
 }
@@ -408,7 +408,7 @@ func TestRenderUnitResources(t *testing.T) {
 	spec := validSpec()
 	spec.Resources = domain.SpecResources{CPUQuotaPercent: 200, MemoryMaxBytes: 536870912}
 
-	got, err := RenderUnit(spec, TierStrict, 255)
+	got, err := RenderUnit(spec, "", TierStrict, 255)
 	if err != nil {
 		t.Fatalf("RenderUnit: %v", err)
 	}
@@ -431,7 +431,7 @@ func TestRenderUnitResources(t *testing.T) {
 // 我们没有在真机上验证过，而「不写」的语义是确定的。
 func TestRenderUnitOmitsResourcesWhenUnlimited(t *testing.T) {
 	spec := validSpec() // Resources 全 0
-	got, err := RenderUnit(spec, TierStrict, 255)
+	got, err := RenderUnit(spec, "", TierStrict, 255)
 	if err != nil {
 		t.Fatalf("RenderUnit: %v", err)
 	}
@@ -452,7 +452,7 @@ func TestRenderUnitLegacyUsesMemoryLimit(t *testing.T) {
 	spec := validSpec()
 	spec.Resources = domain.SpecResources{CPUQuotaPercent: 200, MemoryMaxBytes: 536870912}
 
-	got, err := RenderUnit(spec, TierLegacy, 219)
+	got, err := RenderUnit(spec, "", TierLegacy, 219)
 	if err != nil {
 		t.Fatalf("legacy 档表达内存上限不应当报错: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestRenderUnitLegacyUsesMemoryLimit(t *testing.T) {
 		t.Fatalf("legacy 档应当渲染 CPUQuota=:\n%s", got.Content)
 	}
 	// strict 档用现代的拼法，不受影响。
-	strict, err := RenderUnit(spec, TierStrict, 255)
+	strict, err := RenderUnit(spec, "", TierStrict, 255)
 	if err != nil {
 		t.Fatalf("strict 档: %v", err)
 	}

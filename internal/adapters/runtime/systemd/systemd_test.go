@@ -140,7 +140,7 @@ func TestPrepareCommandSequenceIsIdempotent(t *testing.T) {
 	spec := specFixture(t, "orders")
 	ctx := context.Background()
 
-	mustRun(t, h.adapter.Prepare(ctx, spec))
+	mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 	assertCommands(t, h.host.takeCommands(), [][]string{
 		{"systemctl", "--version"},
 		{"id", "-u", "appuser"},
@@ -151,7 +151,7 @@ func TestPrepareCommandSequenceIsIdempotent(t *testing.T) {
 
 	// 第二次：不重复 useradd；文件内容与权限已经正确，因此也不重写、不重新 daemon-reload。
 	// enable 仍然执行：它幂等，且「上一次写完 unit 但 enable 失败」只能靠重跑修好。
-	mustRun(t, h.adapter.Prepare(ctx, spec))
+	mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 	assertCommands(t, h.host.takeCommands(), [][]string{
 		{"id", "-u", "appuser"},
 		{"systemctl", "enable", "orders.service"},
@@ -162,7 +162,7 @@ func TestPrepareDoesNotTouchExistingUser(t *testing.T) {
 	h := newHarness(t)
 	h.host.users["appuser"] = true
 
-	mustRun(t, h.adapter.Prepare(context.Background(), specFixture(t, "existing")))
+	mustRun(t, h.adapter.Prepare(context.Background(), specFixture(t, "existing"), ""))
 
 	for _, argv := range h.host.takeCommands() {
 		if argv[0] == "useradd" {
@@ -174,7 +174,7 @@ func TestPrepareDoesNotTouchExistingUser(t *testing.T) {
 func TestPrepareWritesFilesWithExpectedModesAndOwners(t *testing.T) {
 	h := newHarness(t)
 	spec := specFixture(t, "orders")
-	mustRun(t, h.adapter.Prepare(context.Background(), spec))
+	mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 
 	for path, want := range map[string]struct {
 		mode    os.FileMode
@@ -242,7 +242,7 @@ func TestPrepareFailsWhenOwnerCannotBeApplied(t *testing.T) {
 		systemd.WithOwnerResolver(func(string) (int, int, error) { return 0, 0, nil }),
 	)
 
-	err := h.adapter.Prepare(context.Background(), specFixture(t, "owned"))
+	err := h.adapter.Prepare(context.Background(), specFixture(t, "owned"), "")
 	if err == nil {
 		t.Fatal("无法设置属主时必须报错，否则会留下一批 root 属主的应用文件")
 	}
@@ -260,7 +260,7 @@ func TestPrepareRejectsMultilineEnvSecret(t *testing.T) {
 	}}, systemd.WithRunner(h.host.run), systemd.WithGOOS("linux"),
 		systemd.WithOwnerResolver(currentOwner))
 
-	err := h.adapter.Prepare(context.Background(), specFixture(t, "multiline"))
+	err := h.adapter.Prepare(context.Background(), specFixture(t, "multiline"), "")
 	if domain.CodeOf(err) != v1.CodeSecretUnresolved {
 		t.Fatalf("want SECRET_UNRESOLVED, got %v", err)
 	}
@@ -285,7 +285,7 @@ func TestPrepareDeliversMultilineFileSecret(t *testing.T) {
 	h.adapter = systemd.New(h.root, &stubResolver{values: map[string]string{"file:/etc/opsd/secrets/tls.key": pem}},
 		systemd.WithRunner(h.host.run), systemd.WithGOOS("linux"), systemd.WithOwnerResolver(currentOwner))
 
-	mustRun(t, h.adapter.Prepare(context.Background(), spec))
+	mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 
 	assertFile(t, h.adapter.RootPath(filepath.Join(domain.SecretsDir("pem"), "TLS_KEY")), 0o600, pem, h.uid, h.gid)
 	// 环境变量里传的是路径，不是内容。
@@ -297,17 +297,17 @@ func TestStartStopIssueSystemctlCommands(t *testing.T) {
 	h := newHarness(t)
 	spec := specFixture(t, "orders")
 	ctx := context.Background()
-	mustRun(t, h.adapter.Prepare(ctx, spec))
+	mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 	h.host.takeCommands()
 
-	mustRun(t, h.adapter.Start(ctx, spec))
+	mustRun(t, h.adapter.Start(ctx, spec, ""))
 	// Start 先问状态再启动：已经 active 的 unit 不该被再 start 一次。
 	assertCommands(t, h.host.takeCommands(), [][]string{
 		{"systemctl", "show", "-p", "ActiveState", "orders.service"},
 		{"systemctl", "start", "orders.service"},
 	})
 
-	status, err := h.adapter.Status(ctx, spec)
+	status, err := h.adapter.Status(ctx, spec, "")
 	mustRun(t, err)
 	if status != domain.RuntimeActive {
 		t.Fatalf("want active, got %s", status)
@@ -317,16 +317,16 @@ func TestStartStopIssueSystemctlCommands(t *testing.T) {
 	})
 
 	// 重复 Start：只查询、不重复启动。
-	mustRun(t, h.adapter.Start(ctx, spec))
+	mustRun(t, h.adapter.Start(ctx, spec, ""))
 	assertCommands(t, h.host.takeCommands(), [][]string{
 		{"systemctl", "show", "-p", "ActiveState", "orders.service"},
 	})
 
-	mustRun(t, h.adapter.Stop(ctx, spec))
+	mustRun(t, h.adapter.Stop(ctx, spec, ""))
 	assertCommands(t, h.host.takeCommands(), [][]string{
 		{"systemctl", "stop", "orders.service"},
 	})
-	status, err = h.adapter.Status(ctx, spec)
+	status, err = h.adapter.Status(ctx, spec, "")
 	mustRun(t, err)
 	if status != domain.RuntimeInactive {
 		t.Fatalf("want inactive, got %s", status)
@@ -337,7 +337,7 @@ func TestStartRequiresPrepare(t *testing.T) {
 	h := newHarness(t)
 	spec := specFixture(t, "unprepared")
 
-	err := h.adapter.Start(context.Background(), spec)
+	err := h.adapter.Start(context.Background(), spec, "")
 	if domain.CodeOf(err) != v1.CodeRuntimeNotReady {
 		t.Fatalf("want RUNTIME_NOT_READY, got %v", err)
 	}
@@ -377,10 +377,10 @@ func TestStatusMapsActiveState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 			spec := specFixture(t, "status")
-			mustRun(t, h.adapter.Prepare(context.Background(), spec))
+			mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 			h.host.showOverride = &systemd.Result{Stdout: tc.stdout}
 
-			status, err := h.adapter.Status(context.Background(), spec)
+			status, err := h.adapter.Status(context.Background(), spec, "")
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("必须报错，却得到 %s", status)
@@ -402,7 +402,7 @@ func TestStatusFailurePaths(t *testing.T) {
 	t.Run("unit 未安装时是不在运行", func(t *testing.T) {
 		h := newHarness(t)
 		// 假主机的 show 对不存在的 unit 返回「找不到」，与真机一致。
-		status, err := h.adapter.Status(context.Background(), specFixture(t, "missing"))
+		status, err := h.adapter.Status(context.Background(), specFixture(t, "missing"), "")
 		mustRun(t, err)
 		if status != domain.RuntimeInactive {
 			t.Fatalf("want inactive, got %s", status)
@@ -412,10 +412,10 @@ func TestStatusFailurePaths(t *testing.T) {
 	t.Run("unit 已安装但查询失败是错误", func(t *testing.T) {
 		h := newHarness(t)
 		spec := specFixture(t, "broken")
-		mustRun(t, h.adapter.Prepare(context.Background(), spec))
+		mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 		h.host.showOverride = &systemd.Result{ExitCode: 4, Stderr: "transport endpoint is not connected"}
 
-		_, err := h.adapter.Status(context.Background(), spec)
+		_, err := h.adapter.Status(context.Background(), spec, "")
 		if domain.CodeOf(err) != v1.CodeInternal {
 			t.Fatalf("want INTERNAL, got %v", err)
 		}
@@ -427,10 +427,10 @@ func TestStatusFailurePaths(t *testing.T) {
 	t.Run("命令无法执行是错误", func(t *testing.T) {
 		h := newHarness(t)
 		spec := specFixture(t, "noexec")
-		mustRun(t, h.adapter.Prepare(context.Background(), spec))
+		mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 		h.host.runnerErr = errBoom
 
-		_, err := h.adapter.Status(context.Background(), spec)
+		_, err := h.adapter.Status(context.Background(), spec, "")
 		if domain.CodeOf(err) != v1.CodeInternal {
 			t.Fatalf("want INTERNAL, got %v", err)
 		}
@@ -443,9 +443,9 @@ func TestHealthLifecycle(t *testing.T) {
 	t.Run("未启动时返回不就绪快照而不是错误", func(t *testing.T) {
 		h := newHarness(t)
 		spec := specFixture(t, "idle")
-		mustRun(t, h.adapter.Prepare(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 
-		health, err := h.adapter.Health(ctx, spec)
+		health, err := h.adapter.Health(ctx, spec, "")
 		mustRun(t, err)
 		if health.Ready {
 			t.Fatal("未启动不得报告就绪")
@@ -458,10 +458,10 @@ func TestHealthLifecycle(t *testing.T) {
 	t.Run("failed 是硬错误", func(t *testing.T) {
 		h := newHarness(t)
 		spec := specFixture(t, "failed")
-		mustRun(t, h.adapter.Prepare(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 		h.host.setState(spec.Systemd.UnitName, domain.RuntimeFailed)
 
-		_, err := h.adapter.Health(ctx, spec)
+		_, err := h.adapter.Health(ctx, spec, "")
 		if domain.CodeOf(err) != v1.CodeRuntimeNotReady {
 			t.Fatalf("want RUNTIME_NOT_READY, got %v", err)
 		}
@@ -473,10 +473,10 @@ func TestHealthLifecycle(t *testing.T) {
 		spec.Health.Readiness.ConsecutiveSuccesses = 2
 		stop := serveTCP(t, spec)
 		defer stop()
-		mustRun(t, h.adapter.Prepare(ctx, spec))
-		mustRun(t, h.adapter.Start(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
+		mustRun(t, h.adapter.Start(ctx, spec, ""))
 
-		health, err := h.adapter.Health(ctx, spec)
+		health, err := h.adapter.Health(ctx, spec, "")
 		mustRun(t, err)
 		if health.Ready {
 			t.Fatalf("只通过 1 次就报就绪，detail=%q", health.Detail)
@@ -485,7 +485,7 @@ func TestHealthLifecycle(t *testing.T) {
 			t.Fatalf("detail 应当说明进度，got %q", health.Detail)
 		}
 
-		health, err = h.adapter.Health(ctx, spec)
+		health, err = h.adapter.Health(ctx, spec, "")
 		mustRun(t, err)
 		if !health.Ready {
 			t.Fatalf("连续通过 2 次后必须报就绪，detail=%q", health.Detail)
@@ -495,10 +495,10 @@ func TestHealthLifecycle(t *testing.T) {
 	t.Run("就绪目标不可达时不报就绪", func(t *testing.T) {
 		h := newHarness(t)
 		spec := specFixture(t, "unready") // 127.0.0.1:1 上没有人监听
-		mustRun(t, h.adapter.Prepare(ctx, spec))
-		mustRun(t, h.adapter.Start(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
+		mustRun(t, h.adapter.Start(ctx, spec, ""))
 
-		health, err := h.adapter.Health(ctx, spec)
+		health, err := h.adapter.Health(ctx, spec, "")
 		mustRun(t, err)
 		if health.Ready {
 			t.Fatal("就绪目标不可达时不得报告就绪")
@@ -537,11 +537,11 @@ func TestHealthLifecycle(t *testing.T) {
 			Target:               "http://" + listener.Addr().String() + "/healthz",
 			ConsecutiveSuccesses: 1,
 		}
-		mustRun(t, h.adapter.Prepare(ctx, spec))
-		mustRun(t, h.adapter.Start(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
+		mustRun(t, h.adapter.Start(ctx, spec, ""))
 
 		started := time.Now()
-		health, err := h.adapter.Health(ctx, spec)
+		health, err := h.adapter.Health(ctx, spec, "")
 		elapsed := time.Since(started)
 		mustRun(t, err)
 		if health.Ready {
@@ -558,18 +558,18 @@ func TestHealthLifecycle(t *testing.T) {
 	t.Run("超过 startTimeoutSeconds 仍未就绪是硬错误", func(t *testing.T) {
 		h := newHarness(t)
 		spec := specFixture(t, "timeout")
-		mustRun(t, h.adapter.Prepare(ctx, spec))
-		mustRun(t, h.adapter.Start(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
+		mustRun(t, h.adapter.Start(ctx, spec, ""))
 
 		// 预算内：快照，不是错误。
-		health, err := h.adapter.Health(ctx, spec)
+		health, err := h.adapter.Health(ctx, spec, "")
 		mustRun(t, err)
 		if health.Ready {
 			t.Fatal("探测不通过时不得报告就绪")
 		}
 
 		h.advance(spec.Health.StartTimeout + time.Second)
-		_, err = h.adapter.Health(ctx, spec)
+		_, err = h.adapter.Health(ctx, spec, "")
 		if domain.CodeOf(err) != v1.CodeRuntimeNotReady {
 			t.Fatalf("启动超时必须报 RUNTIME_NOT_READY, got %v", err)
 		}
@@ -585,7 +585,7 @@ func TestDecisionIsRecordedInLogAndMemory(t *testing.T) {
 	t.Run("新档主机", func(t *testing.T) {
 		h := newHarness(t)
 		spec := specFixture(t, "audit-new")
-		mustRun(t, h.adapter.Prepare(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 
 		decision, ok := h.adapter.UnitDecision("audit-new.service")
 		if !ok {
@@ -616,7 +616,7 @@ func TestDecisionIsRecordedInLogAndMemory(t *testing.T) {
 		h := newHarness(t)
 		h.host.versionOutput = "systemd 219\n+PAM +AUDIT\n"
 		spec := specFixture(t, "audit-old")
-		mustRun(t, h.adapter.Prepare(ctx, spec))
+		mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 
 		decision, _ := h.adapter.UnitDecision("audit-old.service")
 		if decision.SystemdVersion != 219 || decision.Tier != unitfile.TierLegacy {
@@ -658,7 +658,7 @@ func TestPrepareConvergesPreExistingPermissions(t *testing.T) {
 	mustRun(t, os.MkdirAll(filepath.Dir(envPath), 0o755))
 	mustRun(t, os.WriteFile(envPath, []byte("STALE=1\n"), 0o644))
 
-	mustRun(t, h.adapter.Prepare(ctx, spec))
+	mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 
 	for path, want := range map[string]os.FileMode{
 		spec.Exec.WorkingDirectory:         0o750,
@@ -680,7 +680,7 @@ func TestPrepareCreatesTraversableAncestorsRegardlessOfUmask(t *testing.T) {
 
 	h := newHarness(t)
 	spec := specFixture(t, "umask")
-	mustRun(t, h.adapter.Prepare(context.Background(), spec))
+	mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 
 	for _, path := range []string{
 		"/etc/opsd",
@@ -709,7 +709,7 @@ func TestPrepareDoesNotRewriteUnchangedFiles(t *testing.T) {
 	h := newHarness(t)
 	spec := specFixture(t, "stable")
 	ctx := context.Background()
-	mustRun(t, h.adapter.Prepare(ctx, spec))
+	mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 
 	watched := []string{
 		h.adapter.RootPath(domain.UnitPath(spec.Systemd.UnitName)),
@@ -724,7 +724,7 @@ func TestPrepareDoesNotRewriteUnchangedFiles(t *testing.T) {
 		before[path] = info
 	}
 
-	mustRun(t, h.adapter.Prepare(ctx, spec))
+	mustRun(t, h.adapter.Prepare(ctx, spec, ""))
 
 	for _, path := range watched {
 		info, err := os.Stat(path)
@@ -741,7 +741,7 @@ func TestPrepareDoesNotRewriteUnchangedFiles(t *testing.T) {
 func TestCredentialPathIsReachableByRunUser(t *testing.T) {
 	h := newHarness(t)
 	spec := specFixture(t, "creds")
-	mustRun(t, h.adapter.Prepare(context.Background(), spec))
+	mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 
 	// 过路目录：必须对 other 开放 +x（可穿越），且不需要读位。
 	for path, wantMode := range map[string]os.FileMode{
@@ -793,7 +793,7 @@ func TestPrepareRepairsInstallerOwnedEtcOpsd(t *testing.T) {
 			mustRun(t, os.MkdirAll(etcOpsd, tc.existing))
 			mustRun(t, os.Chmod(etcOpsd, tc.existing))
 
-			mustRun(t, h.adapter.Prepare(context.Background(), specFixture(t, "repair")))
+			mustRun(t, h.adapter.Prepare(context.Background(), specFixture(t, "repair"), ""))
 
 			info, err := os.Stat(etcOpsd)
 			mustRun(t, err)
@@ -819,7 +819,7 @@ func TestPrepareWithoutFileSecretsLeavesSharedDirsAlone(t *testing.T) {
 	spec.Exec.SecretEnvironment = map[string]domain.SecretRef{
 		"APP_TOKEN": {Kind: domain.SecretKindEnv, Name: "APP_TOKEN"},
 	}
-	mustRun(t, h.adapter.Prepare(context.Background(), spec))
+	mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 
 	info, err := os.Stat(etcOpsd)
 	mustRun(t, err)
@@ -889,7 +889,7 @@ func TestEnvironmentFilesAreSorted(t *testing.T) {
 	h := newHarness(t)
 	spec := specFixture(t, "sorted")
 	spec.Exec.Environment = map[string]string{"ZED": "1", "ALPHA": "2", "MID": "3"}
-	mustRun(t, h.adapter.Prepare(context.Background(), spec))
+	mustRun(t, h.adapter.Prepare(context.Background(), spec, ""))
 
 	lines := strings.Split(strings.TrimSpace(readFile(t, h.adapter.RootPath(domain.EnvFilePath("sorted")))), "\n")
 	names := make([]string, 0, len(lines))
@@ -913,7 +913,7 @@ func TestPrepareDoesNotCreateReleaseTreeInternals(t *testing.T) {
 	spec := specFixture(t, "releasepath")
 	spec.Exec.WorkingDirectory = domain.CurrentReleaseDir(spec.Application)
 
-	if err := h.adapter.Prepare(context.Background(), spec); err != nil {
+	if err := h.adapter.Prepare(context.Background(), spec, ""); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
@@ -969,7 +969,7 @@ func TestJavaInterpreterPreflightAndStopAfterRemoval(t *testing.T) {
 	if err := h.adapter.Validate(ctx, spec); err != nil {
 		t.Fatalf("解释器到位时应当通过: %v", err)
 	}
-	if err := h.adapter.Prepare(ctx, spec); err != nil {
+	if err := h.adapter.Prepare(ctx, spec, ""); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
@@ -982,7 +982,7 @@ func TestJavaInterpreterPreflightAndStopAfterRemoval(t *testing.T) {
 	}
 	// stop 走的是不碰 argv[0] 的那一层：**这正是最需要这个工具的时刻**，
 	// 它不能因为解释器不在就拒绝停下来。
-	if err := h.adapter.Stop(ctx, spec); err != nil {
+	if err := h.adapter.Stop(ctx, spec, ""); err != nil {
 		t.Fatalf("解释器消失后 Stop 仍必须成功: %v", err)
 	}
 }

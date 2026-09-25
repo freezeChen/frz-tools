@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
@@ -34,7 +35,7 @@ func (s *Server) handlePrepareRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	app, _, decision, decided, err := s.deps.Runtimes.Prepare(r.Context(), r.PathValue("id"))
+	app, _, decision, decided, err := s.deps.Runtimes.Prepare(r.Context(), r.PathValue("id"), r.URL.Query().Get("slot"))
 	if err != nil {
 		writeError(w, s.logger(), err)
 		return
@@ -79,9 +80,21 @@ func (s *Server) createRuntimeOperation(w http.ResponseWriter, r *http.Request, 
 		req.IdempotencyKey = r.Header.Get("Idempotency-Key")
 	}
 
+	// 槽位随 Operation 存下来（见 v1.RuntimeOpSpec）：它是 kind 相关的参数，
+	// 与 app.deploy 用 spec 承载 releaseId、backup.* 用 spec 承载备份 ID 同一个位置。
+	var specJSON json.RawMessage
+	if req.Slot != "" {
+		encoded, err := json.Marshal(v1.RuntimeOpSpec{Slot: req.Slot})
+		if err != nil {
+			writeError(w, s.logger(), domain.NewError(v1.CodeInternal, "无法序列化操作参数: %v", err))
+			return
+		}
+		specJSON = encoded
+	}
 	op, created, err := s.deps.Service.Create(r.Context(), v1.CreateOperationRequest{
 		Kind:           kind,
 		Resource:       r.PathValue("id"),
+		Spec:           specJSON,
 		DryRun:         req.DryRun,
 		IdempotencyKey: req.IdempotencyKey,
 		CreatedBy:      req.CreatedBy,
@@ -105,7 +118,7 @@ func (s *Server) handleRuntimeHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	app, _, health, err := s.deps.Runtimes.Health(r.Context(), r.PathValue("id"))
+	app, _, health, err := s.deps.Runtimes.Health(r.Context(), r.PathValue("id"), r.URL.Query().Get("slot"))
 	if err != nil {
 		writeError(w, s.logger(), err)
 		return

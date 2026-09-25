@@ -22,6 +22,9 @@ type RuntimeDecision struct {
 // 未知字段报错：适配器端口没有 dry-run 语义，接受它就会变成「以为只是预演、其实
 // 真的启停了进程」。要做无副作用的检查请用 runtime/validate。
 type RuntimeActionRequest struct {
+	// Slot 指定操作打在哪个槽位（迭代 4 的蓝绿）。**单槽应用必须留空，蓝绿应用必须给**——
+	// 工具不去猜「他大概想操作哪一侧」：猜错的表现是操作了另一侧而看起来成功了。
+	Slot           string `json:"slot,omitempty"`
 	DryRun         bool   `json:"dryRun"`
 	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 	CreatedBy      string `json:"createdBy,omitempty"`
@@ -56,4 +59,13 @@ type RuntimeHealthResponse struct {
 	Ready       bool      `json:"ready"`
 	CheckedAt   time.Time `json:"checkedAt"`
 	Detail      string    `json:"detail,omitempty"`
+}
+
+// RuntimeOpSpec 是 runtime.* 操作随 Operation 存下来的参数。
+//
+// 它**只**承载槽位：应用的规格仍然在执行时现读（与 spec put 的语义一致，因此重试
+// runtime.start 用的是最新 manifest）。槽位必须存下来，是因为它**不是规格的一部分**
+// ——规格对两个槽位是同一份（端口与就绪目标由槽位自己声明），执行时从规格里推不出来。
+type RuntimeOpSpec struct {
+	Slot string `json:"slot,omitempty"`
 }

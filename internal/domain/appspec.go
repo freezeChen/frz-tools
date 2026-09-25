@@ -635,13 +635,21 @@ func InReleaseTree(application, candidate string) bool {
 //
 // 其余元素里若有相对路径（例如 `java -jar app.jar`），由**进程按自己的 workingDirectory**
 // 解释——那是它本来的语义，我们不该抢。
-func ResolveArgv(application string, argv []string) ([]string, error) {
+//
+// slot 为空表示单槽形态（迭代 3 的语义）；非空时相对路径解析到该槽位的 `current`。
+func ResolveArgv(application string, slot Slot, argv []string) ([]string, error) {
 	resolved := append([]string(nil), argv...)
 	if len(resolved) == 0 || path.IsAbs(resolved[0]) {
 		return resolved, nil
 	}
 
+	// 蓝绿应用解析到**该槽位**的 current（迭代 4）：两个槽位同时跑着不同的版本，
+	// 用单槽那个 current 会让两个 unit 的可执行文件指向同一个版本——而那正是
+	// 「槽位」这个词要避免的事。空槽位 = 单槽形态，base 就是老的 current 指针。
 	base := CurrentReleaseDir(application)
+	if slot != "" {
+		base = SlotCurrentDir(application, slot)
+	}
 	joined := path.Join(base, resolved[0])
 	if joined != base && !strings.HasPrefix(joined, base+"/") {
 		// 相对元素里的 .. 在 SpecExec.validate 里已经被拒（那道防线更早），

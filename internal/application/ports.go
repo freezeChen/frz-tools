@@ -162,15 +162,23 @@ type SecretResolver interface {
 // 内部先校验，因为「未经验证的规格被直接启动」是最危险的一类误用。
 type RuntimeAdapter interface {
 	// Validate 只检查规格能否被本适配器执行，不产生任何副作用。
+	//
+	// 它**不带槽位**：校验的是「这份规格能不能跑」，而两个槽位的规格差异（端口、就绪目标）
+	// 在同一个循环里一起看才完整——拆成两次调用反而看不到「两个槽位抢同一个端口」。
 	Validate(ctx context.Context, spec *domain.ApplicationSpec) error
 	// Prepare 创建用户、目录、环境文件与 unit 文件；幂等，可重复调用。
-	Prepare(ctx context.Context, spec *domain.ApplicationSpec) error
-	Start(ctx context.Context, spec *domain.ApplicationSpec) error
-	Stop(ctx context.Context, spec *domain.ApplicationSpec) error
+	//
+	// slot 为空表示单槽形态（迭代 3 的语义，一个应用一个 unit）；非空表示蓝绿（迭代 4）：
+	// 每个槽位一个 unit、一份环境、一个 `current` 指针。**槽位是操作身份的一部分**，
+	// 而不是规格的属性——规格对两个槽位是同一份（端口与就绪目标由槽位自己声明），
+	// 因此把它塞进规格会让「这份规格是哪个槽位的」变成一个可以写错的状态。
+	Prepare(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error
+	Start(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error
+	Stop(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error
 	// Health 返回「能否接流量」，Status 返回「进程本身的状态」。
 	// 两者刻意不合并：进程活着不等于已就绪。
-	Health(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeHealth, error)
-	Status(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error)
+	Health(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeHealth, error)
+	Status(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeStatus, error)
 }
 
 // BackupAdapter 把「一份备份策略」映射到具体的资源类型（目录、数据库……）。
@@ -259,7 +267,7 @@ type RuntimeDecision struct {
 // 应用引用解析成规范化的 Operation 资源，并在建 Operation 之前完成运行时侧的前置校验。
 // 它不导出——除了 RuntimeService 没有别的实现者，调用方只通过 HTTP/CLI 使用。
 type runtimeOperationResolver interface {
-	ResolveRuntimeOperation(ctx context.Context, kind, appRef string) (string, error)
+	ResolveRuntimeOperation(ctx context.Context, kind, appRef, slot string) (string, domain.Slot, error)
 }
 
 // backupOperationResolver 是 Service 与 BackupService 之间的内部接缝，与

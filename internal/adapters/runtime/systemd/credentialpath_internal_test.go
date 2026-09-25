@@ -63,7 +63,7 @@ func TestCanChmod(t *testing.T) {
 // 凭据路径必须从根到叶、且以凭据目录结尾：顺序决定错误信息指向哪一级，
 // 也决定「哪一级不参与补穿越位」（末项）。
 func TestCredentialPathLevels(t *testing.T) {
-	got := credentialPathLevels("orders")
+	got := credentialPathLevels("orders", "")
 	want := []string{
 		"/etc",
 		"/etc/opsd",

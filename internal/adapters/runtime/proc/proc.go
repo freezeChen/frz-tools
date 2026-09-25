@@ -83,7 +83,7 @@ func (a *Adapter) Validate(_ context.Context, spec *domain.ApplicationSpec) erro
 	return unitfile.PreflightInterpreter(spec)
 }
 
-func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	if err := a.Validate(ctx, spec); err != nil {
 		return err
 	}
@@ -94,21 +94,21 @@ func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) err
 		// releases 子树的内部由 ReleaseAdapter 建，与 systemd 适配器同一条分工：
 		// Prepare 若把 `current` 建成实体目录，之后的符号链接切换就会失败
 		// （见 domain.InReleaseTree）。
-		if domain.InReleaseTree(spec.Application, absolute) {
+		if domain.InReleaseTree(spec.Application, absolute) || domain.InSlotTree(spec.Application, absolute) {
 			continue
 		}
 		if err := os.MkdirAll(a.mapPath(spec, absolute), 0o750); err != nil {
 			return domain.NewError(v1.CodeInternal, "创建目录 %q 失败: %v", absolute, err)
 		}
 	}
-	if err := os.MkdirAll(a.appRoot(spec), 0o750); err != nil {
-		return domain.NewError(v1.CodeInternal, "创建应用目录 %q 失败: %v", a.appRoot(spec), err)
+	if err := os.MkdirAll(a.appRoot(spec, slot), 0o750); err != nil {
+		return domain.NewError(v1.CodeInternal, "创建应用目录 %q 失败: %v", a.appRoot(spec, slot), err)
 	}
 
 	// 凭据目录单独处理并要求 0700：MkdirAll 对已存在的目录不改权限，
 	// 因此必须显式 Chmod，否则目录一旦先被上面的 0750 循环建出来，
 	// 后面再按 0700 创建就是无效的——同组用户将能穿过凭据目录。
-	secretsDir := a.mapPath(spec, domain.SecretsDir(spec.Application))
+	secretsDir := a.mapPath(spec, domain.SecretsDirFor(spec.Application, slot))
 	if err := os.MkdirAll(secretsDir, 0o700); err != nil {
 		return domain.NewError(v1.CodeInternal, "创建凭据目录 %q 失败: %v", secretsDir, err)
 	}
@@ -116,17 +116,17 @@ func (a *Adapter) Prepare(ctx context.Context, spec *domain.ApplicationSpec) err
 		return domain.NewError(v1.CodeInternal, "收敛凭据目录权限失败: %v", err)
 	}
 
-	if err := a.writeEnvFiles(ctx, spec); err != nil {
+	if err := a.writeEnvFiles(ctx, spec, slot); err != nil {
 		return err
 	}
-	return a.writeState(spec)
+	return a.writeState(spec, slot)
 }
 
-func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	if err := a.Validate(ctx, spec); err != nil {
 		return err
 	}
-	current, err := a.Status(ctx, spec)
+	current, err := a.Status(ctx, spec, slot)
 	if err != nil {
 		return err
 	}
@@ -134,11 +134,11 @@ func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error
 		return nil
 	}
 
-	stored, err := a.loadState(spec)
+	stored, err := a.loadState(spec, slot)
 	if err != nil {
 		return err
 	}
-	env, err := a.environment(ctx, spec)
+	env, err := a.environment(ctx, spec, slot)
 	if err != nil {
 		return err
 	}
@@ -164,11 +164,12 @@ func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error
 	}
 
 	a.mu.Lock()
-	a.running[spec.Systemd.UnitName] = cmd
-	a.successes.Reset(spec.Systemd.UnitName)
+	unitName := spec.UnitNameFor(slot)
+	a.running[unitName] = cmd
+	a.successes.Reset(unitName)
 	a.mu.Unlock()
 
-	if err := os.WriteFile(filepath.Join(a.appRoot(spec), pidFileName),
+	if err := os.WriteFile(filepath.Join(a.appRoot(spec, slot), pidFileName),
 		[]byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o640); err != nil {
 		return domain.NewError(v1.CodeInternal, "写入 pid 文件失败: %v", err)
 	}
@@ -177,13 +178,13 @@ func (a *Adapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error
 	go func() {
 		_ = cmd.Wait()
 		a.mu.Lock()
-		delete(a.running, spec.Systemd.UnitName)
+		delete(a.running, spec.UnitNameFor(slot))
 		a.mu.Unlock()
 	}()
 	return nil
 }
 
-func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error {
+func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	// 与 systemd 适配器同一条：Stop 只校验规格本身，**不校验 argv[0] 还在不在**
 	// （见 systemd.Adapter.validateSpec 的注释）。解释器被卸载、制品被人删掉时，
 	// 服务仍然必须能停下来——那正是最需要这个工具的时刻。
@@ -192,10 +193,11 @@ func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error 
 	}
 
 	a.mu.Lock()
-	cmd, ok := a.running[spec.Systemd.UnitName]
+	unitName := spec.UnitNameFor(slot)
+	cmd, ok := a.running[unitName]
 	a.mu.Unlock()
 	if !ok {
-		_ = os.Remove(filepath.Join(a.appRoot(spec), pidFileName))
+		_ = os.Remove(filepath.Join(a.appRoot(spec, slot), pidFileName))
 		return nil
 	}
 
@@ -205,8 +207,8 @@ func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error 
 
 	deadline := a.now().Add(5 * time.Second)
 	for a.now().Before(deadline) {
-		if status, err := a.Status(ctx, spec); err == nil && status != domain.RuntimeActive {
-			_ = os.Remove(filepath.Join(a.appRoot(spec), pidFileName))
+		if status, err := a.Status(ctx, spec, slot); err == nil && status != domain.RuntimeActive {
+			_ = os.Remove(filepath.Join(a.appRoot(spec, slot), pidFileName))
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -215,23 +217,23 @@ func (a *Adapter) Stop(ctx context.Context, spec *domain.ApplicationSpec) error 
 	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return domain.NewError(v1.CodeInternal, "强制结束失败: %v", err)
 	}
-	_ = os.Remove(filepath.Join(a.appRoot(spec), pidFileName))
+	_ = os.Remove(filepath.Join(a.appRoot(spec, slot), pidFileName))
 	return nil
 }
 
-func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error) {
+func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeStatus, error) {
 	if err := spec.Validate(); err != nil {
 		return domain.RuntimeUnknown, err
 	}
 
 	a.mu.Lock()
-	_, tracked := a.running[spec.Systemd.UnitName]
+	_, tracked := a.running[spec.UnitNameFor(slot)]
 	a.mu.Unlock()
 	if tracked {
 		return domain.RuntimeActive, nil
 	}
 
-	raw, err := os.ReadFile(filepath.Join(a.appRoot(spec), pidFileName))
+	raw, err := os.ReadFile(filepath.Join(a.appRoot(spec, slot), pidFileName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return domain.RuntimeInactive, nil
@@ -253,25 +255,25 @@ func (a *Adapter) Status(ctx context.Context, spec *domain.ApplicationSpec) (dom
 	return domain.RuntimeActive, nil
 }
 
-func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (domain.RuntimeHealth, error) {
+func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeHealth, error) {
 	now := a.now()
-	status, err := a.Status(ctx, spec)
+	status, err := a.Status(ctx, spec, slot)
 	if err != nil {
 		return domain.RuntimeHealth{}, err
 	}
 	if status != domain.RuntimeActive {
-		a.successes.Reset(spec.Systemd.UnitName)
+		a.successes.Reset(spec.UnitNameFor(slot))
 		return domain.RuntimeHealth{CheckedAt: now, Detail: "进程未在运行"}, nil
 	}
 
-	ready, detail := readiness.Check(ctx, spec.Health.Readiness, a.probe)
+	ready, detail := readiness.Check(ctx, spec.ReadinessFor(slot), a.probe)
 	if !ready {
-		a.successes.Reset(spec.Systemd.UnitName)
+		a.successes.Reset(spec.UnitNameFor(slot))
 		return domain.RuntimeHealth{CheckedAt: now, Detail: detail}, nil
 	}
 
 	count := a.successes.Record(spec.Systemd.UnitName)
-	required := spec.Health.Readiness.ConsecutiveSuccesses
+	required := spec.ReadinessFor(slot).ConsecutiveSuccesses
 	if count < required {
 		return domain.RuntimeHealth{
 			CheckedAt: now,
@@ -281,7 +283,23 @@ func (a *Adapter) Health(ctx context.Context, spec *domain.ApplicationSpec) (dom
 	return domain.RuntimeHealth{Ready: true, CheckedAt: now, Detail: detail}, nil
 }
 
-func (a *Adapter) appRoot(spec *domain.ApplicationSpec) string {
+// unpackDirFor 返回该槽位 current 指针的位置（单槽就是老的 releases/current）。
+func unpackDirFor(application string, slot domain.Slot) string {
+	if slot != "" {
+		return domain.SlotCurrentDir(application, slot)
+	}
+	return "/opt/opsd/apps/" + application + "/releases/current"
+}
+
+// appRoot 是本适配器对这个应用（或槽位）的状态目录。
+//
+// 蓝绿应用**按槽位分开**（root/<app>/<slot>）：state.json 与 pid 文件按目录定位，
+// 两个槽位共用一份的话，第二个槽位 Prepare 时会覆盖第一个的运行时状态，
+// 而 Start/Stop 读到的就是另一侧的记录——这正是「两个槽位同时运行」必须避免的事。
+func (a *Adapter) appRoot(spec *domain.ApplicationSpec, slot domain.Slot) string {
+	if slot != "" {
+		return filepath.Join(a.root, spec.Application, string(slot))
+	}
 	return filepath.Join(a.root, spec.Application)
 }
 
@@ -297,18 +315,17 @@ func (a *Adapter) SandboxPath(application, absolute string) string {
 	return filepath.Join(a.root, application, "fs", strings.TrimPrefix(absolute, "/"))
 }
 
-func (a *Adapter) writeEnvFiles(ctx context.Context, spec *domain.ApplicationSpec) error {
-	nonSecret := map[string]string{}
-	for name, value := range spec.Exec.Environment {
-		nonSecret[name] = value
-	}
-	if err := writeFile(a.mapPath(spec, domain.EnvFilePath(spec.Application)),
+func (a *Adapter) writeEnvFiles(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
+	// 蓝绿应用的环境把共享项与该槽位自己的项**合并**（同名以槽位为准）：两个槽位要改的
+	// 往往只有端口那一项，让运维把其余变量抄两遍没有意义。
+	nonSecret := spec.SlotEnvironment(slot)
+	if err := writeFile(a.mapPath(spec, domain.EnvFilePathFor(spec.Application, slot)),
 		unitfile.RenderEnvFile(nonSecret), 0o600); err != nil {
 		return err
 	}
 
 	secrets := map[string]string{}
-	secretsDir := a.mapPath(spec, domain.SecretsDir(spec.Application))
+	secretsDir := a.mapPath(spec, domain.SecretsDirFor(spec.Application, slot))
 	if err := os.MkdirAll(secretsDir, 0o700); err != nil {
 		return domain.NewError(v1.CodeInternal, "创建凭据目录失败: %v", err)
 	}
@@ -333,22 +350,23 @@ func (a *Adapter) writeEnvFiles(ctx context.Context, spec *domain.ApplicationSpe
 		}
 		secrets[name] = path
 	}
-	return writeFile(a.mapPath(spec, domain.SecretsEnvFilePath(spec.Application)),
+	return writeFile(a.mapPath(spec, domain.SecretsEnvFilePathFor(spec.Application, slot)),
 		unitfile.RenderEnvFile(secrets), 0o600)
 }
 
 // environment 组装传给子进程的环境变量。非敏感值与环境型凭据直接注入，
 // 文件型凭据注入的是文件路径——与 1c 规格第 6 节的约定一致。
-func (a *Adapter) environment(ctx context.Context, spec *domain.ApplicationSpec) ([]string, error) {
+func (a *Adapter) environment(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) ([]string, error) {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + a.mapPath(spec, spec.Exec.WorkingDirectory),
 	}
-	for name, value := range spec.Exec.Environment {
+	// 与写环境文件同一份合并结果（共享项 + 该槽位自己的项）。
+	for name, value := range spec.SlotEnvironment(slot) {
 		env = append(env, name+"="+value)
 	}
 
-	secretsDir := a.mapPath(spec, domain.SecretsDir(spec.Application))
+	secretsDir := a.mapPath(spec, domain.SecretsDirFor(spec.Application, slot))
 	for name, ref := range spec.Exec.SecretEnvironment {
 		value, err := a.resolver.Resolve(ctx, ref)
 		if err != nil {
@@ -365,24 +383,24 @@ func (a *Adapter) environment(ctx context.Context, spec *domain.ApplicationSpec)
 	return env, nil
 }
 
-func (a *Adapter) writeState(spec *domain.ApplicationSpec) error {
+func (a *Adapter) writeState(spec *domain.ApplicationSpec, slot domain.Slot) error {
 	stored := state{
 		Application:      spec.Application,
-		UnitName:         spec.Systemd.UnitName,
+		UnitName:         spec.UnitNameFor(slot),
 		Argv:             spec.Exec.Argv,
 		WorkingDirectory: a.mapPath(spec, spec.Exec.WorkingDirectory),
 		LogFile:          filepath.Join(a.mapPath(spec, spec.Logs.Directory), "current.log"),
-		UnpackDir:        a.mapPath(spec, "/opt/opsd/apps/"+spec.Application+"/releases/current"),
+		UnpackDir:        a.mapPath(spec, unpackDirFor(spec.Application, slot)),
 	}
 	encoded, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {
 		return domain.NewError(v1.CodeInternal, "序列化运行时状态失败: %v", err)
 	}
-	return writeFile(filepath.Join(a.appRoot(spec), stateFileName), append(encoded, '\n'), 0o640)
+	return writeFile(filepath.Join(a.appRoot(spec, slot), stateFileName), append(encoded, '\n'), 0o640)
 }
 
-func (a *Adapter) loadState(spec *domain.ApplicationSpec) (*state, error) {
-	raw, err := os.ReadFile(filepath.Join(a.appRoot(spec), stateFileName))
+func (a *Adapter) loadState(spec *domain.ApplicationSpec, slot domain.Slot) (*state, error) {
+	raw, err := os.ReadFile(filepath.Join(a.appRoot(spec, slot), stateFileName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, domain.NewError(v1.CodeRuntimeNotReady,

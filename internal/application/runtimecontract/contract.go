@@ -52,7 +52,7 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		}
 		// 「无副作用」的判据：校验之后进程仍未运行，也没有被 Prepare 过的痕迹
 		// 影响状态判断。
-		status, err := (*adapter).Status(ctx, spec)
+		status, err := (*adapter).Status(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
@@ -107,7 +107,7 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		adapter, spec := next(t)
 		ctx := context.Background()
 
-		if err := (*adapter).Start(ctx, spec); err == nil {
+		if err := (*adapter).Start(ctx, spec, ""); err == nil {
 			t.Fatal("未 Prepare 就 Start 必须被拒绝，否则会凭空跑起一个不受管的进程")
 		}
 	})
@@ -116,13 +116,13 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		adapter, spec := next(t)
 		ctx := context.Background()
 
-		if err := (*adapter).Prepare(ctx, spec); err != nil {
+		if err := (*adapter).Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("first Prepare: %v", err)
 		}
-		if err := (*adapter).Prepare(ctx, spec); err != nil {
+		if err := (*adapter).Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("second Prepare 必须幂等: %v", err)
 		}
-		status, err := (*adapter).Status(ctx, spec)
+		status, err := (*adapter).Status(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
@@ -135,10 +135,10 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		adapter, spec := next(t)
 		ctx := context.Background()
 
-		if err := (*adapter).Prepare(ctx, spec); err != nil {
+		if err := (*adapter).Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		health, err := (*adapter).Health(ctx, spec)
+		health, err := (*adapter).Health(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Health: %v", err)
 		}
@@ -154,19 +154,19 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		adapter, spec := next(t)
 		ctx := context.Background()
 
-		if err := (*adapter).Prepare(ctx, spec); err != nil {
+		if err := (*adapter).Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := (*adapter).Start(ctx, spec); err != nil {
+		if err := (*adapter).Start(ctx, spec, ""); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
 		defer func() {
-			if err := (*adapter).Stop(ctx, spec); err != nil {
+			if err := (*adapter).Stop(ctx, spec, ""); err != nil {
 				t.Errorf("Stop: %v", err)
 			}
 		}()
 
-		status, err := (*adapter).Status(ctx, spec)
+		status, err := (*adapter).Status(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
@@ -179,17 +179,17 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		adapter, spec := next(t)
 		ctx := context.Background()
 
-		if err := (*adapter).Prepare(ctx, spec); err != nil {
+		if err := (*adapter).Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := (*adapter).Start(ctx, spec); err != nil {
+		if err := (*adapter).Start(ctx, spec, ""); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
-		if err := (*adapter).Stop(ctx, spec); err != nil {
+		if err := (*adapter).Stop(ctx, spec, ""); err != nil {
 			t.Fatalf("Stop: %v", err)
 		}
 
-		status, err := (*adapter).Status(ctx, spec)
+		status, err := (*adapter).Status(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
@@ -202,13 +202,13 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		adapter, spec := next(t)
 		ctx := context.Background()
 
-		if err := (*adapter).Prepare(ctx, spec); err != nil {
+		if err := (*adapter).Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := (*adapter).Stop(ctx, spec); err != nil {
+		if err := (*adapter).Stop(ctx, spec, ""); err != nil {
 			t.Fatalf("对未启动的应用 Stop 必须成功: %v", err)
 		}
-		if err := (*adapter).Stop(ctx, spec); err != nil {
+		if err := (*adapter).Stop(ctx, spec, ""); err != nil {
 			t.Fatalf("重复 Stop 必须成功: %v", err)
 		}
 	})
@@ -217,18 +217,18 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		adapter, spec := next(t)
 		ctx := context.Background()
 
-		if err := (*adapter).Prepare(ctx, spec); err != nil {
+		if err := (*adapter).Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := (*adapter).Start(ctx, spec); err != nil {
+		if err := (*adapter).Start(ctx, spec, ""); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
-		defer func() { _ = (*adapter).Stop(ctx, spec) }()
+		defer func() { _ = (*adapter).Stop(ctx, spec, "") }()
 
-		if err := (*adapter).Start(ctx, spec); err != nil {
+		if err := (*adapter).Start(ctx, spec, ""); err != nil {
 			t.Fatalf("重复 Start 必须成功（幂等），got %v", err)
 		}
-		status, err := (*adapter).Status(ctx, spec)
+		status, err := (*adapter).Status(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
@@ -246,15 +246,15 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		stopServing := harness.Serve(t, spec)
 		defer stopServing()
 
-		if err := harness.Adapter.Prepare(ctx, spec); err != nil {
+		if err := harness.Adapter.Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := harness.Adapter.Start(ctx, spec); err != nil {
+		if err := harness.Adapter.Start(ctx, spec, ""); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
-		defer func() { _ = harness.Adapter.Stop(ctx, spec) }()
+		defer func() { _ = harness.Adapter.Stop(ctx, spec, "") }()
 
-		health, err := harness.Adapter.Health(ctx, spec)
+		health, err := harness.Adapter.Health(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Health: %v", err)
 		}
@@ -270,15 +270,15 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 		ctx := context.Background()
 
 		// 刻意不 Serve：进程活着但没有就绪目标。
-		if err := harness.Adapter.Prepare(ctx, spec); err != nil {
+		if err := harness.Adapter.Prepare(ctx, spec, ""); err != nil {
 			t.Fatalf("Prepare: %v", err)
 		}
-		if err := harness.Adapter.Start(ctx, spec); err != nil {
+		if err := harness.Adapter.Start(ctx, spec, ""); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
-		defer func() { _ = harness.Adapter.Stop(ctx, spec) }()
+		defer func() { _ = harness.Adapter.Stop(ctx, spec, "") }()
 
-		status, err := harness.Adapter.Status(ctx, spec)
+		status, err := harness.Adapter.Status(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
@@ -286,7 +286,7 @@ func Run(t *testing.T, factory func(t *testing.T) Harness) {
 			t.Fatalf("进程应当在运行，got %s", status)
 		}
 
-		health, err := harness.Adapter.Health(ctx, spec)
+		health, err := harness.Adapter.Health(ctx, spec, "")
 		if err != nil {
 			t.Fatalf("Health: %v", err)
 		}

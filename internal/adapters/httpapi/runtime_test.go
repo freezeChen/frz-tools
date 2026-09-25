@@ -30,27 +30,27 @@ func (s *stubRuntimeAdapter) Validate(_ context.Context, _ *domain.ApplicationSp
 	return s.validateErr
 }
 
-func (s *stubRuntimeAdapter) Prepare(_ context.Context, _ *domain.ApplicationSpec) error {
+func (s *stubRuntimeAdapter) Prepare(_ context.Context, _ *domain.ApplicationSpec, _ domain.Slot) error {
 	s.calls = append(s.calls, "prepare")
 	return s.prepareErr
 }
 
-func (s *stubRuntimeAdapter) Start(_ context.Context, _ *domain.ApplicationSpec) error {
+func (s *stubRuntimeAdapter) Start(_ context.Context, _ *domain.ApplicationSpec, _ domain.Slot) error {
 	s.calls = append(s.calls, "start")
 	return nil
 }
 
-func (s *stubRuntimeAdapter) Stop(_ context.Context, _ *domain.ApplicationSpec) error {
+func (s *stubRuntimeAdapter) Stop(_ context.Context, _ *domain.ApplicationSpec, _ domain.Slot) error {
 	s.calls = append(s.calls, "stop")
 	return nil
 }
 
-func (s *stubRuntimeAdapter) Health(_ context.Context, _ *domain.ApplicationSpec) (domain.RuntimeHealth, error) {
+func (s *stubRuntimeAdapter) Health(_ context.Context, _ *domain.ApplicationSpec, _ domain.Slot) (domain.RuntimeHealth, error) {
 	s.calls = append(s.calls, "health")
 	return s.health, s.healthErr
 }
 
-func (s *stubRuntimeAdapter) Status(_ context.Context, _ *domain.ApplicationSpec) (domain.RuntimeStatus, error) {
+func (s *stubRuntimeAdapter) Status(_ context.Context, _ *domain.ApplicationSpec, _ domain.Slot) (domain.RuntimeStatus, error) {
 	s.calls = append(s.calls, "status")
 	return domain.RuntimeActive, nil
 }

@@ -250,28 +250,43 @@ func (p *Pool) executeRuntime(persistCtx, execCtx context.Context, op *domain.Op
 		p.finishRuntimeFailure(persistCtx, op, err, startedAt)
 		return
 	}
+	// 槽位随操作存下来（v1.RuntimeOpSpec）。解析失败按内部不一致处理：创建侧写进去的
+	// JSON 由本进程生成，解不开说明库被外部改过。
+	var options v1.RuntimeOpSpec
+	if len(op.Spec) > 0 {
+		if err := json.Unmarshal(op.Spec, &options); err != nil {
+			p.finishRuntimeFailure(persistCtx, op, domain.NewError(v1.CodeInternal,
+				"操作参数无法解析: %v", err), startedAt)
+			return
+		}
+	}
+	slot, err := CheckSlot(spec, options.Slot)
+	if err != nil {
+		p.finishRuntimeFailure(persistCtx, op, err, startedAt)
+		return
+	}
 	adapter, err := p.runtimes.requireAdapter()
 	if err != nil {
 		p.finishRuntimeFailure(persistCtx, op, err, startedAt)
 		return
 	}
 
-	target := map[string]string{"application": app.Name, "unit": spec.Systemd.UnitName}
+	target := map[string]string{"application": app.Name, "unit": spec.UnitNameFor(slot)}
 	switch op.Kind {
 	case v1.KindRuntimeStart:
 		p.appendLog(persistCtx, op, nil, "info", domain.PhasePrepare, "开始准备运行时（幂等）", target)
-		if err := adapter.Prepare(execCtx, spec); err != nil {
+		if err := adapter.Prepare(execCtx, spec, slot); err != nil {
 			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
 			return
 		}
 		p.recordRuntimeDecision(persistCtx, op, app, spec)
-		if err := adapter.Start(execCtx, spec); err != nil {
+		if err := adapter.Start(execCtx, spec, slot); err != nil {
 			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
 			return
 		}
 		p.appendLog(persistCtx, op, nil, "info", domain.PhaseExecute, "应用已启动", target)
 	case v1.KindRuntimeStop:
-		if err := adapter.Stop(execCtx, spec); err != nil {
+		if err := adapter.Stop(execCtx, spec, slot); err != nil {
 			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
 			return
 		}

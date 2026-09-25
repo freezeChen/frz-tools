@@ -37,6 +37,44 @@ func (s *RuntimeService) Resolve(ctx context.Context, appRef string) (*domain.Ap
 	return app, spec, nil
 }
 
+// CheckSlot 解析并校验「这次操作打在哪个槽位」，与应用的部署形态对齐。
+//
+// 这条校验是必需的：蓝绿应用的 unit 是 `<app>-<slot>.service`，单槽应用是 `<app>.service`。
+// 少了它，蓝绿应用上的一次 runtime start 会去打一个不存在的 unit，报出来的是
+// 「尚未 Prepare：unit 文件不存在」——那句话与真实原因（少给了槽位）毫无关系。
+// 反过来，给单槽应用指定槽位同样是错的：那份 unit 根本不按槽位划分。
+func CheckSlot(spec *domain.ApplicationSpec, raw string) (domain.Slot, error) {
+	if raw == "" {
+		if spec.BlueGreen() {
+			return "", domain.NewError(v1.CodeInvalidRequest,
+				"应用 %s 是蓝绿形态：运行时操作必须指定槽位（%s 或 %s）", spec.Application, domain.SlotBlue, domain.SlotGreen)
+		}
+		return "", nil
+	}
+	slot, err := domain.ParseSlot(raw)
+	if err != nil {
+		return "", err
+	}
+	if !spec.BlueGreen() {
+		return "", domain.NewError(v1.CodeInvalidRequest,
+			"应用 %s 不是蓝绿形态（manifest 里没有 exec.slots），不能指定槽位 %s", spec.Application, slot)
+	}
+	return slot, nil
+}
+
+// ResolveSlot 取回应用与规格，并解析出这次操作的槽位。
+func (s *RuntimeService) ResolveSlot(ctx context.Context, appRef, rawSlot string) (*domain.Application, *domain.ApplicationSpec, domain.Slot, error) {
+	app, spec, err := s.Resolve(ctx, appRef)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	slot, err := CheckSlot(spec, rawSlot)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return app, spec, slot, nil
+}
+
 // Validate 只检查规格能否被本适配器执行，不产生任何副作用。
 func (s *RuntimeService) Validate(ctx context.Context, appRef string) (*domain.Application, *domain.ApplicationSpec, error) {
 	app, spec, err := s.Resolve(ctx, appRef)
@@ -55,8 +93,8 @@ func (s *RuntimeService) Validate(ctx context.Context, appRef string) (*domain.A
 
 // Prepare 执行一次幂等的准备，并返回适配器做出的决策。决策未知时 ok=false：
 // 调用方据此省略字段，而不是把零值当档位展示。
-func (s *RuntimeService) Prepare(ctx context.Context, appRef string) (*domain.Application, *domain.ApplicationSpec, RuntimeDecision, bool, error) {
-	app, spec, err := s.Resolve(ctx, appRef)
+func (s *RuntimeService) Prepare(ctx context.Context, appRef, rawSlot string) (*domain.Application, *domain.ApplicationSpec, RuntimeDecision, bool, error) {
+	app, spec, slot, err := s.ResolveSlot(ctx, appRef, rawSlot)
 	if err != nil {
 		return nil, nil, RuntimeDecision{}, false, err
 	}
@@ -65,7 +103,7 @@ func (s *RuntimeService) Prepare(ctx context.Context, appRef string) (*domain.Ap
 		return nil, nil, RuntimeDecision{}, false, err
 	}
 	// 适配器契约要求 Prepare 内部先自校验，因此这里不重复 Validate。
-	if err := adapter.Prepare(ctx, spec); err != nil {
+	if err := adapter.Prepare(ctx, spec, slot); err != nil {
 		return nil, nil, RuntimeDecision{}, false, err
 	}
 	decision, ok := s.decision(ctx, spec)
@@ -74,8 +112,8 @@ func (s *RuntimeService) Prepare(ctx context.Context, appRef string) (*domain.Ap
 
 // Health 返回就绪快照。未就绪本身不是错误，由 Ready=false 表达（调用方据此轮询）；
 // 确定性失败（unit failed、启动超时）由适配器返回 RUNTIME_NOT_READY 硬错误。
-func (s *RuntimeService) Health(ctx context.Context, appRef string) (*domain.Application, *domain.ApplicationSpec, domain.RuntimeHealth, error) {
-	app, spec, err := s.Resolve(ctx, appRef)
+func (s *RuntimeService) Health(ctx context.Context, appRef, rawSlot string) (*domain.Application, *domain.ApplicationSpec, domain.RuntimeHealth, error) {
+	app, spec, slot, err := s.ResolveSlot(ctx, appRef, rawSlot)
 	if err != nil {
 		return nil, nil, domain.RuntimeHealth{}, err
 	}
@@ -83,7 +121,7 @@ func (s *RuntimeService) Health(ctx context.Context, appRef string) (*domain.App
 	if err != nil {
 		return nil, nil, domain.RuntimeHealth{}, err
 	}
-	health, err := adapter.Health(ctx, spec)
+	health, err := adapter.Health(ctx, spec, slot)
 	if err != nil {
 		return nil, nil, domain.RuntimeHealth{}, err
 	}
@@ -93,16 +131,22 @@ func (s *RuntimeService) Health(ctx context.Context, appRef string) (*domain.App
 // ResolveRuntimeOperation 是创建侧的前置校验：应用存在、manifest 已登记、适配器可用
 // 且能执行这份规格，最后把资源规范成应用 ID。规范化是必要的——同一个应用无论用名称
 // 还是 ID 提交 runtime.start，都必须命中同一把资源锁。
-func (s *RuntimeService) ResolveRuntimeOperation(ctx context.Context, kind, appRef string) (string, error) {
+func (s *RuntimeService) ResolveRuntimeOperation(ctx context.Context, kind, appRef, rawSlot string) (string, domain.Slot, error) {
 	if kind != v1.KindRuntimeStart && kind != v1.KindRuntimeStop {
-		return "", domain.NewError(v1.CodeInvalidRequest,
+		return "", "", domain.NewError(v1.CodeInvalidRequest,
 			"运行时操作只支持 %s 与 %s（got %q）", v1.KindRuntimeStart, v1.KindRuntimeStop, kind)
 	}
-	app, _, err := s.Validate(ctx, appRef)
+	app, spec, err := s.Validate(ctx, appRef)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return app.ID, nil
+	// 槽位在这里也要校验，而且**要在建 Operation 之前**：提交一个「打错槽位」的操作
+	// 会先排队、再失败，而这类错误没有任何理由延后报。
+	slot, err := CheckSlot(spec, rawSlot)
+	if err != nil {
+		return "", "", err
+	}
+	return app.ID, slot, nil
 }
 
 // adapter 供同包的 worker 使用：执行侧与创建侧必须用同一个适配器实例，

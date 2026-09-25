@@ -440,7 +440,7 @@ func TestRuntimeClientMethods(t *testing.T) {
 		t.Fatalf("unexpected validate response: %+v", validate)
 	}
 
-	prepare, err := client.PrepareRuntime(context.Background(), "billing-api")
+	prepare, err := client.PrepareRuntime(context.Background(), "billing-api", "")
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestRuntimeClientMethods(t *testing.T) {
 		t.Fatalf("unexpected prepare response: %+v", prepare)
 	}
 
-	health, err := client.RuntimeHealth(context.Background(), "billing-api")
+	health, err := client.RuntimeHealth(context.Background(), "billing-api", "")
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
@@ -494,7 +494,7 @@ func TestRuntimeClientSurfacesCodedErrors(t *testing.T) {
 	if domain.CodeOf(err) != v1.CodeRuntimeUnsupport || v1.ExitCode(domain.CodeOf(err)) != 21 {
 		t.Fatalf("want RUNTIME_UNSUPPORTED/21, got %s/%d (%v)", domain.CodeOf(err), v1.ExitCode(domain.CodeOf(err)), err)
 	}
-	if _, err := client.RuntimeHealth(context.Background(), "billing-api"); domain.CodeOf(err) != v1.CodeRuntimeNotReady {
+	if _, err := client.RuntimeHealth(context.Background(), "billing-api", ""); domain.CodeOf(err) != v1.CodeRuntimeNotReady {
 		t.Fatalf("want RUNTIME_NOT_READY, got %v", err)
 	}
 	if _, err := client.ValidateRuntime(context.Background(), "billing-api"); domain.CodeOf(err) != v1.CodeSpecNotFound {

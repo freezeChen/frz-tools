@@ -21,6 +21,9 @@ type fakeRuntimeAdapter struct {
 	calls []string
 	last  *domain.ApplicationSpec
 
+	// lastSlot 是最近一次调用带的槽位（蓝绿断言要用）。
+	lastSlot domain.Slot
+
 	validateErr error
 	prepareErr  error
 	startErr    error
@@ -35,17 +38,26 @@ type fakeRuntimeAdapter struct {
 	startEntered chan struct{}
 }
 
-func (f *fakeRuntimeAdapter) record(name string, spec *domain.ApplicationSpec) {
+func (f *fakeRuntimeAdapter) record(name string, spec *domain.ApplicationSpec, slot domain.Slot) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, name)
 	f.last = spec
+	// 槽位也记下来：蓝绿的断言要问「这次动作打在哪一侧」，而它是操作身份的一部分，
+	// 不体现在 spec 里（规格对两个槽位是同一份）。
+	f.lastSlot = slot
 }
 
 func (f *fakeRuntimeAdapter) callNames() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.calls...)
+}
+
+func (f *fakeRuntimeAdapter) lastSlotSeen() domain.Slot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastSlot
 }
 
 func (f *fakeRuntimeAdapter) lastSpec() *domain.ApplicationSpec {
@@ -55,12 +67,12 @@ func (f *fakeRuntimeAdapter) lastSpec() *domain.ApplicationSpec {
 }
 
 func (f *fakeRuntimeAdapter) Validate(_ context.Context, spec *domain.ApplicationSpec) error {
-	f.record("validate", spec)
+	f.record("validate", spec, "")
 	return f.validateErr
 }
 
-func (f *fakeRuntimeAdapter) Prepare(_ context.Context, spec *domain.ApplicationSpec) error {
-	f.record("prepare", spec)
+func (f *fakeRuntimeAdapter) Prepare(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
+	f.record("prepare", spec, slot)
 	if f.prepareErrWhen != nil {
 		if err := f.prepareErrWhen(spec); err != nil {
 			return err
@@ -69,8 +81,8 @@ func (f *fakeRuntimeAdapter) Prepare(_ context.Context, spec *domain.Application
 	return f.prepareErr
 }
 
-func (f *fakeRuntimeAdapter) Start(ctx context.Context, spec *domain.ApplicationSpec) error {
-	f.record("start", spec)
+func (f *fakeRuntimeAdapter) Start(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
+	f.record("start", spec, slot)
 	if f.startEntered != nil {
 		close(f.startEntered)
 		<-ctx.Done()
@@ -79,18 +91,18 @@ func (f *fakeRuntimeAdapter) Start(ctx context.Context, spec *domain.Application
 	return f.startErr
 }
 
-func (f *fakeRuntimeAdapter) Stop(_ context.Context, spec *domain.ApplicationSpec) error {
-	f.record("stop", spec)
+func (f *fakeRuntimeAdapter) Stop(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
+	f.record("stop", spec, slot)
 	return f.stopErr
 }
 
-func (f *fakeRuntimeAdapter) Health(_ context.Context, spec *domain.ApplicationSpec) (domain.RuntimeHealth, error) {
-	f.record("health", spec)
+func (f *fakeRuntimeAdapter) Health(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeHealth, error) {
+	f.record("health", spec, slot)
 	return f.health, f.healthErr
 }
 
-func (f *fakeRuntimeAdapter) Status(_ context.Context, spec *domain.ApplicationSpec) (domain.RuntimeStatus, error) {
-	f.record("status", spec)
+func (f *fakeRuntimeAdapter) Status(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeStatus, error) {
+	f.record("status", spec, slot)
 	return domain.RuntimeActive, nil
 }
 
@@ -330,10 +342,10 @@ func TestRuntimeOperationRequiresAdapter(t *testing.T) {
 	if _, _, err := rt.Runtimes.Validate(context.Background(), app.Name); domain.CodeOf(err) != v1.CodeRuntimeUnsupport {
 		t.Fatalf("sync validate want RUNTIME_UNSUPPORTED, got %s", domain.CodeOf(err))
 	}
-	if _, _, _, _, err := rt.Runtimes.Prepare(context.Background(), app.Name); domain.CodeOf(err) != v1.CodeRuntimeUnsupport {
+	if _, _, _, _, err := rt.Runtimes.Prepare(context.Background(), app.Name, ""); domain.CodeOf(err) != v1.CodeRuntimeUnsupport {
 		t.Fatalf("sync prepare want RUNTIME_UNSUPPORTED, got %s", domain.CodeOf(err))
 	}
-	if _, _, _, err := rt.Runtimes.Health(context.Background(), app.Name); domain.CodeOf(err) != v1.CodeRuntimeUnsupport {
+	if _, _, _, err := rt.Runtimes.Health(context.Background(), app.Name, ""); domain.CodeOf(err) != v1.CodeRuntimeUnsupport {
 		t.Fatalf("health want RUNTIME_UNSUPPORTED, got %s", domain.CodeOf(err))
 	}
 }
@@ -366,7 +378,7 @@ func TestRuntimeOperationKindIsRestricted(t *testing.T) {
 	app := seedApplicationWithSpec(t, rt, "billing-api")
 
 	// 只有 start/stop 属于运行时操作；别的 kind 不进这条路径。
-	if _, err := rt.Runtimes.ResolveRuntimeOperation(context.Background(), "runtime.restart", app.Name); domain.CodeOf(err) != v1.CodeInvalidRequest {
+	if _, _, err := rt.Runtimes.ResolveRuntimeOperation(context.Background(), "runtime.restart", app.Name, ""); domain.CodeOf(err) != v1.CodeInvalidRequest {
 		t.Fatalf("want INVALID_REQUEST, got %v", err)
 	}
 }
@@ -495,7 +507,7 @@ func TestRuntimeSyncUseCases(t *testing.T) {
 
 	// prepare 幂等可重复，并回传档位决策。
 	for i := 0; i < 2; i++ {
-		_, _, decision, ok, err := rt.Runtimes.Prepare(context.Background(), app.Name)
+		_, _, decision, ok, err := rt.Runtimes.Prepare(context.Background(), app.Name, "")
 		if err != nil {
 			t.Fatalf("prepare #%d: %v", i+1, err)
 		}
@@ -505,7 +517,7 @@ func TestRuntimeSyncUseCases(t *testing.T) {
 	}
 
 	// health 把未就绪当作快照而不是错误；确定性失败才由适配器返回 RUNTIME_NOT_READY。
-	_, _, health, err := rt.Runtimes.Health(context.Background(), app.Name)
+	_, _, health, err := rt.Runtimes.Health(context.Background(), app.Name, "")
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
@@ -513,7 +525,7 @@ func TestRuntimeSyncUseCases(t *testing.T) {
 		t.Fatalf("unexpected health: %+v", health)
 	}
 	adapter.healthErr = domain.NewError(v1.CodeRuntimeNotReady, "unit 处于 failed 状态")
-	if _, _, _, err := rt.Runtimes.Health(context.Background(), app.Name); domain.CodeOf(err) != v1.CodeRuntimeNotReady {
+	if _, _, _, err := rt.Runtimes.Health(context.Background(), app.Name, ""); domain.CodeOf(err) != v1.CodeRuntimeNotReady {
 		t.Fatalf("want RUNTIME_NOT_READY, got %v", err)
 	}
 
@@ -528,7 +540,7 @@ func TestRuntimePrepareWithoutReporterOmitsDecision(t *testing.T) {
 	rt, _ := newTestRuntimeWith(t, Options{RuntimeAdapter: adapter})
 	app := seedApplicationWithSpec(t, rt, "billing-api")
 
-	_, _, _, ok, err := rt.Runtimes.Prepare(context.Background(), app.Name)
+	_, _, _, ok, err := rt.Runtimes.Prepare(context.Background(), app.Name, "")
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}

@@ -7,7 +7,6 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
-	"strings"
 	"syscall"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
@@ -67,19 +66,29 @@ func (a *Adapter) ensureUser(ctx context.Context, runUser, home string) error {
 // 紧接着的 Activate 就会因为改名目标是目录而失败，报出来的还是一句与真实原因无关的
 // 「改名失败」。根目录仍然要建：unit 的 ReadWritePaths= 指向它，而路径不存在会让
 // systemd 的命名空间设置直接失败。
-func (a *Adapter) ensureDirectories(spec *domain.ApplicationSpec, owner ownership) error {
-	for _, dir := range []struct {
+func (a *Adapter) ensureDirectories(spec *domain.ApplicationSpec, slot domain.Slot, owner ownership) error {
+	type directory struct {
 		path string
 		mode os.FileMode
-	}{
+	}
+	dirs := []directory{
 		{spec.Exec.WorkingDirectory, appDirMode},
 		{spec.Logs.Directory, appDirMode},
 		// 解包目录用 domain.ReleaseDir 的约定路径的父目录（releases 根），
 		// 与 unit 的 ReadWritePaths 保持一致；release 目录本身属迭代 3。
 		{domain.ReleaseRootDir(spec.Application), appDirMode},
-		{domain.SecretsDir(spec.Application), secretDirMode},
-	} {
-		if domain.InReleaseTree(spec.Application, dir.path) {
+		{domain.SecretsDirFor(spec.Application, slot), secretDirMode},
+	}
+	if slot != "" {
+		// 槽位目录由我们建（unit 的 ReadWritePaths= 可能指着它，路径不存在会让
+		// systemd 的命名空间设置失败）；它**里面**的 current 指针归 ReleaseAdapter。
+		dirs = append(dirs, directory{domain.SlotDir(spec.Application, slot), appDirMode})
+	}
+	for _, dir := range dirs {
+		// 两个子树（releases 与 slots）的内部都归 ReleaseAdapter：这里若「顺手」把
+		// current 建成实体目录，紧接着的符号链接切换就会以「改名失败」收场
+		// （迭代 3c 在 releases 树里踩过，见 domain.InReleaseTree / InSlotTree）。
+		if domain.InReleaseTree(spec.Application, dir.path) || domain.InSlotTree(spec.Application, dir.path) {
 			continue
 		}
 		if err := a.ensureDirectory(dir.path, dir.mode, owner); err != nil {
@@ -195,8 +204,8 @@ func (a *Adapter) resolveSecrets(ctx context.Context, spec *domain.ApplicationSp
 //
 // 宁可 Prepare 失败，也不要让应用带着一个打不开的凭据路径启动：那种失败发生在目标主机的
 // 应用进程里，比这里难排查一个数量级。
-func (a *Adapter) ensureCredentialReachable(spec *domain.ApplicationSpec, owner ownership) error {
-	levels := credentialPathLevels(spec.Application)
+func (a *Adapter) ensureCredentialReachable(spec *domain.ApplicationSpec, slot domain.Slot, owner ownership) error {
+	levels := credentialPathLevels(spec.Application, slot)
 	// levels 的末项是凭据目录本身：按 §7 它是 0700、属主 runUser，模式由 ensureDirectory
 	// 收敛，这里只校验、不参与「补穿越位」——否则在属主恰好是 opsd 的环境里它会被放大成
 	// 0711（测试环境正是这种情况），而一个「靠环境差异才不会发生」的行为不算行为。
@@ -245,8 +254,8 @@ func (a *Adapter) ensureCredentialReachable(spec *domain.ApplicationSpec, owner 
 
 // credentialPathLevels 返回 kind=file 凭据路径上从根到叶的每一级目录，含凭据目录本身。
 // 顺序是根到叶：出错时按阅读顺序报告，第一处不可穿越的层级就是需要修的那一级。
-func credentialPathLevels(application string) []string {
-	leaf := domain.SecretsDir(application)
+func credentialPathLevels(application string, slot domain.Slot) []string {
+	leaf := domain.SecretsDirFor(application, slot)
 	levels := []string{leaf}
 	for dir := leaf; ; {
 		parent := path.Dir(dir)
@@ -291,9 +300,11 @@ func traversable(mode os.FileMode, dirUID, dirGID int, user ownership) bool {
 // 叶子由 ensureDirectory 按规格收敛；kind=file 的凭据链另外过一遍
 // ensureCredentialReachable（它可能要补穿越位）。这里不再出现任何"默认 0755"的假设——
 // 之前那句注释就是错的：没有任何一条路径会产出 0755。
-func (a *Adapter) writeEnvFiles(spec *domain.ApplicationSpec, secrets *resolvedSecrets, owner ownership) error {
-	if err := a.writeFile(spec, domain.EnvFilePath(spec.Application),
-		unitfile.RenderEnvFile(spec.Exec.Environment), secretFileMode, owner); err != nil {
+func (a *Adapter) writeEnvFiles(spec *domain.ApplicationSpec, slot domain.Slot, secrets *resolvedSecrets, owner ownership) error {
+	// 蓝绿应用的环境是**合并**后的（共享项 + 该槽位自己的项，同名以槽位为准）：
+	// 两个槽位要改的往往只有端口那一项，让运维把其余变量抄两遍没有意义。
+	if err := a.writeFile(spec, domain.EnvFilePathFor(spec.Application, slot),
+		unitfile.RenderEnvFile(spec.SlotEnvironment(slot)), secretFileMode, owner); err != nil {
 		return err
 	}
 
@@ -304,15 +315,15 @@ func (a *Adapter) writeEnvFiles(spec *domain.ApplicationSpec, secrets *resolvedS
 		secretEnv[name] = value
 	}
 	for _, name := range spec.SecretFileNames() {
-		secretEnv[name] = domain.SecretFileVarValue(spec.Application, name)
+		secretEnv[name] = domain.SecretFileVarValueFor(spec.Application, slot, name)
 	}
-	if err := a.writeFile(spec, domain.SecretsEnvFilePath(spec.Application),
+	if err := a.writeFile(spec, domain.SecretsEnvFilePathFor(spec.Application, slot),
 		unitfile.RenderEnvFile(secretEnv), secretFileMode, owner); err != nil {
 		return err
 	}
 
 	for _, name := range spec.SecretFileNames() {
-		if err := a.writeFile(spec, filepath.Join(domain.SecretsDir(spec.Application), name),
+		if err := a.writeFile(spec, filepath.Join(domain.SecretsDirFor(spec.Application, slot), name),
 			[]byte(secrets.file[name]), secretFileMode, owner); err != nil {
 			return err
 		}
@@ -321,19 +332,19 @@ func (a *Adapter) writeEnvFiles(spec *domain.ApplicationSpec, secrets *resolvedS
 }
 
 // writeUnit 渲染并落盘 unit，返回渲染结果与「是否真的改动了文件」。
-func (a *Adapter) writeUnit(ctx context.Context, spec *domain.ApplicationSpec) (unitfile.Rendered, bool, error) {
+func (a *Adapter) writeUnit(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (unitfile.Rendered, bool, error) {
 	version, err := a.detectVersion(ctx)
 	if err != nil {
 		return unitfile.Rendered{}, false, err
 	}
 	// 用已经探测并缓存的版本渲染，而不是 RenderForHost：后者会再探测一次，
 	// 让「写进注释的版本」与「本次校验用的版本」变成两个可能不一致的来源。
-	rendered, err := unitfile.RenderForVersion(spec, version)
+	rendered, err := unitfile.RenderForVersion(spec, slot, version)
 	if err != nil {
 		return unitfile.Rendered{}, false, err
 	}
 	changed, err := a.writeFileIfChanged(
-		a.RootPath(domain.UnitPath(spec.Systemd.UnitName)), []byte(rendered.Content), unitMode)
+		a.RootPath(domain.UnitPath(spec.UnitNameFor(slot))), []byte(rendered.Content), unitMode)
 	if err != nil {
 		return unitfile.Rendered{}, false, err
 	}
@@ -383,35 +394,24 @@ func (a *Adapter) writeFileIfChanged(path string, content []byte, mode os.FileMo
 
 // mustRun 执行一条命令并要求退出码为 0。非零退出码把 stderr 一起带出去：
 // 排查 systemd 问题时，错误信息里有没有 stderr 决定了是两分钟还是两小时。
-func (a *Adapter) mustRun(ctx context.Context, code v1.ErrorCode, argv ...string) (Result, error) {
-	result, err := a.runner(ctx, argv)
-	if err != nil {
-		return result, domain.NewError(code, "执行 %s 失败: %v", strings.Join(argv, " "), err)
-	}
-	if result.ExitCode != 0 {
-		return result, domain.NewError(code, "%s 退出码 %d: %s",
-			strings.Join(argv, " "), result.ExitCode, strings.TrimSpace(result.Stderr))
-	}
-	return result, nil
-}
 
 // prepared 用 unit 文件是否存在作为「已经 Prepare 过」的判据。
 // 没有 unit 就 Start，等于让 systemd 去跑一个 opsd 完全没有准备过的东西
 // （用户、目录、凭据都可能不存在）。
-func (a *Adapter) prepared(spec *domain.ApplicationSpec) error {
-	exists, err := a.unitFileExists(spec)
+func (a *Adapter) prepared(spec *domain.ApplicationSpec, slot domain.Slot) error {
+	exists, err := a.unitFileExists(spec, slot)
 	if err != nil {
 		return err
 	}
 	if !exists {
 		return domain.NewError(v1.CodeRuntimeNotReady,
-			"应用 %s 尚未 Prepare：unit 文件 %s 不存在", spec.Application, domain.UnitPath(spec.Systemd.UnitName))
+			"应用 %s 尚未 Prepare：unit 文件 %s 不存在", spec.Application, domain.UnitPath(spec.UnitNameFor(slot)))
 	}
 	return nil
 }
 
-func (a *Adapter) unitFileExists(spec *domain.ApplicationSpec) (bool, error) {
-	_, err := os.Stat(a.RootPath(domain.UnitPath(spec.Systemd.UnitName)))
+func (a *Adapter) unitFileExists(spec *domain.ApplicationSpec, slot domain.Slot) (bool, error) {
+	_, err := os.Stat(a.RootPath(domain.UnitPath(spec.UnitNameFor(slot))))
 	switch {
 	case err == nil:
 		return true, nil
