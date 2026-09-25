@@ -881,3 +881,31 @@
   容器」的 `container_count()`。
 - **仍未验证**：`legacy` 档的 **232～239 那一段**（无对应版本的主机，不得写成「整档已验证」）、
   以及 strict 档上「修复后的 3c 复跑」（那台主机 `192.168.11.101` 复跑前整段网段从本机不可达）。
+
+### 2026-09-25（补记十三）迭代 4 开工：Nginx 蓝绿的规格冻结，与 4a（槽位进数据层）
+
+- **变更原因**：按路线图第 7 节进入迭代 4（Nginx 蓝绿发布、观察窗口与回滚）。规格冻结在
+  `docs/plans/2026-09-25-iteration-4.md`，拆成 4a（槽位进领域与数据层）、4b（蓝绿部署与切流）、
+  4c（观察、对账与命令）三片。
+- **三条由用户拍板的决定**（规格第 11 节）：**Nginx 蓝绿**（不做「只加观察」与「两套按应用可选」）、
+  **两个槽位各自显式声明端口**（不做基准 + 偏移的魔数，也不做环境变量注入）、
+  **观察窗口 + 手动回滚**（自动回滚本迭代不做——阈值定错的自动切流比不切更危险）。
+- **与迭代 3 的关系（必须先说清）**：迭代 3 的「一个应用一个 unit + `current` 链接 + 先停后起」
+  与蓝绿的「新进程先起来、再切流、旧进程排空后停」是**互斥**的两套语义。本轮的选择是
+  **蓝绿为声明式可选形态**：manifest 里不写 `exec.slots` 的应用行为一字不变。代价是两套语义
+  同时存在，因此「哪些字段互斥」被写成**校验**（`exec.slots` ↔ `exec.ports` / `systemd.unitName` /
+  `health.readiness`），而不是留给文档解释。
+- **4a 交付**：`domain.Slot` 与派生路径（槽位目录、槽位 `current`、按槽位的环境文件、
+  `<app>-<slot>.service`、受管 Nginx 文件）；`SpecSlot` / `SpecNginx` 与全部校验；
+  release 状态只加 `standby`（**`active` 的含义扩成「正在接流量」，不为蓝绿另立 `serving`**）；
+  迁移 `0010`（`releases.slot`、`applications.serving_slot`、`application_slots` 表，
+  NULL = 单槽形态，既有数据语义不变）；manifest 的 `exec.slots` / `nginx` 段与解码。
+- **两处实现时对规格的修正**（都就地写进规格）：①`active` 复用而非新增 `serving`；
+  ②nginx 的默认值在 **manifest 解码那一层**补——`observationSeconds: 0` 是「显式不观察」，
+  而 domain 的 `int` 分不出「没写」与「写了 0」，在 `applyDefaults` 里补默认值会让这个开关
+  永远做不到。
+- **验证**：`make ci` 通过；新增单元用例——蓝绿 manifest 的解码与 **16 条拒绝用例**、
+  单槽 manifest 的兼容性回归、`releases.slot` / `application_slots` / `applications.serving_slot`
+  在真实 SQLite 上的往返与 upsert 语义（含「不传 switchedAt 时保留上一次切流时间」）。
+- **仍未验证**：一切涉及进程、systemd 与 Nginx 的行为（属 4b）；`legacy` 档（CentOS 7）能不能
+  装 Nginx 尚未试过；存量单槽应用迁移到蓝绿**本迭代不做**。

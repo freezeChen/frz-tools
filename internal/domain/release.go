@@ -30,12 +30,12 @@ func (a *Application) Validate() error {
 // active，而**上一次** active 的那个 Release 变成 superseded——那一刻并没有任何 Operation
 // 在跑。
 //
-// 状态转移只有这些（迭代 3 规格 §5）：
+// 状态转移只有这些（迭代 3 规格 §5 + 迭代 4 的 standby）：
 //
-//	created    → deploying → active → superseded
+//	created    → deploying → active → superseded → active（回滚：旧的又被切回来）
+//	                       ↘ standby → active
 //	                       ↘ failed
-//	active     → superseded（被下一次成功部署取代）
-//	非 active  → removed（被保留策略清理；current 指向的那个永远不能被删）
+//	非 active  → removed（被保留策略清理；current / 槽位指针指向的那个永远不能被删）
 type ReleaseStatus string
 
 const (
@@ -44,8 +44,19 @@ const (
 	ReleaseCreated ReleaseStatus = "created"
 	// ReleaseDeploying 表示这一次部署正在进行。
 	ReleaseDeploying ReleaseStatus = "deploying"
-	// ReleaseActive 是**当前激活**：current 指针指向它。
+	// ReleaseActive 是**正在接流量**的那个版本。
+	//
+	// 单槽形态里它就是 `current` 指向的那一个；蓝绿形态（迭代 4）里它是
+	// `applications.serving_slot` 所指槽位正在跑的那一个。**两种形态共用一个取值**：
+	// 「哪个版本正在对外服务」是同一个概念，为蓝绿另立一个 `serving` 只会让
+	// ActiveRelease / Rollbackable / 保留策略三处都要各判一次，进而漂移。
 	ReleaseActive ReleaseStatus = "active"
+	// ReleaseStandby 是**起来了、就绪了，但还没接流量**（迭代 4）。
+	//
+	// 观察窗口内的新槽位就是这个状态：进程在跑、探活通过，只是 Nginx 还没把流量切过来。
+	// 它**不是回滚目标**（Rollbackable 为假）：回滚到一个从没接过流量的版本没有意义，
+	// 而且它可能随时被判定为失败并停掉。
+	ReleaseStandby ReleaseStatus = "standby"
 	// ReleaseSuperseded 是「曾经激活、被后来的版本取代」。它仍然可以回滚回去。
 	ReleaseSuperseded ReleaseStatus = "superseded"
 	// ReleaseFailed 是这次部署失败（进程没起来、健康没过）。失败时 current 已经切回原处，
@@ -58,9 +69,52 @@ const (
 // Rollbackable 报告这个版本还能不能被回滚回去。
 //
 // 只有「目录还在、且曾经验证过能跑」的版本才算数：active 与 superseded 都满足，
-// failed（从没跑成功）与 removed（目录没了）都不满足。
+// failed（从没跑成功）、standby（还没接过流量）、removed（目录没了）都不满足。
 func (s ReleaseStatus) Rollbackable() bool {
 	return s == ReleaseActive || s == ReleaseSuperseded
+}
+
+// SlotState 是一个**槽位**的运营状态（迭代 4）。
+//
+// 它与 ReleaseStatus 是两个层次的东西：Release 是一次部署的身份，槽位是「这一侧现在
+// 处于什么状态」。同一个槽位先后跑过很多 release，而槽位状态只有这五种。
+type SlotState string
+
+const (
+	// SlotServing 是这一侧正在接流量（流量由 Nginx upstream 指向它）。
+	SlotServing SlotState = "serving"
+	// SlotStandby 是这一侧在运行、但没接流量（新版本起来之后的观察期就是这个状态）。
+	SlotStandby SlotState = "standby"
+	// SlotDraining 是这一侧刚被切走、正在等在途请求结束。
+	SlotDraining SlotState = "draining"
+	// SlotStopped 是这一侧没在运行（回滚过后它就停在 standby 里等着被重新拉起）。
+	SlotStopped SlotState = "stopped"
+	// SlotFailed 是这一侧最后一次动作失败了（进程起不来、观察期被判退化）。
+	SlotFailed SlotState = "failed"
+)
+
+func (s SlotState) Valid() bool {
+	switch s {
+	case SlotServing, SlotStandby, SlotDraining, SlotStopped, SlotFailed:
+		return true
+	}
+	return false
+}
+
+// ApplicationSlot 是一个槽位的运营视图（对应 `application_slots` 表）。
+//
+// 它是**运营视图而不是线上事实**：真正决定请求去哪一边的是 Nginx 的 upstream
+// （见迭代 4 规格 D2）。对账时以 Nginx 为准，这一份是它的镜像。
+type ApplicationSlot struct {
+	ApplicationID string
+	Slot          Slot
+	// ReleaseID 是这个槽位当前跑着的 release。空表示还没部署过。
+	ReleaseID string
+	State     SlotState
+	// SwitchedAt 是**流量最近一次切到这一侧**的时刻（不是部署时刻）：
+	// 排查「什么时候切的」时，这正是要看的那个时间。
+	SwitchedAt *time.Time
+	UpdatedAt  time.Time
 }
 
 // Release 是一次部署的记录。
@@ -74,6 +128,9 @@ type Release struct {
 	CreatedBy     string
 
 	Status ReleaseStatus
+	// Slot 是这次部署落在哪个槽位（迭代 4）。**空表示单槽形态**——迭代 3 的既有行都是空的，
+	// 而且单槽部署至今仍然是默认形态。
+	Slot Slot
 	// Directory 是磁盘上这个 release 的目录（绝对路径）。它记在库里，是为了让
 	// 「库里有记录、盘上没目录」这类不一致能被发现，而不是要靠拼路径去猜。
 	Directory   string

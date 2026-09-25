@@ -2,8 +2,6 @@ package domain
 
 import (
 	"fmt"
-	"net"
-	"net/url"
 	"path"
 	"regexp"
 	"sort"
@@ -77,6 +75,8 @@ type ApplicationSpec struct {
 	Systemd     SpecSystemd
 	Resources   SpecResources
 	Release     SpecRelease
+	// Nginx 是蓝绿应用的对外入口声明（迭代 4）。零值表示没声明。
+	Nginx SpecNginx
 }
 
 // SpecResources 是资源限制。字段是**运行时的意图**而不是 systemd 指令：翻译成
@@ -162,7 +162,10 @@ type SpecExec struct {
 	RunUser           string
 	Environment       map[string]string
 	SecretEnvironment map[string]SecretRef
-	Ports             []int
+	// Ports 是**单槽形态**下应用监听的端口。声明了 Slots 的应用不得再用它（互斥，见 slot.go）。
+	Ports []int
+	// Slots 是**蓝绿形态**：每个槽位自己的端口、就绪目标与环境。空表示单槽（迭代 3 的语义）。
+	Slots map[Slot]SpecSlot
 }
 
 type SpecHealth struct {
@@ -210,7 +213,7 @@ func (s *ApplicationSpec) Validate() error {
 	if err := s.Exec.validate(); err != nil {
 		return err
 	}
-	if err := s.Health.validate(); err != nil {
+	if err := s.Health.validate(s.BlueGreen()); err != nil {
 		return err
 	}
 	if err := s.Logs.validate(); err != nil {
@@ -225,8 +228,47 @@ func (s *ApplicationSpec) Validate() error {
 	if err := s.Release.validate(); err != nil {
 		return err
 	}
+	// 蓝绿形态的跨段校验（迭代 4）：槽位本身、以及「哪些字段与槽位互斥」。
+	// 这些规则必须放在**跨段**的位置：unit 名在 Systemd 段、就绪在 Health 段、
+	// 单槽端口在 Exec 段，而它们与槽位的关系只有在这里才同时看得见。
+	if err := s.validateBlueGreen(); err != nil {
+		return err
+	}
+	if err := s.Nginx.validate(s); err != nil {
+		return err
+	}
 
 	s.applyDefaults()
+	return nil
+}
+
+// validateBlueGreen 校验「蓝绿形态」与其余字段的互斥关系。
+func (s *ApplicationSpec) validateBlueGreen() error {
+	if !s.BlueGreen() {
+		// 反过来也要管：nginx 段只服务蓝绿。没声明槽位却声明了 nginx，
+		// 那是把两套形态各写了一半，而任何一半都不成立。
+		if s.Nginx.Configured() {
+			return NewError(v1.CodeManifestInvalid,
+				"nginx 段只用于蓝绿应用：请同时声明 exec.slots（对外端口由 Nginx 承担）")
+		}
+		return nil
+	}
+	if s.Systemd.UnitName != "" {
+		// unit 名按槽位派生（<app>-<slot>.service）。手写一个名字与派生名字并存，
+		// 会让 enable/stop/status 三处各用一个名字里的一个。
+		return NewError(v1.CodeManifestInvalid,
+			"蓝绿应用不得手写 systemd.unitName：unit 名按槽位派生为 %s",
+			SlotUnitName(s.Application, SlotBlue))
+	}
+	if s.Health.Readiness.Type != "" || s.Health.Readiness.Target != "" {
+		// 两个槽位的端口不同，就绪目标也必然不同——写一份共享的就绪目标是自相矛盾的。
+		return NewError(v1.CodeManifestInvalid,
+			"蓝绿应用的就绪目标请写在 exec.slots.<slot>.readiness 里（health.readiness 是单槽形态的写法）")
+	}
+	if !s.Nginx.Configured() {
+		return NewError(v1.CodeManifestInvalid,
+			"蓝绿应用必须声明 nginx 段：没有对外入口就没有「切流」这件事")
+	}
 	return nil
 }
 
@@ -349,6 +391,11 @@ func (e *SpecExec) validate() error {
 			return NewError(v1.CodeManifestInvalid, "exec.ports 中的端口越界: %d", port)
 		}
 	}
+	// 蓝绿形态的槽位（迭代 4）。放在 Exec 段里校验的是「槽位自己那部分」，
+	// 「槽位与其它段的互斥」在 ApplicationSpec.validateBlueGreen 里（那里才同时看得见）。
+	if err := e.validateSlots(); err != nil {
+		return err
+	}
 
 	// 同名键会让「这个变量到底是敏感的还是非敏感的」变成未定义行为，
 	// 因此不允许在 environment 与 secretEnvironment 之间撞键。
@@ -377,31 +424,16 @@ func (e *SpecExec) validate() error {
 	return nil
 }
 
-func (h *SpecHealth) validate() error {
-	switch h.Readiness.Type {
-	case ReadinessTCP:
-		if _, _, err := net.SplitHostPort(h.Readiness.Target); err != nil {
-			return NewError(v1.CodeManifestInvalid,
-				"readiness.type=tcp 时 target 必须是 host:port（got %q）", h.Readiness.Target)
+// validate 校验健康检查。blueGreen 为真时**跳过就绪目标**：蓝绿应用的就绪是逐槽位声明的
+// （端口不同、目标必然不同），共享一份 readiness 在那里是自相矛盾的——那条互斥规则由
+// validateBlueGreen 明确报错，这里只是不再对一份「本该为空」的 readiness 提要求。
+func (h *SpecHealth) validate(blueGreen bool) error {
+	if !blueGreen {
+		// 就绪规格的校验与蓝绿的槽位共用一份（见 slot.go 的 validateReadiness）：
+		// 复制一份规则出来，漂移的表现会是「单槽能过、蓝绿过不了」这种解释不清的差异。
+		if err := validateReadiness(h.Readiness); err != nil {
+			return NewError(v1.CodeManifestInvalid, "health.readiness: %s", MessageOf(err))
 		}
-	case ReadinessHTTP:
-		parsed, err := url.Parse(h.Readiness.Target)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			return NewError(v1.CodeManifestInvalid,
-				"readiness.type=http 时 target 必须是完整 URL（got %q）", h.Readiness.Target)
-		}
-		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			return NewError(v1.CodeManifestInvalid,
-				"readiness.target 的协议只支持 http/https（got %q）", parsed.Scheme)
-		}
-	case "":
-		return NewError(v1.CodeManifestInvalid, "health.readiness.type 不能为空")
-	default:
-		return NewError(v1.CodeManifestInvalid, "health.readiness.type 取值非法: %q", h.Readiness.Type)
-	}
-
-	if h.Readiness.ConsecutiveSuccesses < 0 {
-		return NewError(v1.CodeManifestInvalid, "health.readiness.consecutiveSuccesses 不能为负数")
 	}
 	if h.StartTimeout < 0 || h.StopTimeout < 0 {
 		return NewError(v1.CodeManifestInvalid, "健康检查超时不能为负数")
@@ -448,6 +480,18 @@ func (s *ApplicationSpec) applyDefaults() {
 	if s.Health.Readiness.ConsecutiveSuccesses == 0 {
 		s.Health.Readiness.ConsecutiveSuccesses = 1
 	}
+	// 槽位的就绪默认值与单槽同源：连续成功次数缺省为 1。
+	// 注意这里写回的是 map 里的值——Go 的 map 取出来是副本，必须显式写回。
+	for slot, spec := range s.Exec.Slots {
+		if spec.Readiness.ConsecutiveSuccesses == 0 {
+			spec.Readiness.ConsecutiveSuccesses = 1
+			s.Exec.Slots[slot] = spec
+		}
+	}
+	// 观察窗口与排空时间的默认值**刻意不在这里补**：0 是一个合法且有意义的取值
+	// （「不观察」「不等排空」），而 domain 的 int 分不出「没写」与「写了 0」。
+	// 这个区别只有 manifest 解码那一层能表达（wire 用指针），因此默认值在那里补，
+	// 用的是 domain 里的 DefaultObservationSeconds / DefaultDrainSeconds 常量。
 }
 
 // SecretEnvNames 按字典序返回 kind=env 的变量名，保证生成的敏感环境文件字节稳定，

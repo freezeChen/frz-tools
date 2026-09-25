@@ -47,6 +47,8 @@ Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真�
   GFS 已移出 2d，见第 22 节）
 - `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a/3b/3c 已实现并验证，
   见 §12–17）
+- `docs/plans/2026-09-25-iteration-4.md`：Nginx 蓝绿发布、观察窗口与回滚（4a 已实现，
+  见第 13–14 节；4b/4c 未开始）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）

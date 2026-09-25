@@ -314,7 +314,7 @@ func scanApplication(sc scanner) (*domain.Application, error) {
 // releaseColumns 是 reads 用的列清单。集中一处，免得三处 SELECT 各自漂移出不同的字段集。
 const releaseColumns = `id, application_id, artifact_id, version, labels_json, created_at, created_by,
 	status, COALESCE(directory, ''), activated_at, finished_at,
-	COALESCE(error_code, ''), COALESCE(error_message, '')`
+	COALESCE(error_code, ''), COALESCE(error_message, ''), COALESCE(slot, '')`
 
 func scanRelease(sc scanner) (*domain.Release, error) {
 	var (
@@ -325,14 +325,17 @@ func scanRelease(sc scanner) (*domain.Release, error) {
 		activated   sql.NullString
 		finished    sql.NullString
 		statusValue string
+		slot        sql.NullString
 	)
 	if err := sc.Scan(&release.ID, &release.ApplicationID, &release.ArtifactID, &release.Version,
 		&labels, &createdAt, &createdBy, &statusValue, &release.Directory,
-		&activated, &finished, &release.ErrorCode, &release.ErrorMessage); err != nil {
+		&activated, &finished, &release.ErrorCode, &release.ErrorMessage, &slot); err != nil {
 		return nil, err
 	}
 	release.CreatedBy = createdBy.String
 	release.Status = domain.ReleaseStatus(statusValue)
+	// NULL = 单槽形态（迭代 3 的既有行）。空 Slot 就是这个意思，不另设哨兵值。
+	release.Slot = domain.Slot(slot.String)
 
 	decoded, err := decodeLabels(labels)
 	if err != nil {
