@@ -1,9 +1,16 @@
 FROM ubuntu:24.04
 
+# nginx 是迭代 4 的蓝绿验证要用的：真 `nginx -t` / `-s reload` / 真切流。
+# curl 是那个验证的**判据工具**（拿到的正文就是「现在服务的是哪一版」）——基础镜像里没有它，
+# 少了它的表现是「切流全部成功、而 curl 全部失败」，看起来像产品坏了（2026-09-26 踩到）。
+# 注释必须写在 RUN **之外**：写在续行中间会把行尾的反斜杠一起注释掉，
+# 整个 RUN 会断成两条命令（而第二条是 `nginx`，直接 not found）。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       systemd \
       systemd-sysv \
+      nginx \
+      curl \
       procps \
       iproute2 \
       ca-certificates \

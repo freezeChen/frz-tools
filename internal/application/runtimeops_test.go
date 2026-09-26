@@ -32,7 +32,9 @@ type fakeRuntimeAdapter struct {
 	// 就必须让上一个版本的 Prepare 照常通过，否则测的就成了「回滚也失败」那条路径。
 	prepareErrWhen func(*domain.ApplicationSpec) error
 	health         domain.RuntimeHealth
-	healthErr      error
+	// healthWhen 非 nil 时按槽位决定健康结果（见 Health）。
+	healthWhen func(domain.Slot) (domain.RuntimeHealth, error)
+	healthErr  error
 
 	// startEntered 非 nil 时 Start 会先关闭它再阻塞到 ctx 结束，用于驱动取消路径。
 	startEntered chan struct{}
@@ -98,6 +100,11 @@ func (f *fakeRuntimeAdapter) Stop(_ context.Context, spec *domain.ApplicationSpe
 
 func (f *fakeRuntimeAdapter) Health(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeHealth, error) {
 	f.record("health", spec, slot)
+	// healthWhen 让健康检查**按槽位**不同：蓝绿的两侧本来就该能分别判断
+	// （「新的那一侧挂了、旧的那侧还好好的」是最常见的一种失败）。
+	if f.healthWhen != nil {
+		return f.healthWhen(slot)
+	}
 	return f.health, f.healthErr
 }
 
@@ -112,7 +119,7 @@ type fakePrepareReporter struct {
 	calls    int
 }
 
-func (f *fakePrepareReporter) ReportRuntimePrepare(_ context.Context, _ *domain.ApplicationSpec) (RuntimeDecision, bool) {
+func (f *fakePrepareReporter) ReportRuntimePrepare(_ context.Context, _ *domain.ApplicationSpec, _ domain.Slot) (RuntimeDecision, bool) {
 	f.calls++
 	if !f.ok {
 		return RuntimeDecision{}, false

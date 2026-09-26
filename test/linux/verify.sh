@@ -25,6 +25,12 @@ CID=""
 
 PASS_COUNT=0
 FAIL_COUNT=0
+# pass/fail 除了计数，还各自落一行日志。**这不是冗余**：在 `$( )` 里调用它们时，
+# 子 shell 的变量改动不会回到父 shell——计数会丢，而日志不会。收尾时比对两者，
+# 就能把「有一行 FAIL 打印出来了、但 FAIL_COUNT 还是 0」这种最难发现的情况抓出来
+# （2026-09-26 真的踩到了：176 项通过 / 0 项失败，而日志里明明白白有一行 FAIL）。
+PASS_LOG=$(mktemp)
+FAIL_LOG=$(mktemp)
 
 # ==== 1c RuntimeAdapter 的验证夹具 ====
 # 探针应用由 harness 放进容器；PROBE_ENV_VALUE 是 kind=env 凭据的值，里面刻意塞进
@@ -39,14 +45,14 @@ PROBE_ENV_VALUE=' \back"quote\n$dollar'\''quote '
 PROBE_DIR=/etc/opsd/apps/${RUNTIME_APP}
 
 log()  { printf '\n--- %s\n' "$*"; }
-pass() { PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS  %s\n' "$*"; }
-fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL  %s\n' "$*" >&2; }
+pass() { PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS  %s\n' "$*"; printf '%s\n' "$*" >> "$PASS_LOG"; }
+fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL  %s\n' "$*" >&2; printf '%s\n' "$*" >> "$FAIL_LOG"; }
 
 cleanup() {
   if [ -n "$CID" ]; then
     docker rm -f "$CID" >/dev/null 2>&1 || true
   fi
-  rm -rf "$WORK_DIR"
+  rm -rf "$WORK_DIR" "$PASS_LOG" "$FAIL_LOG"
 }
 trap cleanup EXIT
 
@@ -1546,6 +1552,211 @@ MANIFEST
   require_ok "解释器存在时 runtime validate 通过" runtimectl runtime validate --app "${japp}"
 }
 
+# 迭代 4：Nginx 蓝绿。**这一段的证据是 curl 拿到的内容**——它不是「端口在听」，
+# 而是「现在服务的是哪一版」，比端口强一层。
+check_bluegreen() {
+  log "迭代 4：Nginx 蓝绿切流（真 Nginx、真切流）"
+
+  local app=frz-bg
+  local vport=8080      # Nginx 的对外端口
+  local blue_port=28621
+  local green_port=28622
+  local managed=/etc/nginx/frz-managed/${app}.conf
+
+  # Nginx 是这一段的前提。Ubuntu 的包会 enable 它，但容器里的系统服务未必都已经起来，
+  # 因此这里显式确认一次——失败要失败在「没有 Nginx」，而不是后面某条看不懂的断言上。
+  q systemctl start nginx >/dev/null 2>&1 || true
+  assert_eq "Nginx 在跑（蓝绿的前提）" "active" "$(q systemctl is-active nginx)"
+
+  require_ok "注册应用" runtimectl app create "${app}"
+
+  local uploaded artifact_id
+  uploaded=$(rq artifact put /opt/frz-ops/frz-probe --media-type application/octet-stream --json)
+  artifact_id=$(printf '%s' "${uploaded}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "${artifact_id}" ]; then
+    fail "制品上传失败：${uploaded}"
+    return 0
+  fi
+
+  # 蓝绿 manifest：两个槽位各一个端口 + 一个对外端口。
+  #
+  # **端口与版本都从槽位环境里来**：两个槽位共用同一份 argv，而它们必须听不同的端口。
+  # 这正是规格 D6 里那条契约的实样——「应用怎么知道自己的端口」由运维通过槽位环境告诉它，
+  # 工具不发明 FRZ_SLOT_PORT 之类的魔法名字。探针作为被托管的应用，读的也是它自己的变量。
+  bg_manifest() { # 版本
+    local version=$1
+    cat <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${app}
+runtime: go
+artifact:
+  id: ${artifact_id}
+  version: ${version}
+  fileName: bin/frz-probe
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - bin/frz-probe
+    - --report
+    - /var/lib/${app}/probe-report.txt
+  workingDirectory: /var/lib/${app}
+  runUser: ${app}
+  slots:
+    blue:
+      ports: [${blue_port}]
+      readiness:
+        type: tcp
+        target: "127.0.0.1:${blue_port}"
+        consecutiveSuccesses: 1
+      environment:
+        FRZ_PROBE_LISTEN: "127.0.0.1:${blue_port}"
+        FRZ_PROBE_VERSION: "${version}"
+    green:
+      ports: [${green_port}]
+      readiness:
+        type: tcp
+        target: "127.0.0.1:${green_port}"
+        consecutiveSuccesses: 1
+      environment:
+        FRZ_PROBE_LISTEN: "127.0.0.1:${green_port}"
+        FRZ_PROBE_VERSION: "${version}"
+health:
+  startTimeoutSeconds: 30
+  stopTimeoutSeconds: 15
+logs:
+  directory: /var/log/${app}
+nginx:
+  listen: ${vport}
+  observationSeconds: 2
+  drainSeconds: 1
+release:
+  keepLast: 3
+MANIFEST
+  }
+
+  # bg_deploy 把 operation id 写进全局 BG_OP_ID，**不用 $( ) 取返回值**：命令替换是子
+  # shell，里面的 pass/fail 不会计入父 shell 的计数（而日志会记——见 PASS_LOG/FAIL_LOG
+  # 那道元断言）。这个坑 2026-09-26 真的踩到了。
+  bg_deploy() { # 描述 版本
+    local desc=$1 version=$2
+    BG_OP_ID=""
+    bg_manifest "${version}" > "$WORK_DIR/bg-${version}.yaml"
+    docker cp "$WORK_DIR/bg-${version}.yaml" "$CID:/opt/frz-ops/bg-${version}.yaml"
+    local out id
+    out=$(rq app deploy --app "${app}" --file "/opt/frz-ops/bg-${version}.yaml" --json)
+    id=$(printf '%s' "${out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+    if [ -z "${id}" ]; then
+      fail "${desc}：未返回 operation id（${out}）"
+      return 1
+    fi
+    if ! wait_for_status "${id}" "succeeded" "${RUNTIME_SOCK}"; then
+      fail "${desc}：部署未成功（$(rq operation get "${id}" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p' | head -1)：$(rq operation logs "${id}" --json | sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' | tail -3 | tr '\n' ' ')）"
+      return 1
+    fi
+    pass "${desc}"
+    BG_OP_ID="${id}"
+    return 0
+  }
+
+  served_version() { # 从 Nginx 的对外端口读回「现在服务的是哪一版」
+    q sh -c "curl -s -m 3 http://127.0.0.1:${vport}/ | tr -d '\r\n'"
+  }
+
+  # A) 反例：主配置还没 include 受管的目录 → 部署必须**拒绝切流**。
+  #
+  #    这是这一层最要紧的一条：配置写对了但没生效时，切流看起来会成功，而流量根本不
+  #    经过我们改的 upstream。宁可在这里失败。
+  bg_manifest 1.0.0 > "$WORK_DIR/bg-1.0.0.yaml"
+  docker cp "$WORK_DIR/bg-1.0.0.yaml" "$CID:/opt/frz-ops/bg-1.0.0.yaml"
+  local out id
+  out=$(rq app deploy --app "${app}" --file /opt/frz-ops/bg-1.0.0.yaml --json)
+  id=$(printf '%s' "${out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "${id}" ]; then
+    fail "未返回 operation id：${out}"
+  elif wait_for_status "${id}" "failed" "${RUNTIME_SOCK}"; then
+    assert_eq "受管目录没被主配置加载时的错误码" "NGINX_CONFIG_INVALID" \
+      "$(rq operation get "${id}" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p' | head -1)"
+    assert_eq "报错指出了该怎么办（include 受管目录）" "yes" \
+      "$(rq operation logs "${id}" --json | grep -q 'frz-managed' && echo yes || echo no)"
+  else
+    fail "主配置没有 include 受管目录，部署本该失败却成功了"
+  fi
+  assert_eq "被拒绝的部署没有让 Nginx 监听到对外端口" "no" \
+    "$(q sh -c "ss -lnt | grep -q ':${vport} ' && echo yes || echo no")"
+
+  # B) 运维的那一步：在主配置里 include 受管目录（一行 conf.d 文件即可）。
+  require_ok "把受管目录加进主配置（运维的动作）" \
+    q sh -c "printf 'include /etc/nginx/frz-managed/*.conf;\n' > /etc/nginx/conf.d/frz-managed.conf && nginx -t"
+
+  # C) 第一次部署：1.0.0 落到 blue，对外端口能拿到 version=1.0.0。
+  bg_deploy "第一次部署 1.0.0（落 blue）" 1.0.0 || return 0
+  assert_eq "对外端口拿到的版本" "version=1.0.0" "$(served_version)"
+  assert_eq "blue 的 unit 在跑" "active" "$(q systemctl is-active ${app}-blue.service)"
+  assert_eq "green 的 unit 没被起过" "inactive" "$(q systemctl is-active ${app}-green.service)"
+  assert_eq "受管配置指向 blue 的端口" "yes" \
+    "$(q sh -c "grep -q 'server 127.0.0.1:${blue_port};' ${managed} && echo yes || echo no")"
+  assert_eq "受管配置里没有 green 的端口" "no" \
+    "$(q sh -c "grep -q '${green_port}' ${managed} && echo yes || echo no")"
+  assert_eq "受管配置的头注释说明了它指向哪一侧" "yes" \
+    "$(q sh -c "head -2 ${managed} | grep -q 'blue' && echo yes || echo no")"
+
+  # D) 第二次部署**期间**持续打请求：切流不能丢掉任何一个请求。
+  cat > "$WORK_DIR/curl-loop.sh" <<'LOOP'
+#!/bin/sh
+# 切流期间持续打请求：成功与失败都各记一行——**只记失败的话，「零失败」可能只是
+# 「零请求」**，而那正是最危险的一种绿。
+while [ ! -f /tmp/frz-bg-stop ]; do
+  if curl -s -m 2 -o /dev/null http://127.0.0.1:8080/; then
+    echo ok >> /tmp/frz-bg-requests
+  else
+    echo fail >> /tmp/frz-bg-requests
+  fi
+  sleep 0.05
+done
+LOOP
+  docker cp "$WORK_DIR/curl-loop.sh" "$CID:/opt/frz-ops/curl-loop.sh"
+  require_ok "启动切流期间的请求循环" \
+    q sh -c 'rm -f /tmp/frz-bg-requests /tmp/frz-bg-stop; chmod 0755 /opt/frz-ops/curl-loop.sh; setsid nohup /opt/frz-ops/curl-loop.sh >/dev/null 2>&1 </dev/null & echo started'
+
+  local switched_ok=0
+  if bg_deploy "第二次部署 2.0.0（切到 green）" 2.0.0; then
+    switched_ok=1
+  fi
+  q sh -c 'touch /tmp/frz-bg-stop' >/dev/null
+  sleep 0.3
+
+  if [ "${switched_ok}" = "1" ]; then
+    assert_eq "切流之后对外端口拿到的是新版本" "version=2.0.0" "$(served_version)"
+  fi
+  assert_eq "切流期间失败的请求数" "0" "$(q sh -c 'grep -c fail /tmp/frz-bg-requests || true')"
+  # 元断言：循环必须**成功地**打过足够多的请求。只看「零失败」是不够的——循环如果压根
+  # 没跑起来（或者容器里没有 curl），它同样会「零失败」，那是一个测不出东西的断言。
+  assert_eq "切流期间成功的请求数 ≥ 50" "yes" \
+    "$(q sh -c 'test "$(grep -c "^ok$" /tmp/frz-bg-requests)" -ge 50 && echo yes || echo no')"
+  assert_eq "green 的 unit 在跑" "active" "$(q systemctl is-active ${app}-green.service)"
+  assert_eq "blue 被排空后停掉" "inactive" "$(q systemctl is-active ${app}-blue.service)"
+  assert_eq "受管配置指向 green 的端口" "yes" \
+    "$(q sh -c "grep -q 'server 127.0.0.1:${green_port};' ${managed} && echo yes || echo no")"
+  # 两个槽位的 unit 各自存在，且都 enable（重启后各自回到该有的状态）。
+  assert_eq "blue 的 unit 开机自启" "enabled" "$(q systemctl is-enabled ${app}-blue.service)"
+  assert_eq "green 的 unit 开机自启" "enabled" "$(q systemctl is-enabled ${app}-green.service)"
+
+  # E) 回滚：把流量切回 1.0.0 所在的 blue。
+  local rollback_out rollback_id
+  rollback_out=$(rq app rollback --app "${app}" --json)
+  rollback_id=$(printf '%s' "${rollback_out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -n "${rollback_id}" ] && wait_for_status "${rollback_id}" "succeeded" "${RUNTIME_SOCK}"; then
+    pass "回滚走 Operation 且成功"
+    assert_eq "回滚后对外端口拿到的是旧版本" "version=1.0.0" "$(served_version)"
+    assert_eq "回滚后 blue 重新在跑" "active" "$(q systemctl is-active ${app}-blue.service)"
+    assert_eq "回滚后 green 被停掉" "inactive" "$(q systemctl is-active ${app}-green.service)"
+  else
+    fail "回滚未成功"
+  fi
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -1593,10 +1804,22 @@ main() {
   check_deploy
   # 迭代 3c：资源限制落进 unit 并被内核采纳，java 解释器预检。
   check_resources
+  # 迭代 4：Nginx 蓝绿（真 Nginx、真 curl）。
+  check_bluegreen
   # 放在最后：它会故意让探针 unit 停在 failed 状态（验证缺凭据必须起不来）。
   check_runtime
 
   log "结果"
+  # 元断言：计数必须与日志行数一致。不一致说明有断言是在 `$( )` 里跑的——那种情况下
+  # 「0 项失败」是假的，而它会一路绿着通过。
+  local logged_pass logged_fail
+  logged_pass=$(wc -l < "$PASS_LOG" | tr -d ' ')
+  logged_fail=$(wc -l < "$FAIL_LOG" | tr -d ' ')
+  if [ "${logged_pass}" != "${PASS_COUNT}" ] || [ "${logged_fail}" != "${FAIL_COUNT}" ]; then
+    printf 'FAIL  断言计数与日志不一致：计数 %d/%d，日志 %s/%s（有断言跑在子 shell 里）\n' \
+      "$PASS_COUNT" "$FAIL_COUNT" "${logged_pass}" "${logged_fail}" >&2
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  fi
   printf '%d 项通过，%d 项失败\n' "$PASS_COUNT" "$FAIL_COUNT"
   [ "$FAIL_COUNT" -eq 0 ] || exit 1
 }

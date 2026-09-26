@@ -24,6 +24,8 @@ type DeployService struct {
 	artifacts *ArtifactService
 	releases  ReleaseAdapter
 	runtime   RuntimeAdapter
+	// nginx 只在蓝绿应用上用到（见 Options.NginxAdapter）。
+	nginx NginxAdapter
 
 	newID  func(prefix string) string
 	now    func() time.Time
@@ -35,6 +37,7 @@ func newDeployService(
 	artifacts *ArtifactService,
 	releases ReleaseAdapter,
 	runtime RuntimeAdapter,
+	nginx NginxAdapter,
 	newID func(prefix string) string,
 	now func() time.Time,
 	logger *slog.Logger,
@@ -49,7 +52,7 @@ func newDeployService(
 		logger = slog.Default()
 	}
 	return &DeployService{
-		repo: repo, artifacts: artifacts, releases: releases, runtime: runtime,
+		repo: repo, artifacts: artifacts, releases: releases, runtime: runtime, nginx: nginx,
 		newID: newID, now: now, logger: logger,
 	}
 }
@@ -285,6 +288,11 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 	if err := s.repo.MarkReleaseDeploying(ctx, releaseID, directory, s.now()); err != nil {
 		return err
 	}
+	// 蓝绿应用走另一条路（起新槽位 → 切流 → 观察 → 排空停旧槽位），见 deploy_slot.go。
+	// 两条路共用「读这一版自己的规格」「上一个版本是谁」这些准备，以及失败语义的三态。
+	if spec.BlueGreen() {
+		return s.applySlot(ctx, release, spec, rollback, logf)
+	}
 
 	action := "部署"
 	if rollback {
@@ -384,7 +392,7 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 	}
 	// **健康通过才算发布成功**：1c 的 runtime.start 只负责把进程起来（「启动 ≠ 就绪」是它
 	// 刻意的区分，就绪要单独问 health），因此这一步由部署流程自己做。
-	if err := s.waitForReady(ctx, spec, logf); err != nil {
+	if err := s.waitForReady(ctx, spec, "", logf); err != nil {
 		return fail(err)
 	}
 
@@ -538,28 +546,31 @@ const readyPollInterval = 200 * time.Millisecond
 //
 // 「连续成功次数」不在这里数：那是适配器的状态（systemd 的实例态计数），`Health` 只在
 // 达成之后才报 Ready。这里只负责「等」与「超时」。
-func (s *DeployService) waitForReady(ctx context.Context, spec *domain.ApplicationSpec, logf DeployLogf) error {
+func (s *DeployService) waitForReady(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot, logf DeployLogf) error {
+	readiness := spec.ReadinessFor(slot)
 	timeout := spec.Health.StartTimeout
 	if timeout <= 0 {
 		timeout = domain.DefaultStartTimeout
 	}
 	deadline := time.Now().Add(timeout)
-	logf("info", domain.PhaseExecute, "等待就绪", map[string]string{"target": spec.Health.Readiness.Target, "timeout": timeout.String()})
+	logf("info", domain.PhaseExecute, "等待就绪", map[string]string{
+		"slot": string(slot), "target": readiness.Target, "timeout": timeout.String(),
+	})
 
 	for {
-		health, err := s.runtime.Health(ctx, spec, "")
+		health, err := s.runtime.Health(ctx, spec, slot)
 		if err != nil {
 			// 适配器自己也可能报「超时未就绪」（systemd 那边在超过 startTimeout 之后会
 			// 直接给出 RUNTIME_NOT_READY），那种错误原样上抛。
 			return err
 		}
 		if health.Ready {
-			logf("info", domain.PhaseExecute, "已就绪", map[string]string{"detail": health.Detail})
+			logf("info", domain.PhaseExecute, "已就绪", map[string]string{"slot": string(slot), "detail": health.Detail})
 			return nil
 		}
 		if time.Now().After(deadline) {
 			return domain.NewError(v1.CodeRuntimeNotReady,
-				"应用在 %s 内未就绪（目标 %s，最近一次检查：%s）", timeout, spec.Health.Readiness.Target, health.Detail)
+				"应用在 %s 内未就绪（槽位 %s，目标 %s，最近一次检查：%s）", timeout, slot, readiness.Target, health.Detail)
 		}
 		select {
 		case <-ctx.Done():

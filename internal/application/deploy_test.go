@@ -99,6 +99,8 @@ type deployFixture struct {
 	store    *sqlite.Store
 	releases *local.Adapter
 	adapter  *fakeRuntimeAdapter
+	// nginx 是蓝绿那条路要用的对外入口（假实现：只记录切到哪一侧）。单槽用例不会碰它。
+	nginx *fakeNginxAdapter
 	// root 是 release 目录的路径前缀（local.WithRoot），断言真实产物时用它拼。
 	root string
 }
@@ -111,12 +113,14 @@ func newDeployFixture(t *testing.T, adapter *fakeRuntimeAdapter) *deployFixture 
 	if adapter == nil {
 		adapter = &fakeRuntimeAdapter{health: domain.RuntimeHealth{Ready: true}}
 	}
+	nginx := &fakeNginxAdapter{}
 	rt, store := newTestRuntimeWith(t, Options{
 		Store:          &memStore{blobs: map[domain.Digest][]byte{}},
 		ReleaseAdapter: releases,
 		RuntimeAdapter: adapter,
+		NginxAdapter:   nginx,
 	})
-	return &deployFixture{rt: rt, store: store, releases: releases, adapter: adapter, root: root}
+	return &deployFixture{rt: rt, store: store, releases: releases, adapter: adapter, nginx: nginx, root: root}
 }
 
 // upload 造一个单文件制品并上传（unpack.strategy=none + fileName 是部署最简单的形态）。

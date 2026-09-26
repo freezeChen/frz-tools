@@ -175,6 +175,13 @@ func (a *Adapter) checkLoaded(ctx context.Context, spec *domain.ApplicationSpec)
 	}
 
 	file := a.ManagedFile(spec.Application)
+	if _, statErr := os.Stat(a.RootPath(file)); errors.Is(statErr, os.ErrNotExist) {
+		// 「文件还不存在」与「文件没被加载」是两件事：前者发生在第一次部署的候选写出来
+		// 之前，报「没被加载」会把人指向错误的方向。
+		return domain.NewError(v1.CodeNginxConfigInvalid,
+			"受管文件 %s 还不存在——它会在切流时被写出来；这条检查问的是「主配置有没有 include %s」",
+			file, a.ManagedDir())
+	}
 	marker := "# configuration file " + file + ":"
 	if !strings.Contains(dump, marker) {
 		return domain.NewError(v1.CodeNginxConfigInvalid,
@@ -195,10 +202,6 @@ func (a *Adapter) Apply(ctx context.Context, spec *domain.ApplicationSpec, targe
 	if err := a.Validate(ctx, spec); err != nil {
 		return err
 	}
-	if err := a.checkLoaded(ctx, spec); err != nil {
-		return err
-	}
-
 	// 头注释只写槽位：这才是这份文件承载的那个事实（「现在指向谁」）。具体的 release 与
 	// 版本由 `app slot list` 回答——那份数据在库里，这里多写一遍只会多一处会过期的副本。
 	candidate, err := RenderManaged(spec, target, "", "")
@@ -212,6 +215,19 @@ func (a *Adapter) Apply(ctx context.Context, spec *domain.ApplicationSpec, targe
 		return err
 	}
 	if err := a.writeManaged(spec.Application, candidate); err != nil {
+		return err
+	}
+
+	// **先把候选放到位，再检查它有没有被主配置加载。** 顺序是必需的：第一次部署时受管
+	// 文件还不存在，而「有没有被加载」这件事只有文件存在才问得出来（`nginx -T` 列的是
+	// 它实际加载到的文件）。没被加载（主配置没 include 我们的目录）时换回原内容，
+	// **流量一点没动**：这一步同样在 reload 之前。
+	if err := a.checkLoaded(ctx, spec); err != nil {
+		if restoreErr := a.restore(spec.Application, previous, hadPrevious); restoreErr != nil {
+			return domain.NewError(v1.CodeNginxConfigInvalid,
+				"%s；**且移除候选配置也失败了**（%s）：%s 现在是一份不会被加载的配置，但它留在盘上会误导后来的人，需要人工检查",
+				domain.MessageOf(err), domain.MessageOf(restoreErr), file)
+		}
 		return err
 	}
 

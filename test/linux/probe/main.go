@@ -31,10 +31,26 @@ func main() {
 	var allowWrite, denyWrite stringList
 	flag.Var(&allowWrite, "allow-write", "期望可写的路径（unit 已声明）；可重复")
 	flag.Var(&denyWrite, "deny-write", "期望不可写的路径（unit 未声明，ProtectSystem 应拦截）；可重复")
+	// httpVersion 非空时，每个连接回一句 HTTP 200 + "version=<值>" 再关闭。
+	// 蓝绿验证靠它回答「现在服务的是哪一版」——就绪探测只连接、不读内容，
+	// 因此这一项对既有的 TCP 就绪断言没有影响。
+	httpVersion := flag.String("http-version", "", "在该端口上应答 HTTP，正文为 version=<值>")
 	flag.Parse()
 
+	// 监听地址与版本可以**从环境变量取**（flag 为空时）。
+	//
+	// 这不是语法糖：蓝绿的两个槽位共用同一份 argv，而它们必须听不同的端口——端口只能
+	// 从「每个槽位自己的环境」里来。这也正是规格 D6 里那条契约的实样：「应用怎么知道
+	// 自己的端口」由运维通过槽位环境告诉它，工具不发明魔法变量名。探针作为「被托管的
+	// 应用」，示范的就是这个配合。
+	if *listenAddr == "" {
+		*listenAddr = os.Getenv("FRZ_PROBE_LISTEN")
+	}
+	if *httpVersion == "" {
+		*httpVersion = os.Getenv("FRZ_PROBE_VERSION")
+	}
 	if *reportPath == "" || *listenAddr == "" {
-		fmt.Fprintln(os.Stderr, "必须提供 --report 与 --listen")
+		fmt.Fprintln(os.Stderr, "必须提供 --report 与 --listen（或 FRZ_PROBE_LISTEN 环境变量）")
 		os.Exit(2)
 	}
 
@@ -94,6 +110,11 @@ func main() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
+		}
+		if *httpVersion != "" {
+			body := "version=" + *httpVersion + "\n"
+			_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+				len(body), body)
 		}
 		// 就绪探测只做 TCP 连接，连接内容无关紧要；立刻关掉避免占满队列。
 		_ = conn.Close()

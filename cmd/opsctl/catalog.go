@@ -331,6 +331,11 @@ func reportDeploy(opts *rootOptions, result *v1.DeployResponse, action string) e
 		return nil
 	}
 	fmt.Printf("已提交%s：release %s（版本 %s）\n", action, result.Release.ID, result.Release.Version)
+	// 蓝绿应用才有的信息：这一版上到了哪一侧。切流是异步的（走 Operation），
+	// 因此这里说的是「目标槽位」，不是「流量已经切过去了」。
+	if result.Release.Slot != "" {
+		fmt.Printf("目标槽位：%s（切流进度见下面的操作日志）\n", result.Release.Slot)
+	}
 	if result.Operation != nil {
 		printOperation(result.Operation)
 		fmt.Printf("\n查询进度：opsctl operation get %s\n查看日志：opsctl operation logs %s\n",

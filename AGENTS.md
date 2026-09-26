@@ -137,10 +137,10 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 170**（2026-09-24 迭代 3c 落地后实跑：170 通过 / 0 失败，其中 1c 的 `check_runtime`
+当前为 197**（2026-09-27 迭代 4b 落地后实跑：197 通过 / 0 失败，其中 1c 的 `check_runtime`
 49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项、2d 的 `check_prune` 13 项、
-3b 的 `check_deploy` 23 项（原 20 + 迭代 3c 加的「物化失败」3 项）、3c 的 `check_resources`
-16 项；历史快照：3b 时点 151 项、2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
+3b 的 `check_deploy` 23 项、3c 的 `check_resources` 16 项、4b 的 `check_bluegreen` 27 项；
+历史快照：3c 时点 170 项、3b 时点 151 项、2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
 1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在

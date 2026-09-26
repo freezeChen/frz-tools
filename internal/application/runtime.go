@@ -30,6 +30,11 @@ type Options struct {
 	// PrepareReporter 由装配层实现，把适配器私有的 Prepare 决策（unit 档位、systemd
 	// 版本）翻译成 Operation 的日志与审计字段。
 	PrepareReporter RuntimePrepareReporter
+	// NginxAdapter 是蓝绿的对外入口（迭代 4）。它只在**声明了 exec.slots 的应用**上用到，
+	// 因此缺席不算部署能力缺失：单槽应用照常部署，蓝绿应用会得到一句明确的
+	// 「本部署未装配 Nginx 适配器」。与 RuntimeAdapter/ReleaseAdapter 同为「可以缺席但
+	// 必须有明确说法」的那一类。
+	NginxAdapter NginxAdapter
 
 	AllowExecutable func(string) bool
 	Defaults        Defaults
@@ -83,7 +88,8 @@ func NewRuntime(opts Options) *Runtime {
 		artifacts.now = opts.Now
 	}
 
-	deploys := newDeployService(opts.Repo, artifacts, opts.ReleaseAdapter, opts.RuntimeAdapter, idGen, opts.Now, opts.Logger)
+	deploys := newDeployService(opts.Repo, artifacts, opts.ReleaseAdapter, opts.RuntimeAdapter,
+		opts.NginxAdapter, idGen, opts.Now, opts.Logger)
 
 	cancels := newCancelRegistry()
 	pool := newPool(opts.Repo, opts.Executor, opts.Secrets, opts.Defaults, cancels, runtimes, backups, deploys, opts.Workers, opts.Logger, idGen)

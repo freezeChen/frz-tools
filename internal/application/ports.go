@@ -51,8 +51,26 @@ type Repository interface {
 	GetReleaseByVersion(ctx context.Context, applicationID, version string) (*domain.Release, error)
 	// PreviousRelease 返回回滚的默认目标：最近一个曾经激活、且状态仍可回滚的版本。
 	PreviousRelease(ctx context.Context, applicationID string) (*domain.Release, error)
-	// ActiveRelease 返回当前激活的 release；没有时返回 (nil, nil)。
+	// ActiveRelease 返回当前接流量的那个 release；没有时返回 (nil, nil)。
+	//
+	// 单槽与蓝绿共用一个取值（见 domain.ReleaseActive）：单槽里它就是 `current` 指向的
+	// 那一个，蓝绿里它是 serving_slot 所指槽位正在跑的那一个。
 	ActiveRelease(ctx context.Context, applicationID string) (*domain.Release, error)
+
+	// SetReleaseSlot 记下这次部署落在哪个槽位（迭代 4）。空槽位 = 单槽形态。
+	SetReleaseSlot(ctx context.Context, releaseID string, slot domain.Slot) error
+	// ServingSlot 返回现在哪一侧在接流量（迭代 4）。单槽应用返回空槽位。
+	//
+	// 它是**Nginx 配置的镜像**：真正决定请求去哪边的是 Nginx 的 upstream，对账以那边为准
+	// （迭代 4 规格 D2）。因此它**可能**与实际不一致——所以它只用于「这一步该切到哪一侧」
+	// 这类决策，而不用于「现在流量在哪」这类断言。
+	ServingSlot(ctx context.Context, applicationID string) (domain.Slot, error)
+	// SetServingSlot 记下现在哪一侧在接流量（空槽位 = 回到单槽形态）。
+	SetServingSlot(ctx context.Context, applicationID string, slot domain.Slot, now time.Time) error
+	// PutApplicationSlot 写一个槽位的运营状态（它跑的是哪个 release、什么状态、何时切的）。
+	PutApplicationSlot(ctx context.Context, applicationID string, slot domain.Slot, releaseID string,
+		state domain.SlotState, switchedAt *time.Time, now time.Time) error
+	ApplicationSlots(ctx context.Context, applicationID string) ([]domain.ApplicationSlot, error)
 
 	CreateSchedule(ctx context.Context, schedule *domain.Schedule) error
 	GetSchedule(ctx context.Context, ref string) (*domain.Schedule, error)
@@ -280,7 +298,7 @@ type ReleaseAdapter interface {
 type RuntimePrepareReporter interface {
 	// ReportRuntimePrepare 在 Prepare 成功之后被调用；决策未知时返回 ok=false，
 	// 而不是返回一个看起来像真的空决策。
-	ReportRuntimePrepare(ctx context.Context, spec *domain.ApplicationSpec) (RuntimeDecision, bool)
+	ReportRuntimePrepare(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (RuntimeDecision, bool)
 }
 
 // RuntimeDecision 是一次 Prepare 的最小可追溯记录。字段与 systemd 适配器的

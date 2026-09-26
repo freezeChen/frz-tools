@@ -151,6 +151,7 @@ func releaseDTO(release *domain.Release) v1.Release {
 		FinishedAt:    release.FinishedAt,
 		ErrorCode:     release.ErrorCode,
 		ErrorMessage:  release.ErrorMessage,
+		Slot:          string(release.Slot),
 	}
 }
 

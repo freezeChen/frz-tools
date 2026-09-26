@@ -209,8 +209,20 @@ func TestValidateRejectsNonLinuxAndMissingNginx(t *testing.T) {
 // 而流量根本不经过我们改的 upstream。这条断言必须给出**可操作**的下一步。
 func TestCheckLoadedRejectsUnincludedManagedDir(t *testing.T) {
 	f := newFixture(t)
-	f.fake.dump = "# configuration file /etc/nginx/nginx.conf:\n"
+
+	// 文件还不存在（第一次部署的候选写出来之前）：报错要说的是「文件还没写出来」，
+	// 而不是「没被加载」——后者会把人指向「去改主配置」，而那时该做的是先切流。
 	err := f.adapter.CheckLoaded(f.ctx, f.spec)
+	if domain.CodeOf(err) != v1.CodeNginxConfigInvalid || !strings.Contains(err.Error(), "还不存在") {
+		t.Fatalf("文件不存在时应当说清这件事，got %v", err)
+	}
+
+	// 文件在位、但主配置没 include 我们的目录：这才是「配置写对了却没生效」。
+	if err := f.adapter.writeManaged(f.spec.Application, "# placeholder\n"); err != nil {
+		t.Fatalf("写受管文件: %v", err)
+	}
+	f.fake.dump = "# configuration file /etc/nginx/nginx.conf:\n"
+	err = f.adapter.CheckLoaded(f.ctx, f.spec)
 	if domain.CodeOf(err) != v1.CodeNginxConfigInvalid {
 		t.Fatalf("want NGINX_CONFIG_INVALID, got %v", err)
 	}
@@ -221,6 +233,24 @@ func TestCheckLoadedRejectsUnincludedManagedDir(t *testing.T) {
 	f.fake.dump = "# configuration file " + domain.ManagedNginxFile("/etc/nginx", "orders-api") + ":\n"
 	if err := f.adapter.CheckLoaded(f.ctx, f.spec); err != nil {
 		t.Fatalf("被加载时应当通过: %v", err)
+	}
+}
+
+// 主配置没 include 我们的目录时，切流必须**拒绝**，而且要把刚写出来的候选收回去
+// （否则它会留在盘上，等哪天有人手工 reload nginx 时把流量悄悄带到一个根本没切过去的版本）。
+func TestApplyRefusesWhenManagedDirNotIncluded(t *testing.T) {
+	f := newFixture(t)
+	f.fake.dump = "# configuration file /etc/nginx/nginx.conf:\n"
+
+	err := f.adapter.Apply(f.ctx, f.spec, domain.SlotGreen)
+	if domain.CodeOf(err) != v1.CodeNginxConfigInvalid {
+		t.Fatalf("want NGINX_CONFIG_INVALID, got %v", err)
+	}
+	if _, present := f.managed(t); present {
+		t.Fatal("被拒绝的切流不该把候选配置留在盘上")
+	}
+	if countReloads(f.fake.commands) != 0 {
+		t.Fatal("没被加载时不该 reload：流量必须一点没动")
 	}
 }
 

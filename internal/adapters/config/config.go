@@ -54,6 +54,20 @@ type Config struct {
 	BackupStore   BackupStoreConfig   `yaml:"backupStore"`
 	Secrets       SecretsConfig       `yaml:"secrets"`
 	Sudo          SudoConfig          `yaml:"sudo"`
+	// Nginx 只在**声明了 exec.slots 的蓝绿应用**上用得到；没配就按下面这些默认值走
+	// （/etc/nginx、二进制走 PATH），因此绝大多数部署不需要写这一段。
+	Nginx NginxConfig `yaml:"nginx"`
+}
+
+// NginxConfig 是蓝绿发布用到的 Nginx 参数（迭代 4）。
+type NginxConfig struct {
+	// ConfDir 是 Nginx 的配置目录。受管文件写在它的 frz-managed/ 子目录里——
+	// **工具只写自己的目录**，主配置要不要 include 由运维决定。
+	ConfDir string `yaml:"confDir"`
+	// Binary 是 nginx 可执行文件（默认 "nginx"，即走 PATH）。
+	Binary string `yaml:"binary"`
+	// MainConfig 是主配置（默认 <ConfDir>/nginx.conf）。`nginx -t/-T` 都用它。
+	MainConfig string `yaml:"mainConfig"`
 }
 
 type SocketConfig struct {

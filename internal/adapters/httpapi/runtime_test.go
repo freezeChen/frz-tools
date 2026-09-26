@@ -60,7 +60,7 @@ type stubReporter struct {
 	ok       bool
 }
 
-func (s stubReporter) ReportRuntimePrepare(_ context.Context, _ *domain.ApplicationSpec) (application.RuntimeDecision, bool) {
+func (s stubReporter) ReportRuntimePrepare(_ context.Context, _ *domain.ApplicationSpec, _ domain.Slot) (application.RuntimeDecision, bool) {
 	return s.decision, s.ok
 }
 

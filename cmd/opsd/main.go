@@ -20,6 +20,7 @@ import (
 	"github.com/freezeChen/frz-tools/internal/adapters/config"
 	"github.com/freezeChen/frz-tools/internal/adapters/executor"
 	"github.com/freezeChen/frz-tools/internal/adapters/httpapi"
+	"github.com/freezeChen/frz-tools/internal/adapters/nginx"
 	releaselocal "github.com/freezeChen/frz-tools/internal/adapters/release/local"
 	"github.com/freezeChen/frz-tools/internal/adapters/runtime/systemd"
 	"github.com/freezeChen/frz-tools/internal/adapters/secret"
@@ -116,11 +117,20 @@ func run(cmd *cobra.Command, _ []string) error {
 	var (
 		runtimeAdapter  application.RuntimeAdapter
 		prepareReporter application.RuntimePrepareReporter
+		nginxAdapter    application.NginxAdapter
 	)
 	if stdruntime.GOOS == "linux" {
 		systemdAdapter := systemd.New("/", secretResolver, systemd.WithLogger(logger))
 		runtimeAdapter = systemdAdapter
 		prepareReporter = systemdReporter{adapter: systemdAdapter}
+		// Nginx 适配器与 systemd 适配器同一个平台门槛：它要执行 nginx 二进制、写
+		// /etc/nginx 下的受管文件。**缺席不等于部署能力缺失**——单槽应用照常部署，
+		// 蓝绿应用会得到一句明确的「本部署未装配 Nginx 适配器」。
+		nginxAdapter = nginx.New(nginx.Config{
+			ConfDir:    cfg.Nginx.ConfDir,
+			Binary:     cfg.Nginx.Binary,
+			MainConfig: cfg.Nginx.MainConfig,
+		}, nginx.WithLogger(logger))
 	} else {
 		logger.Info("runtime adapter is unavailable on this platform, runtime.* will report RUNTIME_UNSUPPORTED",
 			"goos", stdruntime.GOOS)
@@ -144,6 +154,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		},
 		RuntimeAdapter:  runtimeAdapter,
 		PrepareReporter: prepareReporter,
+		NginxAdapter:    nginxAdapter,
 		// 发布适配器（解包、切换、清理）与运行时适配器**分开装配**：它只做文件系统与归档，
 		// 任何平台都能用；而部署能力是否可用由 Configured() 一起判定（缺运行时就没有部署）。
 		ReleaseAdapter:  releaselocal.New(),

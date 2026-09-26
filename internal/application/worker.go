@@ -279,7 +279,7 @@ func (p *Pool) executeRuntime(persistCtx, execCtx context.Context, op *domain.Op
 			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
 			return
 		}
-		p.recordRuntimeDecision(persistCtx, op, app, spec)
+		p.recordRuntimeDecision(persistCtx, op, app, spec, slot)
 		if err := adapter.Start(execCtx, spec, slot); err != nil {
 			p.finishRuntimeFailure(persistCtx, op, err, startedAt)
 			return
@@ -309,8 +309,8 @@ func (p *Pool) executeRuntime(persistCtx, execCtx context.Context, op *domain.Op
 // recordRuntimeDecision 把 Prepare 的档位决策写进 Operation 日志与审计：同一份 manifest
 // 在不同 systemd 版本的主机上会生成不同的 unit，这份记录是事后唯一的解释来源。
 // 适配器没提供决策（例如假适配器、没有 reporter）时什么都不写，而不是编一条空档位。
-func (p *Pool) recordRuntimeDecision(ctx context.Context, op *domain.Operation, app *domain.Application, spec *domain.ApplicationSpec) {
-	decision, ok := p.runtimes.decision(ctx, spec)
+func (p *Pool) recordRuntimeDecision(ctx context.Context, op *domain.Operation, app *domain.Application, spec *domain.ApplicationSpec, slot domain.Slot) {
+	decision, ok := p.runtimes.decision(ctx, spec, slot)
 	if !ok {
 		return
 	}

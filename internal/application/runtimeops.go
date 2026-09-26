@@ -106,7 +106,7 @@ func (s *RuntimeService) Prepare(ctx context.Context, appRef, rawSlot string) (*
 	if err := adapter.Prepare(ctx, spec, slot); err != nil {
 		return nil, nil, RuntimeDecision{}, false, err
 	}
-	decision, ok := s.decision(ctx, spec)
+	decision, ok := s.decision(ctx, spec, slot)
 	return app, spec, decision, ok, nil
 }
 
@@ -158,11 +158,11 @@ func (s *RuntimeService) requireAdapter() (RuntimeAdapter, error) {
 	return s.adapter, nil
 }
 
-func (s *RuntimeService) decision(ctx context.Context, spec *domain.ApplicationSpec) (RuntimeDecision, bool) {
+func (s *RuntimeService) decision(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (RuntimeDecision, bool) {
 	if s.reporter == nil {
 		return RuntimeDecision{}, false
 	}
-	return s.reporter.ReportRuntimePrepare(ctx, spec)
+	return s.reporter.ReportRuntimePrepare(ctx, spec, slot)
 }
 
 // errRuntimeUnsupported 用同一句话描述「没有可用适配器」，让 HTTP 与 worker 两条

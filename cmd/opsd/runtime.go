@@ -18,8 +18,10 @@ type systemdReporter struct {
 	adapter *systemd.Adapter
 }
 
-func (r systemdReporter) ReportRuntimePrepare(_ context.Context, spec *domain.ApplicationSpec) (application.RuntimeDecision, bool) {
-	decision, ok := r.adapter.UnitDecision(spec.Systemd.UnitName)
+func (r systemdReporter) ReportRuntimePrepare(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (application.RuntimeDecision, bool) {
+	// 按槽位取 unit 名：蓝绿的两个槽位各有一个 unit，各自的档位决策分开记
+	// （空槽位就是单槽那条路）。
+	decision, ok := r.adapter.UnitDecision(spec.UnitNameFor(slot))
 	if !ok {
 		// 适配器没有这次 Prepare 的记录（例如 Prepare 在别的进程里做过）：
 		// 返回 ok=false，让调用方省略字段，而不是编一个看起来像真的空档位。

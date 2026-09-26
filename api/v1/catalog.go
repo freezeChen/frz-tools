@@ -49,6 +49,9 @@ type Release struct {
 	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
 	ErrorCode    string     `json:"errorCode,omitempty"`
 	ErrorMessage string     `json:"errorMessage,omitempty"`
+	// Slot 是这次部署落在哪个槽位（迭代 4）。**空表示单槽形态**——蓝绿与非蓝绿共用一个
+	// 字段，因为「这一版上到了哪一侧」这件事只有蓝绿才有答案。
+	Slot string `json:"slot,omitempty"`
 }
 
 type ReleaseResponse struct {
