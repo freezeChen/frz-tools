@@ -1675,6 +1675,30 @@ MANIFEST
     q sh -c "curl -s -m 3 http://127.0.0.1:${vport}/ | tr -d '\r\n'"
   }
 
+  # wait_for_served_version 等 nginx 真的把流量切过去，再断言。
+  #
+  # **`nginx -s reload` 是异步的**：master 收到 HUP 之后新 worker 才起来、旧 worker 处理完
+  # 在途请求才退出。reload 之后立刻读，可能还拿到旧 worker 服务的旧版本——真机上 2026-09-27
+  # 就是这样失败了一次（而隔着一次重启的那条断言反而是过的，因为那时早就收敛了）。
+  # 顺带说：这恰好也是**为什么要有观察窗口**的同一个道理。
+  wait_for_served_version() { # 期望的响应正文
+    local want=$1 got="" _
+    for _ in $(seq 1 60); do
+      got=$(served_version)
+      [ "$got" = "$want" ] && return 0
+      sleep 0.25
+    done
+    return 1
+  }
+
+  assert_served() { # 描述 期望的响应正文
+    if wait_for_served_version "$2"; then
+      pass "$1 = $2"
+    else
+      fail "$1：等不到 $2（现在拿到的是 $(served_version)）"
+    fi
+  }
+
   # A) 反例：主配置还没 include 受管的目录 → 部署必须**拒绝切流**。
   #
   #    这是这一层最要紧的一条：配置写对了但没生效时，切流看起来会成功，而流量根本不
@@ -1705,7 +1729,7 @@ MANIFEST
 
   # C) 第一次部署：1.0.0 落到 blue，对外端口能拿到 version=1.0.0。
   bg_deploy "第一次部署 1.0.0（落 blue）" 1.0.0 || return 0
-  assert_eq "对外端口拿到的版本" "version=1.0.0" "$(served_version)"
+  assert_served "对外端口拿到的版本" "version=1.0.0"
   assert_eq "blue 的 unit 在跑" "active" "$(q systemctl is-active ${app}-blue.service)"
   assert_eq "green 的 unit 没被起过" "inactive" "$(q systemctl is-active ${app}-green.service)"
   assert_eq "受管配置指向 blue 的端口" "yes" \
@@ -1741,7 +1765,7 @@ LOOP
   sleep 0.3
 
   if [ "${switched_ok}" = "1" ]; then
-    assert_eq "切流之后对外端口拿到的是新版本" "version=2.0.0" "$(served_version)"
+    assert_served "切流之后对外端口拿到的是新版本" "version=2.0.0"
   fi
   assert_eq "切流期间失败的请求数" "0" "$(q sh -c 'grep -c fail /tmp/frz-bg-requests || true')"
   # 元断言：循环必须**成功地**打过足够多的请求。只看「零失败」是不够的——循环如果压根
@@ -1762,7 +1786,7 @@ LOOP
   rollback_id=$(printf '%s' "${rollback_out}" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
   if [ -n "${rollback_id}" ] && wait_for_status "${rollback_id}" "succeeded" "${RUNTIME_SOCK}"; then
     pass "回滚走 Operation 且成功"
-    assert_eq "回滚后对外端口拿到的是旧版本" "version=1.0.0" "$(served_version)"
+    assert_served "回滚后对外端口拿到的是旧版本" "version=1.0.0"
     assert_eq "回滚后 blue 重新在跑" "active" "$(q systemctl is-active ${app}-blue.service)"
     assert_eq "回滚后 green 被停掉" "inactive" "$(q systemctl is-active ${app}-green.service)"
   else

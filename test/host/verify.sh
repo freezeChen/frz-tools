@@ -17,7 +17,9 @@
 #   · opsd 本身作为 **systemd 服务**运行的部署形态（含 /run 是 tmpfs 这件事）；
 #   · 迭代 3：部署出来的 release 在真机上跑起来、**跨重启存活**（那需要真的重启一台机器）；
 #   · 迭代 3c：用主机上真实的 JDK 跑一个真实的 JAR，并断言资源限制在 systemd 与
-#     内核两侧都是声明的那个值。
+#     内核两侧都是声明的那个值；
+#   · 迭代 4：发行版的包装出来的 nginx（不是容器里那个）+ 真真切流，以及 opsd **作为
+#     服务**重启之后的对账。
 #
 # 刻意**不**重复容器 harness 的哪些断言，以及为什么（避免两套断言各自漂移）：
 #   · 「以非 root 用户运行 opsd」那一组（socket ACL、非授权可执行文件被拒、计划与
@@ -71,10 +73,25 @@ JAVA_BUILD_DIR=/opt/frz-ops/java-fixture
 JAVA_MARKER=java-marker-ok
 JAVA_MEMORY_MAX_BYTES=536870912
 
-# 迭代 3 的夹具应用：清理与前置检查都按这张表走，免得新增一个就漏一处。
-HOST_APPS=("$DEPLOY_APP" "$JAVA_APP" "$JAVA_BAD_APP")
+# 迭代 4 的蓝绿夹具：两个槽位各自的 unit 与端口，外加 nginx 的对外端口。
+# 端口刻意排在一起（28580 对外、28584/28585 两侧），与迭代 3 的三个夹具不重叠。
+BG_APP=frz-bg
+BG_VPORT=${FRZ_BG_VPORT:-28580}
+BG_BLUE_PORT=${FRZ_BG_BLUE_PORT:-28584}
+BG_GREEN_PORT=${FRZ_BG_GREEN_PORT:-28585}
+# 受管配置（我们写的）与我们往主配置里加的那一行 include。两者都由本轮创建、由 cleanup 删。
+BG_MANAGED=/etc/nginx/frz-managed/${BG_APP}.conf
+BG_INCLUDE=/etc/nginx/conf.d/frz-managed.conf
+
+# 迭代 3/4 的夹具应用：清理与前置检查都按这张表走，免得新增一个就漏一处。
+# 蓝绿应用的两个 unit 是**派生**名字（`<app>-<slot>.service`），不在这一列里，由 cleanup
+# 单独按槽位删。
+HOST_APPS=("$DEPLOY_APP" "$JAVA_APP" "$JAVA_BAD_APP" "$BG_APP")
 
 START_OP_ID=""
+# 蓝绿那一段的回车：操作 id，以及「nginx 是不是我们起的」（收尾要还原成借之前的样子）。
+BG_OP_ID=""
+NGINX_STARTED_BY_US=0
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
@@ -125,6 +142,13 @@ require_fail() { # 描述 命令…
 }
 
 mode_of()  { stat -c '%a' "$1" 2>/dev/null || true; }
+# remove_path 删一棵子树，**失败不中断调用方**。
+#
+# 收尾阶段删不掉某个路径时，中断留下的垃圾比「删不掉」本身更糟（2026-09-27 真的踩到：
+# 一条 rm 因为 unit 还在跑而 EBUSY，set -e 让脚本当场退出，后面该删的一件没删）。
+# 因此收尾统一走它：删不掉就记一行，继续往下走。
+remove_path() { rm -rf "$1" 2>/dev/null || printf '收尾：%s 删不掉（继续）\n' "$1" >&2; }
+
 owner_of() { stat -c '%U:%G' "$1" 2>/dev/null || true; }
 label_of() { stat -c '%C' "$1" 2>/dev/null || true; }
 
@@ -268,13 +292,36 @@ cleanup() {
   systemctl disable "$OPSD_UNIT" >/dev/null 2>&1 || true
   systemctl disable "$RUNTIME_UNIT" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/$OPSD_UNIT" "/etc/systemd/system/$RUNTIME_UNIT"
+
+  # 迭代 4：蓝绿应用的两个槽位 unit（名字是派生的）。**必须在这里停掉**——它比下面那张
+  # 表里的应用多一条约束：unit 还在跑时它的 `WorkingDirectory=`（`/var/lib/<app>`）删不掉，
+  # rmdir 会返回 EBUSY。2026-09-27 第一版把这段放在删目录之后，收尾当场中断，
+  # 主机上留下一堆该删的东西。
+  for slot in blue green; do
+    systemctl stop "${BG_APP}-${slot}.service" >/dev/null 2>&1 || true
+    systemctl disable "${BG_APP}-${slot}.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${BG_APP}-${slot}.service"
+  done
+  # 我们写进 nginx 的一切。**nginx 本身不动**——它是主机的包，不是我们装的；
+  # 只把它还原成我们借它之前的样子。
+  rm -f "$BG_MANAGED" "$BG_INCLUDE"
+  rmdir /etc/nginx/frz-managed 2>/dev/null || true
+  if [ "$NGINX_STARTED_BY_US" = "1" ]; then
+    systemctl stop nginx >/dev/null 2>&1 || true
+  fi
+  rm -f /tmp/frz-bg-requests /tmp/frz-bg-stop
+
   for app in "${HOST_APPS[@]}"; do
     systemctl stop "${app}.service" >/dev/null 2>&1 || true
     systemctl disable "${app}.service" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/${app}.service"
     userdel "$app" >/dev/null 2>&1 || true
     groupdel "$app" >/dev/null 2>&1 || true
-    rm -rf "/var/lib/$app" "/var/log/$app" "/etc/opsd/apps/$app"*
+    remove_path "/var/lib/$app"
+    remove_path "/var/log/$app"
+    for leftover in /etc/opsd/apps/"$app"*; do
+      [ -e "$leftover" ] && remove_path "$leftover"
+    done
   done
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed >/dev/null 2>&1 || true
@@ -290,16 +337,20 @@ cleanup() {
   # RuntimeAdapter 的 Prepare 与 ReleaseAdapter 的物化共同建出来，因此也必须由这里删掉
   # ——生产机上留一棵没人认领的目录树是最不该发生的事。cleanup 敢直接 rm 是因为
   # check_preconditions 已经断言过它本轮之前不存在。
-  rm -rf /etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops /opt/opsd
-  rm -rf "/var/lib/$RUNTIME_APP" "/var/log/$RUNTIME_APP" "/var/lib/${RUNTIME_APP}-extra" "/usr/local/$MS_DIR"
-  rm -rf "$FRZ_HOST_DIR"
+  for path in /etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops /opt/opsd \
+    "/var/lib/$RUNTIME_APP" "/var/log/$RUNTIME_APP" "/var/lib/${RUNTIME_APP}-extra" "/usr/local/$MS_DIR" \
+    "$FRZ_HOST_DIR"; do
+    remove_path "$path"
+  done
 
   printf '已删除：用户/组 frz-ops、%s、%s；unit %s 与 %s；目录 /etc/opsd、/var/lib/opsd、\n' \
     "$RUNTIME_USER" "$OTHER_USER" "$OPSD_UNIT" "$RUNTIME_UNIT"
   printf '        /var/log/opsd、/run/opsd、/opt/frz-ops、/opt/opsd、/var/lib/%s、/var/log/%s、%s\n' \
     "$RUNTIME_APP" "$RUNTIME_APP" "$FRZ_HOST_DIR"
-  printf '        以及迭代 3 的三个夹具应用：%s（用户、unit、/var/lib 与 /var/log 下的目录）\n' \
+  printf '        以及夹具应用：%s（用户、unit、/var/lib 与 /var/log 下的目录）\n' \
     "${HOST_APPS[*]}"
+  printf '        迭代 4 另加：两个槽位 unit %s-{blue,green}.service、nginx 受管配置 %s、\n' "$BG_APP" "$BG_MANAGED"
+  printf '        以及我们往主配置里加的那一行 include %s（nginx 装了但没在跑时一并停掉）\n' "$BG_INCLUDE"
 }
 
 # ==== 环境事实 ====
@@ -330,10 +381,17 @@ check_preconditions() {
   done
   [ "$dirty" -eq 0 ] && pass "本轮涉及的用户与目录此时都不存在"
 
-  for port in "$RUNTIME_PORT" "$DEPLOY_PORT" "$JAVA_PORT"; do
+  for port in "$RUNTIME_PORT" "$DEPLOY_PORT" "$JAVA_PORT" "$BG_VPORT" "$BG_BLUE_PORT" "$BG_GREEN_PORT"; do
     ss -lntH "sport = :$port" 2>/dev/null | grep -q . && { fail "端口 $port 已被占用"; dirty=1; }
   done
-  [ "$dirty" -eq 0 ] && pass "三个夹具端口（$RUNTIME_PORT / $DEPLOY_PORT / $JAVA_PORT）都空闲"
+  [ "$dirty" -eq 0 ] && pass "夹具端口都空闲（$RUNTIME_PORT / $DEPLOY_PORT / $JAVA_PORT / $BG_VPORT / $BG_BLUE_PORT / $BG_GREEN_PORT）"
+
+  # 迭代 4：nginx 的受管配置与那一行 include 也必须是干净的——它们是**我们**写的，
+  # 主机上本来就该没有。有的话说明上一轮没收干净，而 cleanup 敢直接删它们正靠这一条。
+  for path in "$BG_MANAGED" "$BG_INCLUDE"; do
+    [ -e "$path" ] && { fail "$path 已存在，无法从「干净主机」开始"; dirty=1; }
+  done
+  [ "$dirty" -eq 0 ] && pass "nginx 受管配置与主配置的那一行 include 此时都不存在"
 
   # 这一条让 cleanup 知道「机器不干净」，从而**什么都不删**（见 cleanup 的注释）。
   PRECONDITION_FAILED=$dirty
@@ -1218,6 +1276,347 @@ MANIFEST
 }
 
 # ==== 重启验证：记录重启前的主机身份 ====
+# ==== 迭代 4：真机上的 Nginx 蓝绿 ====
+#
+# 这一节的证据容器给不了：真机上 nginx 是发行版的包（这台上是 EPEL 的 1.20），主配置归运维，
+# 而 opsd 自己是一个 **systemd 服务**——因此「重启 opsd 之后对账」用的是 `systemctl restart`，
+# 不是容器里那种精确挑 PID 的办法。
+#
+# 容器已经覆盖的部分（受管配置被手工改坏、`nginx -t` 不通过等）这里不重复：
+# 两套 harness 各自漂移比少几条断言更糟。这里补的是「同一套语义在真机上是否还成立」。
+#
+# 缺 nginx 时**跳过并显式计数**：跳过不是通过。
+check_bluegreen_host() {
+  log "迭代 4：真机上的 Nginx 蓝绿（切流、时间线、对账）"
+
+  if ! command -v nginx >/dev/null 2>&1; then
+    skip "真机蓝绿：这台主机上没有 nginx；容器里已覆盖，**真机未验证**"
+    return 0
+  fi
+
+  local app=$BG_APP
+
+  # unit_running 把 `systemctl is-active` 归一成「在跑 / 没在跑」。
+  #
+  # **这个归一不是洁癖**：对一个**不存在**的 unit，systemd 219（legacy 档）报 `unknown`，
+  # 而容器里的 255 报 `inactive`。断言写死其中一个，就会在两档之间来回摇摆，而两档要说
+  # 的其实是同一件事——它没在跑。
+  unit_running() { # unit 名
+    case "$(systemctl is-active "$1" 2>/dev/null || true)" in
+      active | activating) printf 'yes' ;;
+      *) printf 'no' ;;
+    esac
+  }
+  unit_file_exists() { [ -f "/etc/systemd/system/$1" ] && printf yes || printf no; }
+
+  # 借 nginx 之前先记下它原来的状态：这一轮只借用它，收尾还原（见 cleanup）。
+  if [ "$(systemctl is-active nginx 2>/dev/null || true)" != "active" ]; then
+    require_ok "启动 nginx（主机上装了它但没在跑）" systemctl start nginx
+    NGINX_STARTED_BY_US=1
+  fi
+  assert_eq "nginx 在跑（蓝绿的前提）" "active" "$(systemctl is-active nginx 2>/dev/null || true)"
+  printf '      nginx 版本: %s\n' "$(nginx -v 2>&1)"
+  printf '      主配置    : /etc/nginx/nginx.conf（运维的，本轮只往里加一行 include）\n'
+
+  require_ok "注册蓝绿应用" opsctl app create "$app"
+
+  local uploaded artifact_id
+  uploaded=$(q artifact put /opt/frz-ops/frz-probe --media-type application/octet-stream --json)
+  artifact_id=$(printf '%s' "${uploaded}" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+  if [ -z "$artifact_id" ]; then
+    fail "制品上传失败：${uploaded}"
+    return 0
+  fi
+
+  # 两个槽位共用同一份 argv，因此**端口只能从槽位环境里来**：应用怎么知道自己的端口，
+  # 由运维通过槽位环境告诉它（迭代 4 规格 D6——工具不发明 FRZ_SLOT_PORT 之类的魔法名字）。
+  # 版本号走同一条路，于是「curl 拿到的正文就是现在服务的是哪一版」。
+  bg_manifest() { # 版本
+    local version=$1
+    cat <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${app}
+runtime: go
+artifact:
+  id: ${artifact_id}
+  version: ${version}
+  fileName: bin/frz-probe
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - bin/frz-probe
+    - --report
+    - /var/lib/${app}/probe-report.txt
+  workingDirectory: /var/lib/${app}
+  runUser: ${app}
+  slots:
+    blue:
+      ports: [${BG_BLUE_PORT}]
+      readiness:
+        type: tcp
+        target: "127.0.0.1:${BG_BLUE_PORT}"
+        consecutiveSuccesses: 1
+      environment:
+        FRZ_PROBE_LISTEN: "127.0.0.1:${BG_BLUE_PORT}"
+        FRZ_PROBE_VERSION: "${version}"
+    green:
+      ports: [${BG_GREEN_PORT}]
+      readiness:
+        type: tcp
+        target: "127.0.0.1:${BG_GREEN_PORT}"
+        consecutiveSuccesses: 1
+      environment:
+        FRZ_PROBE_LISTEN: "127.0.0.1:${BG_GREEN_PORT}"
+        FRZ_PROBE_VERSION: "${version}"
+health:
+  startTimeoutSeconds: 30
+  stopTimeoutSeconds: 30
+logs:
+  directory: /var/log/${app}
+nginx:
+  listen: ${BG_VPORT}
+  observationSeconds: 2
+  drainSeconds: 1
+release:
+  keepLast: 3
+MANIFEST
+  }
+
+  # bg_deploy 把 operation id 写进全局 BG_OP_ID。**不用 $( ) 取返回值**：命令替换是子 shell，
+  # 里面的 pass/fail 不会计入父 shell 的计数（容器 harness 2026-09-26 真踩到过这件事）。
+  bg_deploy() { # 描述 版本
+    local desc=$1 version=$2 out id
+    bg_manifest "$version" > "$FRZ_HOST_DIR/bg-${version}.yaml"
+    chmod 0644 "$FRZ_HOST_DIR/bg-${version}.yaml"
+    BG_OP_ID=""
+    out=$(opsctl app deploy --app "$app" --file "$FRZ_HOST_DIR/bg-${version}.yaml" --json 2>&1) || true
+    id=$(printf '%s' "$out" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+    if [ -z "$id" ]; then
+      fail "${desc}：未返回 operation id（${out}）"
+      return 1
+    fi
+    if ! wait_for_status "$id" succeeded; then
+      fail "${desc}：部署未成功（$(q operation get "$id" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p' | head -1)：$(q operation logs "$id" --json | sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' | tail -3 | tr '\n' ' ')）"
+      return 1
+    fi
+    pass "${desc}"
+    BG_OP_ID=$id
+    return 0
+  }
+
+  # 从 nginx 的对外端口读回「现在服务的是哪一版」——判据是**正文**，不是「端口在听」。
+  served_version() { curl -s -m 3 "http://127.0.0.1:${BG_VPORT}/" | tr -d '\r\n' || true; }
+
+  # wait_for_served_version 等 nginx 真的把流量切过去，再断言。
+  #
+  # **`nginx -s reload` 是异步的**：master 收到 HUP 之后新 worker 才起来、旧 worker 处理完
+  # 在途请求才退出。reload 之后立刻读，可能还拿到旧 worker 服务的旧版本——2026-09-27 在这一
+  # 台上真的失败了一次（而隔着一次重启的那条断言反而是过的，因为那时早就收敛了）。
+  # 顺带说：这恰好也是**为什么要有观察窗口**的同一个道理。
+  wait_for_served_version() { # 期望的响应正文
+    local want=$1 got="" _
+    for _ in $(seq 1 60); do
+      got=$(served_version)
+      [ "$got" = "$want" ] && return 0
+      sleep 0.25
+    done
+    return 1
+  }
+
+  assert_served() { # 描述 期望的响应正文
+    if wait_for_served_version "$2"; then
+      pass "$1 = $2"
+    else
+      fail "$1：等不到 $2（现在拿到的是 $(served_version)）"
+    fi
+  }
+
+  # A) 反例：主配置还没 include 受管目录 → 部署必须**拒绝切流**。
+  #
+  #    这是这一层最要紧的一条：配置写对了但没生效时，切流看起来会成功，而流量根本不经过
+  #    我们改的 upstream。宁可在这里失败。
+  bg_manifest 1.0.0 > "$FRZ_HOST_DIR/bg-1.0.0.yaml"
+  chmod 0644 "$FRZ_HOST_DIR/bg-1.0.0.yaml"
+  local out id
+  out=$(opsctl app deploy --app "$app" --file "$FRZ_HOST_DIR/bg-1.0.0.yaml" --json 2>&1) || true
+  id=$(printf '%s' "$out" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -z "$id" ]; then
+    fail "未返回 operation id：${out}"
+  elif wait_for_status "$id" failed; then
+    assert_eq "受管目录没被主配置加载时的错误码" "NGINX_CONFIG_INVALID" \
+      "$(q operation get "$id" --json | sed -n 's/.*"errorCode": *"\([^"]*\)".*/\1/p' | head -1)"
+    assert_eq "报错指出了该怎么办（include 受管目录）" "yes" \
+      "$(q operation logs "$id" --json | grep -q 'frz-managed' && printf yes || printf no)"
+  else
+    fail "主配置没有 include 受管目录，部署本该失败却成功了"
+  fi
+  assert_eq "被拒绝的部署没有让 nginx 监听到对外端口" "no" \
+    "$(ss -lntH "sport = :$BG_VPORT" 2>/dev/null | grep -q . && printf yes || printf no)"
+
+  # B) 运维的那一步：在主配置里 include 受管目录（一行 conf.d 文件即可）。
+  require_ok "把受管目录加进主配置（运维的动作）" \
+    sh -c "printf 'include /etc/nginx/frz-managed/*.conf;\n' > ${BG_INCLUDE} && nginx -t"
+
+  # C) 第一次部署：1.0.0 落到 blue，对外端口能拿到 version=1.0.0。
+  if bg_deploy "第一次部署 1.0.0（落 blue）" 1.0.0; then
+    assert_served "对外端口拿到的版本" "version=1.0.0"
+  fi
+  assert_eq "${app}-blue.service 在跑" "yes" "$(unit_running "${app}-blue.service")"
+  # green 这一侧**从没被 Prepare 过**：unit 文件都不存在。这比「没在跑」更强，
+  # 也正是蓝绿要的那件事——第一次部署不该碰另一侧。
+  assert_eq "${app}-green.service 的 unit 文件还不存在" "no" "$(unit_file_exists "${app}-green.service")"
+  assert_eq "${app}-green.service 没在跑" "no" "$(unit_running "${app}-green.service")"
+  assert_eq "受管配置指向 blue 的端口" "yes" \
+    "$(grep -q "server 127.0.0.1:${BG_BLUE_PORT};" "$BG_MANAGED" 2>/dev/null && printf yes || printf no)"
+  assert_eq "受管配置里没有 green 的端口" "no" \
+    "$(grep -q "${BG_GREEN_PORT}" "$BG_MANAGED" 2>/dev/null && printf yes || printf no)"
+  assert_eq "受管配置的头注释说明了它指向哪一侧" "yes" \
+    "$(head -2 "$BG_MANAGED" 2>/dev/null | grep -q 'blue' && printf yes || printf no)"
+
+  # D) 第二次部署**期间**持续打请求：切流不能丢掉任何一个请求。
+  #
+  #    成功与失败各记一行——**只记失败的话，「零失败」可能只是「零请求」**，
+  #    而那正是最危险的一种绿。
+  : > /tmp/frz-bg-requests
+  rm -f /tmp/frz-bg-stop
+  curl_loop() {
+    while [ ! -f /tmp/frz-bg-stop ]; do
+      if curl -s -m 2 -o /dev/null "http://127.0.0.1:${BG_VPORT}/"; then
+        printf 'ok\n' >> /tmp/frz-bg-requests
+      else
+        printf 'fail\n' >> /tmp/frz-bg-requests
+      fi
+      sleep 0.05
+    done
+  }
+  curl_loop &
+  local loop_pid=$!
+
+  local switched_ok=0
+  if bg_deploy "第二次部署 2.0.0（切到 green）" 2.0.0; then
+    switched_ok=1
+  fi
+  touch /tmp/frz-bg-stop
+  wait "$loop_pid" 2>/dev/null || true
+
+  if [ "$switched_ok" = "1" ]; then
+    assert_served "切流之后对外端口拿到的是新版本" "version=2.0.0"
+  fi
+  assert_eq "切流期间失败的请求数" "0" "$(grep -c fail /tmp/frz-bg-requests || true)"
+  # 元断言：循环必须**成功地**打过足够多的请求。只看「零失败」是不够的——循环如果压根
+  # 没跑起来（或者主机上没有 curl），它同样会「零失败」，那是一个测不出东西的断言。
+  assert_eq "切流期间成功的请求数 ≥ 50" "yes" \
+    "$(test "$(grep -c '^ok$' /tmp/frz-bg-requests)" -ge 50 && printf yes || printf no)"
+  assert_eq "${app}-green.service 在跑" "yes" "$(unit_running "${app}-green.service")"
+  assert_eq "${app}-blue.service 被排空后停掉" "no" "$(unit_running "${app}-blue.service")"
+  assert_eq "${app}-blue.service 开机自启" "enabled" "$(systemctl is-enabled "${app}-blue.service" 2>/dev/null || true)"
+  assert_eq "${app}-green.service 开机自启" "enabled" "$(systemctl is-enabled "${app}-green.service" 2>/dev/null || true)"
+  # 两个槽位各有一份自己的环境文件——共用一份就表达不了「blue 听 A、green 听 B」。
+  # 因此光「两个文件都在」不够，**它们的内容必须不同**，各带各的端口。
+  assert_eq "两个槽位各有一份自己的环境文件" "yes yes" \
+    "$([ -f "/etc/opsd/apps/${app}.blue.env" ] && printf yes || printf no) $([ -f "/etc/opsd/apps/${app}.green.env" ] && printf yes || printf no)"
+  assert_eq "blue 的环境文件带的是 blue 的端口" "yes" \
+    "$(grep -q "${BG_BLUE_PORT}" "/etc/opsd/apps/${app}.blue.env" 2>/dev/null && printf yes || printf no)"
+  assert_eq "green 的环境文件带的是 green 的端口" "yes" \
+    "$(grep -q "${BG_GREEN_PORT}" "/etc/opsd/apps/${app}.green.env" 2>/dev/null && printf yes || printf no)"
+
+  # E) 回滚：把流量切回 1.0.0 所在的 blue。
+  local rb_out rb_id
+  rb_out=$(opsctl app rollback --app "$app" --json 2>&1) || true
+  rb_id=$(printf '%s' "$rb_out" | sed -n 's/.*"id": *"\(op_[^"]*\)".*/\1/p' | head -1)
+  if [ -n "$rb_id" ] && wait_for_status "$rb_id" succeeded; then
+    pass "回滚走 Operation 且成功"
+    assert_served "回滚后对外端口拿到的是旧版本" "version=1.0.0"
+    assert_eq "回滚后 blue 重新在跑" "yes" "$(unit_running "${app}-blue.service")"
+    assert_eq "回滚后 green 被停掉" "no" "$(unit_running "${app}-green.service")"
+  else
+    fail "回滚未成功"
+  fi
+
+  # F) 槽位视图与切换时间线（迭代 4c）。断言用的取值方式与容器 harness 同一套：
+  #    从 --json 里按 `"slot": "<侧>"` 切出那一侧的对象——JSON 的键全是 ASCII，
+  #    而人类可读输出的标签是中文，塞进 sed 模式里要按字节匹配。
+  slot_item() { q app slot list --app "$app" --json | sed -n "/\"slot\": \"$1\"/,/}/p"; }
+  slot_str() { slot_item "$1" | sed -n "s/.*\"$2\": *\"\([^\"]*\)\".*/\1/p" | head -1; }
+  slot_bool() { slot_item "$1" | sed -n "s/.*\"$2\": *\([a-z]*\).*/\1/p" | head -1; }
+  view_str() { q app slot list --app "$app" --json | sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" | head -1; }
+  view_bool() { q app slot list --app "$app" --json | sed -n "s/.*\"$1\": *\([a-z]*\).*/\1/p" | head -1; }
+
+  assert_eq "slot list 报的线上事实" "blue" "$(view_str servingSlot)"
+  assert_eq "slot list 报的库里记录" "blue" "$(view_str recordedSlot)"
+  assert_eq "两份事实一致时不报不一致" "false" "$(view_bool inconsistent)"
+  assert_eq "blue 这一侧在接流量（线上事实）" "true" "$(slot_bool blue serving)"
+  assert_eq "blue 的状态" "serving" "$(slot_str blue state)"
+  assert_eq "blue 跑的是回滚后的版本" "1.0.0" "$(slot_str blue version)"
+  assert_eq "blue 的 unit 名是按槽位派生的" "${app}-blue.service" "$(slot_str blue unitName)"
+  assert_eq "green 被回滚停掉之后状态是 stopped" "stopped" "$(slot_str green state)"
+  assert_eq "blue 报的端口是它自己声明的那个" "yes" \
+    "$(slot_item blue | grep -q "${BG_BLUE_PORT}" && printf yes || printf no)"
+  assert_eq "green 报的端口是它自己声明的那个" "yes" \
+    "$(slot_item green | grep -q "${BG_GREEN_PORT}" && printf yes || printf no)"
+  assert_eq "blue 的进程状态来自 systemd" "active" "$(slot_str blue processState)"
+  assert_eq "green 的进程状态来自 systemd" "inactive" "$(slot_str green processState)"
+  # 「没探」与「探了不健康」是两件事：green 停着，因此 ready 是 null（字段缺席）。
+  assert_eq "在跑的 blue 探了就绪" "true" "$(slot_bool blue ready)"
+  assert_eq "停着的 green 没被探活（ready 是 null）" "no" \
+    "$(slot_item green | grep -q '\"ready\"' && printf yes || printf no)"
+
+  assert_eq "时间线里有三次切流（两次部署 + 一次回滚）" "3" \
+    "$(q app slot history --app "$app" --json | grep -c '"kind": "switched"' || true)"
+  assert_eq "时间线里有排空停掉旧槽位的记录" "yes" \
+    "$(q app slot history --app "$app" --json | grep -q '"kind": "stopped"' && printf yes || printf no)"
+  assert_eq "时间线里有观察窗口通过的记录" "yes" \
+    "$(q app slot history --app "$app" --json | grep -q '"kind": "observed"' && printf yes || printf no)"
+  assert_eq "时间线覆盖了两个版本" "yes" \
+    "$(q app slot history --app "$app" --json | grep -q '"version": "2.0.0"' && printf yes || printf no)"
+  assert_eq "事件带上了触发它的操作 id" "yes" \
+    "$(q app slot history --app "$app" --json | grep -q '"operationId": "op_' && printf yes || printf no)"
+
+  # G) 对账（迭代 4c）：把**线上**改成与库不一致，重启 opsd 服务，库应当被按线上纠正。
+  #
+  #    造法是照着真实成因做的：手工把受管配置改指向 green、把 green 拉起来、reload——
+  #    这就是「切流成功、而 promote 落库之前进程被杀」在盘上留下的样子。**刻意不动库**：
+  #    线上那一侧才是事实（迭代 4 规格 D2），对账是让库追上它。
+  #
+  #    容器 harness 用的是另一条路（直接改库），因为那里的 sqlite3 是新的；**这台主机上
+  #    那条路走不通**——CentOS 7 自带的 sqlite3 是 3.7.17（2013 年），连我们的库都打不开：
+  #    迁移 0009 建了一个偏索引（`CREATE UNIQUE INDEX ... WHERE ...`），那需要 3.8+。
+  #    见下面的 note：这不是本轮引入的问题，但它是一台 legacy 主机上真实存在的操作约束。
+  require_ok "手工把受管配置改指向 green（模拟切流成功、落库之前被杀）" \
+    sed -i "s/127.0.0.1:${BG_BLUE_PORT};/127.0.0.1:${BG_GREEN_PORT};/" "$BG_MANAGED"
+  assert_eq "受管配置现在指向 green 的端口" "yes" \
+    "$(grep -q "server 127.0.0.1:${BG_GREEN_PORT};" "$BG_MANAGED" 2>/dev/null && printf yes || printf no)"
+  require_ok "把 green 拉起来并 reload（线上真的在 green 服务了）" \
+    sh -c "systemctl start ${app}-green.service && nginx -s reload"
+  assert_served "线上现在服务的是 2.0.0" "version=2.0.0"
+
+  assert_eq "线上事实报 green" "green" "$(view_str servingSlot)"
+  assert_eq "库里那份还记着 blue（与线上不一致）" "blue" "$(view_str recordedSlot)"
+  assert_eq "两份事实不一致时被标出来" "true" "$(view_bool inconsistent)"
+
+  require_ok "重启 opsd 服务（对账在启动时跑）" systemctl restart "$OPSD_UNIT"
+  wait_for_socket
+  sleep 1
+
+  assert_eq "对账之后库里的记录跟上了线上" "green" "$(view_str recordedSlot)"
+  assert_eq "对账之后两份事实一致" "false" "$(view_bool inconsistent)"
+  # 第二条规则：按 systemd 的实际状态重算。green 被我们手工拉起来了、而它就是线上那一侧，
+  # 因此是 serving；blue 的进程还在跑（回滚时起的），而它已经不接流量了。
+  assert_eq "对账按进程事实把 green 认成 serving" "serving" "$(slot_str green state)"
+  assert_eq "对账按进程事实把 blue 改成 standby" "standby" "$(slot_str blue state)"
+  # **对账只镜像事实，不动流量**：nginx 的 upstream 与两个进程都原样。
+  assert_eq "对账没有改 nginx 的 upstream" "version=2.0.0" "$(served_version)"
+  assert_eq "对账没有动 blue 的进程" "yes" "$(unit_running "${app}-blue.service")"
+  assert_eq "对账在时间线里留了痕" "yes" \
+    "$(q app slot history --app "$app" --json | grep -q '"kind": "reconciled"' && printf yes || printf no)"
+
+  note "这台主机自带的 sqlite3 是 3.7.17（CentOS 7 的，2013 年），**打不开 opsd 的库**：迁移 0009 的偏索引（CREATE UNIQUE INDEX ... WHERE）需要 3.8+。运维要在 legacy 主机上直接查库，得自己装一个新一点的 sqlite3；本工具不受影响（它用的是编译进来的 SQLite），但「库坏了怎么查」这件事有前提"
+  note "蓝绿应用的两个槽位 unit（${app}-blue/-green.service）**不在重启验证那一轮的断言里**：本轮只重启了 opsd 服务，没有重启整台机，因此「蓝绿部署跨机器重启存活」未验证"
+}
+
+
 record_boot_identity() {
   log "记录重启前的主机身份（用来证明真的重启过，而不是在检查一台没重启的机器）"
   # CLI 没有 operation list，因此 start 操作的 ID 由 check_lifecycle 记在变量里。
@@ -1448,6 +1847,9 @@ main() {
       check_deploy_host
       # 迭代 3c：真 JVM + 资源限制 + 解释器预检。
       check_java_and_resources
+      # 迭代 4：真机上的 Nginx 蓝绿（切流、时间线、对账）。**只进 full**：
+      # 它不参与重启验证那一轮（prepare/check），因此「蓝绿跨机器重启存活」仍未验证。
+      check_bluegreen_host
       report
       ;;
   esac
