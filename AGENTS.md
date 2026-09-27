@@ -25,8 +25,9 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 **迭代 3（Go/Java 通用进程部署）的 3a / 3b / 3c 都已实现并验证**（解包与 release 目录、
 部署与回滚、资源限制与 Java 运行时的解释器预检），3c 的真机验证（含**重启后部署版本仍存活**）
 在 legacy 档主机上完成。**迭代 4（Nginx 蓝绿发布、观察窗口与回滚）的 4a/4b/4c 均已实现
-并在 Linux 容器里验证**（真 Nginx + 真 systemd + 真 curl，见 `2026-09-25-iteration-4.md`
-第 13–20 节）；迭代 5 未开始。
+并验证**：容器里有真 Nginx + 真 systemd + 真 curl（第 13–20 节），**legacy 档真机上也跑了一整轮**
+（EPEL 的 nginx 1.20.1 + systemd 219，`make verify-host` **183 项通过 / 0 项失败**，第 21 节）；
+迭代 5 未开始。
 **真实 Linux 主机的证据已于 2026-09-24 取得**，而且**两档都拿到了**：
 Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真实重启）与
 **CentOS 7 / systemd 219 / cgroup v1（legacy 档，118 项通过 / 0 项失败）**，见 `test/host/`。
@@ -50,7 +51,8 @@ Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真�
 - `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a/3b/3c 已实现并验证，
   见 §12–17）
 - `docs/plans/2026-09-25-iteration-4.md`：Nginx 蓝绿发布、观察窗口与回滚
-  （4a/4b/4c 已实现并在 **Linux 容器**里验证，见第 13–20 节；**真实主机上的蓝绿未验证**）
+  （4a/4b/4c 已实现并验证：容器见第 13–20 节，**legacy 档真机**见第 21 节；
+  **strict 档真机**与**跨机器重启存活**仍未验证）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -191,7 +193,9 @@ socket 属组项）；MySQL 的隔离恢复对备份账号的权限要求不只�
 ——容器（255）与上一台真机（257）都够不到的那一档：
 `FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host` 实跑
 **118 项通过 / 0 项失败**，含迭代 3c 的整段（真实 JAR + 真 JVM + `MemoryLimit=` 落到 cgroup v1 +
-解释器预检）。**重启验证也做了**（用户授权重启那台 VM）：`prepare` **116/0** + `check` **28/0**
+解释器预检），**迭代 4 的蓝绿段也已在这台上跑通**（2026-09-27：EPEL 的 nginx 1.20.1，
+两次部署 + 真切流 + 回滚 + `app slot list/history` + `systemctl restart` opsd 之后的对账，
+整轮 `full` **183/0**）。**重启验证也做了**（用户授权重启那台 VM）：`prepare` **116/0** + `check` **28/0**
 ——`boot_id` 前后不同、`/run/opsd` 由 `RuntimeDirectory=` 重建、两档的应用都自己回到 active、
 **部署出来的 release 自己回来且 `current` 未变**、重启前创建的 Operation 仍可查。
 自动重启的编排**必须等它先下线再上线**：关机过程中 ssh 几秒内仍可用，只等「ssh 恢复」会让

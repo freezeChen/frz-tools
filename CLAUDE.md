@@ -133,7 +133,7 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   不删历史决策），`2026-09-21-iteration-{0,1a,1b,1c,1d,2}.md` 与 `2026-09-24-iteration-3.md`
   是各迭代规格与验证记录，
   `2026-09-25-iteration-4.md` 是 Nginx 蓝绿的规格与验证记录（4a/4b/4c 均已实现并在
-  **Linux 容器**里验证，见第 13–20 节；**真实主机上的蓝绿未验证**），
+  **Linux 容器**里验证，见第 13–20 节；**legacy 档真机**上一整轮也跑通了，见第 21 节），
   `2026-09-24-future-iterations.md` 是**未来迭代目标的停放区**（GFS 保留策略 +
   迭代 0–2 沉淀下来的待定项；**不是规格**，开工前要先升级成迭代文档）。验收标准
   必须给出「命令 / 结果 / 证据类型」。**1d（重试与并发策略）已于 2026-09-24 实现并提交**；
@@ -150,9 +150,10 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   `SudoConfig`（只有模型、零行为）、GFS 保留、store-wide 的备份孤儿回收、
   真实生产库与大库的备份、
   GTID 开启的 MySQL 8、大容量长时间备份、**strict 档上修复后的 3c 复跑**（那台主机不可达）、
-  **真实主机上的蓝绿（迭代 4）**——容器里有真 Nginx 与真 systemd，但那仍是「Linux 容器」证据；
-  另有两条设计边界见 `2026-09-25-iteration-4.md` §18.6（受管文件 ≠ nginx 已加载的配置、
-  对账只发生在启动时）。
+  **蓝绿只在 legacy 档真机上验过**（2026-09-27，183 项通过 / 0 项失败）：**strict 档**上的
+  蓝绿、以及**蓝绿跨机器重启存活**仍未验证（容器里有真 Nginx 与真 systemd，但那仍是
+  「Linux 容器」证据）；另有两条设计边界见 `2026-09-25-iteration-4.md` §18.6
+  （受管文件 ≠ nginx 已加载的配置、对账只发生在启动时）。
   SELinux 的措辞要精确：**enforcing 下的行为已观测**（进程落在 `unconfined_service_t`），
   本工具**不提供** SELinux 加固——这是「未实现的能力」，不得写成「已支持」。
 - **真实 Linux 主机**上的验证用 `make verify-host`（`test/host/`，需要一台能 ssh 的主机，
@@ -161,8 +162,11 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
     `full` **95/0**（1c 的 73 + 2b 的 22），重启验证 **21/0**（停机 44 秒）；迭代 3c 那一轮
     **111/1**——唯一失败项是一个真实缺陷（已修复），**修复后没在这台上复跑**（那台机后来
     整段网段不可达）。
-  - **legacy 档**（CentOS 7 / systemd 219 / cgroup v1，`43.142.95.141`）：`full` **118/0**，
-    含迭代 3c 整段（真 JAR、真 JVM、`MemoryLimit=` 落到 cgroup v1、解释器预检）；重启验证
+  - **legacy 档**（CentOS 7 / systemd 219 / cgroup v1，`43.142.95.141`）：最近一轮 `full`
+    **183/0**（2026-09-27，迭代 4 之前那一轮是 118/0），含迭代 3c 整段（真 JAR、真 JVM、
+    `MemoryLimit=` 落到 cgroup v1、解释器预检）与**迭代 4 的蓝绿段**（EPEL 的 nginx 1.20.1：
+    两次部署 + 真切流 + 回滚 + `app slot list/history` + 重启 opsd 服务之后的对账）；
+    重启验证
     `prepare` **116/0** + `check` **28/0**——`boot_id` 前后不同、`/run/opsd` 由
     `RuntimeDirectory=` 重建、**部署出来的 release 自己回来且 `current` 未变**。
     跑法：`FRZ_HOST=root@43.142.95.141 FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 make verify-host`。
