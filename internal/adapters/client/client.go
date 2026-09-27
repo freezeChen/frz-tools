@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net"
@@ -18,11 +19,20 @@ import (
 	"github.com/freezeChen/frz-tools/internal/domain"
 )
 
-const baseURL = "http://opsd"
+const (
+	// unixScheme 是本机 socket 那条路的伪 URL：真实地址由 DialContext 决定，
+	// 这里的主机名只是占位。
+	unixScheme = "http://opsd"
+	// remoteScheme 是远程那条路。**必须是 https**：http.Transport 按 URL 的 scheme
+	// 决定要不要套 TLS，用 http:// 的话即便配了 TLSClientConfig 也不会握手。
+	remoteScheme = "https://opsd"
+)
 
 type Client struct {
 	http   *http.Client
 	socket string
+	// address 是远程目标（host:port）。空表示走本机 socket。
+	address string
 }
 
 func New(socketPath string, timeout time.Duration) *Client {
@@ -39,6 +49,46 @@ func New(socketPath string, timeout time.Duration) *Client {
 		http:   &http.Client{Transport: transport, Timeout: timeout},
 		socket: socketPath,
 	}
+}
+
+// NewRemote 连到另一台机器上的 opsd（迭代 5a）。
+//
+// 地址用参数固定，而不是让 URL 里的主机名决定：`--host` 是从本机库里查出来的地址，
+// 而 URL 里的名字只是占位符。TLS 的 ServerName 由调用方在 tlsConfig 里给出
+// （见 pki.ClientTLSConfig），两处都刻意不与 URL 耦合。
+func NewRemote(address string, tlsConfig *tls.Config, timeout time.Duration) *Client {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp", address)
+		},
+		TLSClientConfig: tlsConfig,
+	}
+	return &Client{
+		http:    &http.Client{Transport: transport, Timeout: timeout},
+		address: address,
+	}
+}
+
+// IsRemote 报告这个客户端连的是不是远程主机。
+func (c *Client) IsRemote() bool { return c.address != "" }
+
+// Target 是给人看的「我在跟谁说话」，报错时用。
+func (c *Client) Target() string {
+	if c.IsRemote() {
+		return "远程 opsd " + c.address
+	}
+	return "opsd (unix socket " + c.socket + ")"
+}
+
+func (c *Client) scheme() string {
+	if c.IsRemote() {
+		return remoteScheme
+	}
+	return unixScheme
 }
 
 func (c *Client) Health(ctx context.Context) (*v1.HealthResponse, error) {
@@ -111,7 +161,7 @@ type UploadArtifactInput struct {
 }
 
 func (c *Client) UploadArtifact(ctx context.Context, in UploadArtifactInput) (*v1.Artifact, bool, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/v1/artifacts", in.Body)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.scheme()+"/api/v1/artifacts", in.Body)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,7 +173,7 @@ func (c *Client) UploadArtifact(ctx context.Context, in UploadArtifactInput) (*v
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return nil, false, domain.NewError(v1.CodeInternal, "cannot reach opsd at %s: %v", c.socket, err)
+		return nil, false, c.transportError(err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= 400 {
@@ -187,14 +237,14 @@ func (c *Client) DownloadArtifact(ctx context.Context, ref, destPath string) (*v
 		return nil, err
 	}
 
-	endpoint := baseURL + "/api/v1/artifacts/" + url.PathEscape(artifact.ID) + "/content"
+	endpoint := c.scheme() + "/api/v1/artifacts/" + url.PathEscape(artifact.ID) + "/content"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	response, err := c.http.Do(request)
 	if err != nil {
-		return nil, domain.NewError(v1.CodeInternal, "cannot reach opsd at %s: %v", c.socket, err)
+		return nil, c.transportError(err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= 400 {
@@ -283,7 +333,7 @@ func setIfNotEmpty(request *http.Request, header, value string) {
 }
 
 func (c *Client) doWithStatus(ctx context.Context, method, path string, query url.Values, body, out any) (bool, error) {
-	endpoint := baseURL + path
+	endpoint := c.scheme() + path
 	if len(query) > 0 {
 		endpoint += "?" + query.Encode()
 	}
@@ -307,7 +357,7 @@ func (c *Client) doWithStatus(ctx context.Context, method, path string, query ur
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return false, domain.NewError(v1.CodeInternal, "cannot reach opsd at %s: %v", c.socket, err)
+		return false, c.transportError(err)
 	}
 	defer response.Body.Close()
 

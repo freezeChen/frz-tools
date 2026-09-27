@@ -71,6 +71,20 @@ const (
 	// 不确定状态，必须人工介入。刻意不复用 CONFIG_INVALID：那个码是「拒绝切流」，
 	// 这个码是「切到一半出事了」，运维要做的事完全不同。
 	CodeNginxReloadFailed ErrorCode = "NGINX_RELOAD_FAILED"
+
+	// 远程（迭代 5a）。三个码**刻意分开**，因为它们指向三种不同的修法：
+	// 一个去查网络、一个去查证书、一个去改授权名单。合成一句「连不上」会让
+	// 这三件事混成一件事。
+	//
+	// CodeHostUnreachable 是**根本没连上**目标主机的 opsd：连接被拒、超时、DNS 失败。
+	CodeHostUnreachable ErrorCode = "HOST_UNREACHABLE"
+	// CodeHostTLSFailed 是**连上了但 TLS 没通过**：证书不受信、过期、SAN 与地址
+	// 不匹配，或者本机根本没带客户端证书。它与 HOST_UNREACHABLE 分开的理由是
+	// 「TCP 通不通」与「证书对不对」是两个人去修的两件事。
+	CodeHostTLSFailed ErrorCode = "HOST_TLS_FAILED"
+	// CodeRemoteForbidden 是**身份认出来了，但这件事不归它做**：CN 不在 clients
+	// 名单里、档位不够，或者超出了它的应用白名单。
+	CodeRemoteForbidden ErrorCode = "REMOTE_FORBIDDEN"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -112,6 +126,11 @@ var httpStatusByCode = map[ErrorCode]int{
 	CodeDeployRolledBack:         409,
 	CodeNginxConfigInvalid:       409,
 	CodeNginxReloadFailed:        409,
+	// 502 而不是 500：这两个码说的是**上游**（目标主机）的问题，不是本守护进程内部出错。
+	// 客户端据此能区分「对面挂了」与「我的请求把 opsd 弄崩了」。
+	CodeHostUnreachable: 502,
+	CodeHostTLSFailed:   502,
+	CodeRemoteForbidden: 403,
 }
 
 // HTTPStatus 返回错误码在被 API 处理器直接返回时对应的 HTTP 状态码。
@@ -167,6 +186,9 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeDeployRolledBack:         29,
 	CodeNginxConfigInvalid:       31,
 	CodeNginxReloadFailed:        32,
+	CodeHostUnreachable:          33,
+	CodeHostTLSFailed:            34,
+	CodeRemoteForbidden:          35,
 }
 
 func ExitCode(code ErrorCode) int {

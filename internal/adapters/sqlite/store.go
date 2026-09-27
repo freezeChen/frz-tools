@@ -124,6 +124,13 @@ func (s *Store) CreateOperation(ctx context.Context, op *domain.Operation) (*dom
 	if err := insertOperation(ctx, tx, op); err != nil {
 		return nil, err
 	}
+	// claimedBy 只记「他自称是谁」，且只在它与认证身份不同时才有值（迭代 5a）。
+	// Actor 一律是可信的那一份——远程请求里 created_by 是调用方自报的，
+	// 把它直接当 actor 等于给任何能连上的人一个改审计的机会。
+	var details map[string]string
+	if op.ClaimedBy != "" {
+		details = map[string]string{"claimedBy": op.ClaimedBy}
+	}
 	if err := insertAudit(ctx, tx, domain.AuditEvent{
 		EventType:   domain.EventOperationCreated,
 		Actor:       op.CreatedBy,
@@ -131,6 +138,7 @@ func (s *Store) CreateOperation(ctx context.Context, op *domain.Operation) (*dom
 		Resource:    op.Resource,
 		Result:      string(op.Status),
 		Time:        op.CreatedAt,
+		Details:     details,
 	}); err != nil {
 		return nil, err
 	}

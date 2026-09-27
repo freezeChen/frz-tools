@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/freezeChen/frz-tools/internal/adapters/sqlite"
 	"github.com/freezeChen/frz-tools/internal/application"
 	"github.com/freezeChen/frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/pki"
 )
 
 const maxRequestBytes = 1 << 20
@@ -37,6 +39,12 @@ type Dependencies struct {
 	Store     *sqlite.Store
 	Workers   int
 	Logger    *slog.Logger
+	// RemoteIdentities 是远程身份白名单（迭代 5a）。为 nil 表示本进程不听远程——
+	// 那时任何 mTLS 请求都是装配错误，一律拒绝。
+	RemoteIdentities RemoteIdentityLookup
+	// Version 是构建信息（模块版本 + VCS 修订），由 /identity 回答。
+	// 为空串是诚实的事实（没有注入），不是 "unknown"。
+	Version string
 }
 
 type Server struct {
@@ -55,79 +63,108 @@ func (s *Server) logger() *slog.Logger {
 	return s.deps.Logger
 }
 
+// routes 是**唯一**的路由注册处：路径、访问档位与处理器写在同一行。
+//
+// 之所以把三条信息捆在一起，是因为它们必须一起改。把档位表单独列一份的话，
+// 新加一个写端点而忘了登记，得到的是「静默放行」——一个不会报错的越权。
+// Handler() 对档位做了合法性检查，漏写就是启动即崩。
+func (s *Server) routes() []route {
+	return []route{
+		{"GET /api/v1/identity", accessRead, s.handleIdentity},
+		{"GET /api/v1/health", accessRead, s.handleHealth},
+		{"POST /api/v1/operations", accessWrite, s.handleCreateOperation},
+		{"GET /api/v1/operations/{id}", accessRead, s.handleGetOperation},
+		{"POST /api/v1/operations/{id}/cancel", accessWrite, s.handleCancelOperation},
+		{"POST /api/v1/operations/{id}/retry", accessWrite, s.handleRetryOperation},
+		{"GET /api/v1/operations/{id}/logs", accessRead, s.handleOperationLogs},
+
+		{"POST /api/v1/artifacts", accessWrite, s.handleUploadArtifact},
+		{"GET /api/v1/artifacts", accessRead, s.handleListArtifacts},
+		{"POST /api/v1/artifacts/gc", accessWrite, s.handleCollectArtifacts},
+		{"GET /api/v1/artifacts/{id}", accessRead, s.handleGetArtifact},
+		{"GET /api/v1/artifacts/{id}/content", accessRead, s.handleDownloadArtifact},
+		// verify 只重算一遍摘要与记录比对，不改任何状态，因此是只读。
+		{"POST /api/v1/artifacts/{id}/verify", accessRead, s.handleVerifyArtifact},
+		{"DELETE /api/v1/artifacts/{id}", accessWrite, s.handleDeleteArtifact},
+
+		{"POST /api/v1/applications", accessWrite, s.handleCreateApplication},
+		{"GET /api/v1/applications", accessRead, s.handleListApplications},
+		{"GET /api/v1/applications/{id}", accessRead, s.handleGetApplication},
+		{"GET /api/v1/applications/{id}/releases", accessRead, s.handleListApplicationReleases},
+		{"PUT /api/v1/applications/{id}/spec", accessWrite, s.handlePutApplicationSpec},
+		{"GET /api/v1/applications/{id}/spec", accessRead, s.handleGetApplicationSpec},
+		// validate 是同步用例且无副作用（成败都在内存里判），因此是只读；
+		// prepare 会真的往盘上写 unit 与环境文件，是写。
+		{"POST /api/v1/applications/{id}/runtime/validate", accessRead, s.handleValidateRuntime},
+		{"POST /api/v1/applications/{id}/runtime/prepare", accessWrite, s.handlePrepareRuntime},
+		{"POST /api/v1/applications/{id}/runtime/start", accessWrite, s.handleStartRuntime},
+		{"POST /api/v1/applications/{id}/runtime/stop", accessWrite, s.handleStopRuntime},
+		{"GET /api/v1/applications/{id}/runtime/health", accessRead, s.handleRuntimeHealth},
+		// 部署与回滚（迭代 3）：都走 Service.Create，与 runtime.* / backup.* 同一条创建路径，
+		// 因此 operation get/logs/cancel/retry 对它们同样适用。
+		// 槽位的运营视图与切换时间线（迭代 4c）。`history` 是子路径而不是查询参数：
+		// 它返回的是另一种东西（事件流），不是同一个列表的另一种筛选。
+		{"GET /api/v1/applications/{id}/slots", accessRead, s.handleListSlots},
+		{"GET /api/v1/applications/{id}/slots/history", accessRead, s.handleSlotHistory},
+
+		{"POST /api/v1/applications/{id}/deploy", accessWrite, s.handleDeployApplication},
+		{"POST /api/v1/applications/{id}/rollback", accessWrite, s.handleRollbackApplication},
+		{"POST /api/v1/releases", accessWrite, s.handleCreateRelease},
+		{"GET /api/v1/releases/{id}", accessRead, s.handleGetRelease},
+
+		{"GET /api/v1/hosts", accessRead, s.handleListHosts},
+		{"POST /api/v1/hosts", accessWrite, s.handleCreateHost},
+		{"GET /api/v1/hosts/{id}", accessRead, s.handleGetHost},
+		{"GET /api/v1/environments", accessRead, s.handleListEnvironments},
+		{"POST /api/v1/environments", accessWrite, s.handleCreateEnvironment},
+		{"GET /api/v1/environments/{id}", accessRead, s.handleGetEnvironment},
+
+		{"PUT /api/v1/backup-policies/{name}", accessWrite, s.handlePutBackupPolicy},
+		{"GET /api/v1/backup-policies/{name}", accessRead, s.handleGetBackupPolicy},
+		{"GET /api/v1/backup-policies", accessRead, s.handleListBackupPolicies},
+		{"POST /api/v1/backups", accessWrite, s.handleRunBackup},
+		{"GET /api/v1/backups", accessRead, s.handleListBackups},
+		{"GET /api/v1/backups/{id}", accessRead, s.handleGetBackup},
+		{"POST /api/v1/backups/{id}/verify", accessWrite, s.handleVerifyBackup},
+		{"POST /api/v1/backups/{id}/restore", accessWrite, s.handleRestoreBackup},
+		// prune 是**同步**端点（与制品 GC 一致）：它删的是备份内容，但结果必须当场看得见。
+		{"POST /api/v1/backups/prune", accessWrite, s.handlePruneBackups},
+
+		{"POST /api/v1/schedules", accessWrite, s.handleCreateSchedule},
+		{"GET /api/v1/schedules", accessRead, s.handleListSchedules},
+		{"GET /api/v1/schedules/{id}", accessRead, s.handleGetSchedule},
+		{"DELETE /api/v1/schedules/{id}", accessWrite, s.handleDeleteSchedule},
+		{"POST /api/v1/schedules/{id}/enable", accessWrite, s.handleEnableSchedule},
+		{"POST /api/v1/schedules/{id}/disable", accessWrite, s.handleDisableSchedule},
+		{"GET /api/v1/schedules/{id}/runs", accessRead, s.handleScheduleRuns},
+
+		// 未匹配的请求落在这里。它是只读的：它做的事只有一句「没有这条路由」。
+		{"/", accessRead, s.handleNotFound},
+	}
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
-	mux.HandleFunc("POST /api/v1/operations", s.handleCreateOperation)
-	mux.HandleFunc("GET /api/v1/operations/{id}", s.handleGetOperation)
-	mux.HandleFunc("POST /api/v1/operations/{id}/cancel", s.handleCancelOperation)
-	mux.HandleFunc("POST /api/v1/operations/{id}/retry", s.handleRetryOperation)
-	mux.HandleFunc("GET /api/v1/operations/{id}/logs", s.handleOperationLogs)
-
-	mux.HandleFunc("POST /api/v1/artifacts", s.handleUploadArtifact)
-	mux.HandleFunc("GET /api/v1/artifacts", s.handleListArtifacts)
-	mux.HandleFunc("POST /api/v1/artifacts/gc", s.handleCollectArtifacts)
-	mux.HandleFunc("GET /api/v1/artifacts/{id}", s.handleGetArtifact)
-	mux.HandleFunc("GET /api/v1/artifacts/{id}/content", s.handleDownloadArtifact)
-	mux.HandleFunc("POST /api/v1/artifacts/{id}/verify", s.handleVerifyArtifact)
-	mux.HandleFunc("DELETE /api/v1/artifacts/{id}", s.handleDeleteArtifact)
-
-	mux.HandleFunc("POST /api/v1/applications", s.handleCreateApplication)
-	mux.HandleFunc("GET /api/v1/applications", s.handleListApplications)
-	mux.HandleFunc("GET /api/v1/applications/{id}", s.handleGetApplication)
-	mux.HandleFunc("GET /api/v1/applications/{id}/releases", s.handleListApplicationReleases)
-	mux.HandleFunc("PUT /api/v1/applications/{id}/spec", s.handlePutApplicationSpec)
-	mux.HandleFunc("GET /api/v1/applications/{id}/spec", s.handleGetApplicationSpec)
-	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/validate", s.handleValidateRuntime)
-	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/prepare", s.handlePrepareRuntime)
-	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/start", s.handleStartRuntime)
-	mux.HandleFunc("POST /api/v1/applications/{id}/runtime/stop", s.handleStopRuntime)
-	mux.HandleFunc("GET /api/v1/applications/{id}/runtime/health", s.handleRuntimeHealth)
-	// 部署与回滚（迭代 3）：都走 Service.Create，与 runtime.* / backup.* 同一条创建路径，
-	// 因此 operation get/logs/cancel/retry 对它们同样适用。
-	// 槽位的运营视图与切换时间线（迭代 4c）。`history` 是子路径而不是查询参数：
-	// 它返回的是另一种东西（事件流），不是同一个列表的另一种筛选。
-	mux.HandleFunc("GET /api/v1/applications/{id}/slots", s.handleListSlots)
-	mux.HandleFunc("GET /api/v1/applications/{id}/slots/history", s.handleSlotHistory)
-
-	mux.HandleFunc("POST /api/v1/applications/{id}/deploy", s.handleDeployApplication)
-	mux.HandleFunc("POST /api/v1/applications/{id}/rollback", s.handleRollbackApplication)
-	mux.HandleFunc("POST /api/v1/releases", s.handleCreateRelease)
-	mux.HandleFunc("GET /api/v1/releases/{id}", s.handleGetRelease)
-
-	mux.HandleFunc("GET /api/v1/hosts", s.handleListHosts)
-	mux.HandleFunc("POST /api/v1/hosts", s.handleCreateHost)
-	mux.HandleFunc("GET /api/v1/hosts/{id}", s.handleGetHost)
-	mux.HandleFunc("GET /api/v1/environments", s.handleListEnvironments)
-	mux.HandleFunc("POST /api/v1/environments", s.handleCreateEnvironment)
-	mux.HandleFunc("GET /api/v1/environments/{id}", s.handleGetEnvironment)
-
-	mux.HandleFunc("PUT /api/v1/backup-policies/{name}", s.handlePutBackupPolicy)
-	mux.HandleFunc("GET /api/v1/backup-policies/{name}", s.handleGetBackupPolicy)
-	mux.HandleFunc("GET /api/v1/backup-policies", s.handleListBackupPolicies)
-	mux.HandleFunc("POST /api/v1/backups", s.handleRunBackup)
-	mux.HandleFunc("GET /api/v1/backups", s.handleListBackups)
-	mux.HandleFunc("GET /api/v1/backups/{id}", s.handleGetBackup)
-	mux.HandleFunc("POST /api/v1/backups/{id}/verify", s.handleVerifyBackup)
-	mux.HandleFunc("POST /api/v1/backups/{id}/restore", s.handleRestoreBackup)
-	// prune 是**同步**端点（与制品 GC 一致）：它删的是备份内容，但结果必须当场看得见。
-	mux.HandleFunc("POST /api/v1/backups/prune", s.handlePruneBackups)
-
-	mux.HandleFunc("POST /api/v1/schedules", s.handleCreateSchedule)
-	mux.HandleFunc("GET /api/v1/schedules", s.handleListSchedules)
-	mux.HandleFunc("GET /api/v1/schedules/{id}", s.handleGetSchedule)
-	mux.HandleFunc("DELETE /api/v1/schedules/{id}", s.handleDeleteSchedule)
-	mux.HandleFunc("POST /api/v1/schedules/{id}/enable", s.handleEnableSchedule)
-	mux.HandleFunc("POST /api/v1/schedules/{id}/disable", s.handleDisableSchedule)
-	mux.HandleFunc("GET /api/v1/schedules/{id}/runs", s.handleScheduleRuns)
-
-	mux.HandleFunc("/", s.handleNotFound)
+	access := make(map[string]domain.AccessScope)
+	for _, rt := range s.routes() {
+		if !rt.access.Valid() {
+			// 编译不过做不到（档位是个字符串常量），因此把它做成**启动即崩**：
+			// 一个没说清访问档位的路由绝不允许在「默认放行」的状态下跑起来。
+			panic("httpapi: 路由 " + rt.pattern + " 没有声明 accessRead / accessWrite")
+		}
+		mux.HandleFunc(rt.pattern, rt.handler)
+		access[rt.pattern] = rt.access
+	}
 
 	logger := s.logger()
-	return recoverPanic(logger, logRequests(logger, mux))
+	return recoverPanic(logger, logRequests(logger, s.authenticate(mux, access)))
 }
 
 // Serve 在 ln 上运行 HTTP 服务，直到 ctx 被取消，然后在 grace 内优雅关闭。
+//
+// 远程监听（迭代 5a）不需要第二个 Serve：把 TCP 监听器套进 tls.NewListener 再交给
+// 这里即可——http.Server.Serve 会在 *tls.Conn 上做握手并填好 r.TLS，而 r.TLS 正是
+// 认证中间件区分「走的是哪条路」的唯一判据。
 func (s *Server) Serve(ctx context.Context, ln net.Listener, grace time.Duration) error {
 	httpServer := &http.Server{
 		Handler:           s.Handler(),
@@ -191,6 +228,26 @@ func isAddrInUse(err error) bool {
 		return true
 	}
 	return err != nil && strings.Contains(err.Error(), "address already in use")
+}
+
+// ListenTLS 起一个 mTLS 监听器（迭代 5a）。
+//
+// 与 ListenUnix 不同，它不做「顶掉正在运行的守护进程」那套：TCP 端口被占用时
+// 直接失败——占用它的可能是另一个 opsd，也可能是完全不相干的服务，猜错了就是
+// 把一个正在服务的进程踢下线。
+//
+// 返回的是一个 **tls.Listener**：http.Server.Serve 会在每个 *tls.Conn 上完成握手并
+// 填好 r.TLS，而 r.TLS 正是认证中间件区分本机与远程的唯一判据。
+func ListenTLS(addr, certFile, keyFile, clientCAFile string) (net.Listener, error) {
+	tlsConfig, err := pki.ServerTLSConfig(certFile, keyFile, clientCAFile)
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, domain.NewError(v1.CodeConfigInvalid, "无法监听 %s: %v", addr, err)
+	}
+	return tls.NewListener(listener, tlsConfig), nil
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

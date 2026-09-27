@@ -26,8 +26,12 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 部署与回滚、资源限制与 Java 运行时的解释器预检），3c 的真机验证（含**重启后部署版本仍存活**）
 在 legacy 档主机上完成。**迭代 4（Nginx 蓝绿发布、观察窗口与回滚）的 4a/4b/4c 均已实现
 并验证**：容器里有真 Nginx + 真 systemd + 真 curl（第 13–20 节），**legacy 档真机上也跑了一整轮**
-（EPEL 的 nginx 1.20.1 + systemd 219，`make verify-host` **183 项通过 / 0 项失败**，第 21 节）；
-迭代 5 未开始。
+（EPEL 的 nginx 1.20.1 + systemd 219，`make verify-host` **183 项通过 / 0 项失败**，第 21 节）。
+**迭代 5（远程、多主机与生产加固）的 5a 已实现**——远程连接与主机注册：`opsd` 可选的
+mTLS 监听、证书身份、默认拒绝的 CN 白名单（档位 + 应用白名单）、审计绑定认证身份、
+`GET /api/v1/identity`，以及 `opsctl` 的 `--host` / `--remote` / `identity` /
+`host check` / `host list --check`。规格与验证记录见
+`docs/plans/2026-09-27-iteration-5.md`（5b–5e 未开始）。
 **真实 Linux 主机的证据已于 2026-09-24 取得**，而且**两档都拿到了**：
 Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真实重启）与
 **CentOS 7 / systemd 219 / cgroup v1（legacy 档，118 项通过 / 0 项失败）**，见 `test/host/`。
@@ -53,6 +57,9 @@ Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真�
 - `docs/plans/2026-09-25-iteration-4.md`：Nginx 蓝绿发布、观察窗口与回滚
   （4a/4b/4c 已实现并验证：容器见第 13–20 节，**legacy 档真机**见第 21 节；
   **strict 档真机**与**跨机器重启存活**仍未验证）
+- `docs/plans/2026-09-27-iteration-5.md`：远程、多主机与生产加固
+  （**5a 已实现并验证**：§12 实现记录、§13 验证记录；5b 批量发布、5c 安全加固、
+  5d 可观测性与通知、5e 备份灾备**未开始**）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -74,6 +81,9 @@ Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真�
 - `api/v1`：对外协议类型与错误码，各层共享的叶子包。
 - `internal/domain`：领域模型、状态机、错误码载体、脱敏等纯逻辑。
 - `internal/application`：定义端口（`ports.go`）并编排用例，不 import 任何具体适配器。
+- `internal/pki`：证书与私钥文件 → `crypto/tls` 配置，以及在读之前检查私钥文件的模式与属主
+  （迭代 5a）。它被 opsd（服务端）与 opsctl（客户端）**共用**——两边对「什么样的私钥才算
+  合格」的判据只有一份，一边松一边紧是最容易出的事，而松的那边不会报警。
 - `internal/adapters`：SQLite、执行器、HTTP API、客户端、配置、日志等实现；
   运行时适配器在 `runtime/systemd`（真实）与 `runtime/proc`（假适配器，供 macOS/CI 跑同一套合约），
   两个适配器**共用** `runtime/unitfile`（unit 渲染与转义）与 `runtime/readiness`（tcp/http 就绪探测
@@ -82,6 +92,19 @@ Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真�
 装配层的**平台选择只有一处**：`cmd/opsd` 里 `GOOS == linux` 才注入 systemd 适配器，其它平台
 不注入（`runtime.*` 因此返回 `RUNTIME_UNSUPPORTED`）；刻意**不提供** `runtime.adapter` 之类的
 配置开关，避免生产误选 `proc` 假适配器。
+
+**远程监听（迭代 5a）默认是关的**：配置里没有 `remote.listen` 就完全不听 TCP，形态与此前
+逐字节一致。开了之后是 mTLS（最低 TLS 1.2，为了兼容 legacy 档 CentOS 7 的 openssl 1.0.2），
+**握手只验 CA、授权在 HTTP 层**——这样「证书没签对」与「身份没被授权」在客户端看来是两种
+不同的错误，运维分得清该改哪一边。授权是**默认拒绝**的白名单：CN 不在 `remote.clients`
+名单里一律拒绝，档位只有 `read`/`write` 两个取值。
+
+**每条路由必须在注册处声明访问档位**（`internal/adapters/httpapi/server.go` 的 `routes()`）：
+路径、档位与处理器写在同一行，档位漏写就是启动即崩。**不要**把这些信息拆成第二份表——
+一张单独的「写端点清单」会随新端点漂移，而漏登记一个就是**静默放行**（一个不会报错的越权）。
+同理，**「谁做的」只在 `application.Service.Create` 一处决定**（远程用证书 CN、本机用请求体里
+的 `createdBy`），不要在 HTTP 处理器里各自改写——写入口有八九个，漏一个就是一个能被冒充的
+审计条目。
 
 上面那条「不 import 任何具体适配器」的约束**只管非测试代码**：`internal/application`
 自身的 package 依赖里没有任何适配器。**测试是显式例外，现状如此且不打算现在就收**——
@@ -255,6 +278,12 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
   不得写成「已支持 SELinux」或「SELinux 已加固」。AppArmor 未在 RHEL 系上存在，仍未验证。
 - 源码检查不能替代真实 Linux 主机、systemd、Nginx、数据库实例的验证；未验证内容要显式
   标注为「未验证」。
+- **远程（迭代 5a）的证据边界要写清楚**：那些断言跑的是**同一台机上的两个 `opsd` 实例**
+  （一个本机 socket、一个 mTLS 端口），因此**跨物理主机**（真实网络、防火墙、MTU、时钟
+  偏移）**未验证**；`SELinux` 与防火墙对监听端口的影响**未验证**。**证书的签发与轮换
+  不做**（工具只消费证书，运维用 openssl 手工来，`CRL`/`OCSP` 都不做）——不得写成
+  「已支持证书轮换」。授权只到 `read`/`write` 两个档位加应用白名单，
+  **RBAC / 审批 / 操作签名 / 审计导出**是 5c 的事，**未实现**。
 - 若修改 API、状态机、数据表或错误码，先更新对应迭代文档并记录兼容性影响。
 
 ### Linux 容器验证的固定配方

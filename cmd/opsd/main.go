@@ -9,6 +9,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	stdruntime "runtime"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -210,6 +212,13 @@ func run(cmd *cobra.Command, _ []string) error {
 	runtime.Pool.Start(ctx)
 	// 调度器与 worker 池并行运行：前者只决定何时创建 Operation，后者负责执行。
 	go runtime.Scheduler.Run(ctx)
+
+	// 远程身份白名单只在真的开了远程端口时装配。**没有配 remote 段就不装配**，
+	// 从而让「没开远程却收到 mTLS 请求」变成一个明确的装配错误，而不是悄悄放行。
+	var identities httpapi.RemoteIdentityLookup
+	if cfg.RemoteEnabled() {
+		identities = cfg
+	}
 	server := httpapi.NewServer(httpapi.Dependencies{
 		Service:   runtime.Service,
 		Artifacts: runtime.Artifacts,
@@ -224,13 +233,72 @@ func run(cmd *cobra.Command, _ []string) error {
 		Store:     store,
 		Workers:   runtime.Pool.Workers(),
 		Logger:    logger,
+
+		RemoteIdentities: identities,
+		Version:          buildVersion(),
 	})
+
+	// 远程监听（迭代 5a）。**先绑定再启动**：端口被占用是启动期就该报出来的问题，
+	// 而一个「起来了但远程连不上」的守护进程最难排查。
+	if cfg.RemoteEnabled() {
+		remoteListener, err := httpapi.ListenTLS(
+			cfg.Remote.Listen, cfg.Remote.CertFile, cfg.Remote.KeyFile, cfg.Remote.ClientCAFile)
+		if err != nil {
+			return err
+		}
+		defer remoteListener.Close()
+		logger.Info("remote listener ready",
+			"listen", cfg.Remote.Listen,
+			"clients", len(cfg.Remote.Clients),
+			"minTLSVersion", "1.2",
+		)
+		go func() {
+			// 远程监听挂了**不让本机跟着停**：本机 socket 上的运维动作与远程是两件事，
+			// 而远程只是这个守护进程的一个可选能力（与 Nginx 适配器可以缺席同一条）。
+			// 失败在这里是 Error 级日志，而不是静默降级——静默的那一天没人知道
+			// 远程已经连不上了。
+			if err := server.Serve(ctx, remoteListener, cfg.ShutdownGrace()); err != nil {
+				logger.Error("remote listener stopped serving",
+					"listen", cfg.Remote.Listen, "error", err)
+			}
+		}()
+	} else {
+		logger.Info("remote listener is disabled", "reason", "remote.listen is not configured")
+	}
 
 	if err := server.Serve(ctx, listener, cfg.ShutdownGrace()); err != nil {
 		return domain.NewError(v1.CodeInternal, "HTTP 服务启动失败: %v", err)
 	}
 	logger.Info("opsd stopped")
 	return nil
+}
+
+// buildVersion 从构建信息里拼出版本号：模块版本 + VCS 修订。
+//
+// 刻意不加 -ldflags 变量：go build 在 git 仓库里默认会写入 vcs.revision，
+// 因此「这个 opsd 是哪个提交编的」不需要额外的构建约定就能答出来。取不到时返回
+// 空串——空串是诚实的事实（没有信息），不是 "unknown"（那会被读成「查过了、查不到」）。
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var parts []string
+	if info.Main.Version != "" && info.Main.Version != "(devel)" {
+		parts = append(parts, info.Main.Version)
+	}
+	for _, setting := range info.Settings {
+		if setting.Key != "vcs.revision" || setting.Value == "" {
+			continue
+		}
+		revision := setting.Value
+		if len(revision) > 12 {
+			revision = revision[:12]
+		}
+		parts = append(parts, revision)
+		break
+	}
+	return strings.Join(parts, "+")
 }
 
 func openArtifactStore(ctx context.Context, cfg *config.Config, logger *slog.Logger) (application.StorageBackend, application.ArtifactPolicy, error) {

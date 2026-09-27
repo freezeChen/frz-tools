@@ -56,6 +56,9 @@ type daemon struct {
 	backupsDir   string
 	secretsDir   string
 	configPath   string
+	// baseConfig 是不含 remote 段的那份配置；remote 是追加段（迭代 5a）。
+	baseConfig string
+	remote     string
 }
 
 // shortTempDir 返回路径足够短的临时目录，以满足 unix socket 的路径长度限制
@@ -133,10 +136,29 @@ sudo:
   allowedCommands: []
 `, d.socket, d.database, d.workDir, d.logDir, d.artifactsDir, d.backupsDir, d.secretsDir)
 
-	if err := os.WriteFile(d.configPath, []byte(cfg), 0o600); err != nil {
+	d.baseConfig = cfg
+	d.writeConfig(t)
+	return d
+}
+
+// writeConfig 把基础配置与可能存在的 remote 段写下去。允许重复调用：
+// 「先起一个不听远程的守护进程，再补上远程段重启」这类用例需要它。
+func (d *daemon) writeConfig(t *testing.T) {
+	t.Helper()
+	body := d.baseConfig
+	if d.remote != "" {
+		body += "\n" + d.remote
+	}
+	if err := os.WriteFile(d.configPath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	return d
+}
+
+// setRemote 补上 remote 段（必须在 start 之前调用）。
+func (d *daemon) setRemote(t *testing.T, remote string) {
+	t.Helper()
+	d.remote = remote
+	d.writeConfig(t)
 }
 
 func (d *daemon) start(t *testing.T) {
@@ -195,10 +217,77 @@ func (d *daemon) kill(t *testing.T) {
 	d.cmd = nil
 }
 
+// runOpsdExpectingFailure 起一个**注定起不来**的 opsd，等它退出并取回它的输出。
+//
+// 「拒绝启动」这件事必须真的去起一次才知道：配置校验通过、而启动路径上还有一道
+// 自己的检查（私钥文件模式）时，只测配置解析会漏掉后者。
+func runOpsdExpectingFailure(t *testing.T, d *daemon) string {
+	t.Helper()
+	cmd := exec.Command(opsdBinary, "--config", d.configPath)
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start opsd: %v", err)
+	}
+	// 必须用 cmd.Wait 而不是 cmd.Process.Wait：前者会等输出拷贝的 goroutine 结束，
+	// 后者不会——那样在 -race 下就是一次「测试在读 strings.Builder、exec 在写它」。
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("opsd 应当因为配置非法而失败退出，但它正常退出了：\n%s", output.String())
+		}
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatalf("opsd 应当因为配置非法立刻退出，但它还在跑：\n%s", output.String())
+	}
+	return output.String()
+}
+
 func runOpsctl(t *testing.T, socket string, args ...string) (string, int, error) {
 	t.Helper()
 	full := append([]string{"--socket", socket}, args...)
 	cmd := exec.Command(opsctlBinary, full...)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	code := 0
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		code = exitErr.ExitCode()
+		err = fmt.Errorf("opsctl %v failed with exit code %d: %s", args, code, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(stdout.String()), code, err
+}
+
+// runOpsctlRemote 走 `--remote` 那条路：不给 socket，给地址与身份三件套。
+//
+// 与 runOpsctl 分开而不是塞进同一个，是为了让用例一眼看出这次请求走的是哪条路
+// ——「我明明给了 --remote，怎么打到了本机」正是这一片要防的错。
+func runOpsctlRemote(t *testing.T, remoteAddr string, pki *testPKI, args ...string) (string, int, error) {
+	t.Helper()
+	full := append([]string{
+		"--remote", remoteAddr,
+		"--client-cert", pki.clientCert,
+		"--client-key", pki.clientKey,
+		"--ca-cert", pki.ca.certPath,
+	}, args...)
+	return runOpsctlBinary(t, full...)
+}
+
+// runOpsctlRemoteWith 允许覆盖身份三件套，用于「证书不对」那几类用例。
+func runOpsctlRemoteWith(t *testing.T, args ...string) (string, int, error) {
+	t.Helper()
+	return runOpsctlBinary(t, args...)
+}
+
+func runOpsctlBinary(t *testing.T, args ...string) (string, int, error) {
+	t.Helper()
+	cmd := exec.Command(opsctlBinary, args...)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -46,3 +46,24 @@ secrets:
 # 这是迭代 0 的遗留项，在真实 Linux 主机上验证 sudoers 之前不得当作已生效的安全控制。
 sudo:
   allowedCommands: []
+
+# 远程监听（迭代 5a）：不配这一段就**完全不听 TCP**，形态与之前逐字节一致。
+# 配上之后 opsd 会在这个地址上跑 mTLS：双向证书，且只有 clients 名单里的 CN 能进来。
+#
+# 证书由运维自己签发（本工具只消费、不签发、不轮换，见迭代 5 文档 D10）。
+# 签发时 SAN 必须包含客户端用来连它的那个名字（地址或域名），否则客户端会（正确地）
+# 拒绝——那是防中间人的那一半。
+#
+# remote:
+#   listen: "0.0.0.0:9443"
+#   certFile: /etc/opsd/pki/server.crt
+#   keyFile: /etc/opsd/pki/server.key      # 模式必须不宽于 0600，属主必须是 opsd 的运行用户
+#   clientCAFile: /etc/opsd/pki/ca.crt     # 签发客户端证书的 CA
+#   clients:
+#     # 不在名单里的 CN 一律拒绝（白名单，不是黑名单）。
+#     - cn: opsctl-central
+#       scope: write                       # read 只能打只读端点；write 是全部
+#       applications:                      # 省略表示这台机器上的全部应用
+#         - orders-api
+#     - cn: opsctl-readonly
+#       scope: read

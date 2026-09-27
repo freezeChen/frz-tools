@@ -80,6 +80,12 @@ type Operation struct {
 	StartedAt      *time.Time
 	FinishedAt     *time.Time
 	CreatedBy      string
+	// ClaimedBy 是调用方**自报**的身份，只在它与认证身份不同时有值（迭代 5a）。
+	//
+	// 它刻意**不落库**：operations 表的 created_by 一律是可信的那一份，自报值只作为
+	// 一条线索写进 operation.created 那条审计的 details。让同一件事在库里存两份、
+	// 其中一份不可信，是后面每一次查询都要小心避开的坑。
+	ClaimedBy string
 
 	// Attempt 是这条重试链上的第几次尝试，从 1 开始。未声明重试的操作恒为 1。
 	Attempt int

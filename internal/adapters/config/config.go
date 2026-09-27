@@ -57,6 +57,8 @@ type Config struct {
 	// Nginx 只在**声明了 exec.slots 的蓝绿应用**上用得到；没配就按下面这些默认值走
 	// （/etc/nginx、二进制走 PATH），因此绝大多数部署不需要写这一段。
 	Nginx NginxConfig `yaml:"nginx"`
+	// Remote 是远程监听（迭代 5a）。不配 = 完全不听 TCP，形态与之前逐字节一致。
+	Remote RemoteConfig `yaml:"remote"`
 }
 
 // NginxConfig 是蓝绿发布用到的 Nginx 参数（迭代 4）。
@@ -303,6 +305,7 @@ func (c *Config) Validate() error {
 	}
 
 	problems = append(problems, c.validateArtifactStore()...)
+	problems = append(problems, c.validateRemote()...)
 	for i, dir := range c.Secrets.AllowedFileDirectories {
 		err := requireAbsolute(fmt.Sprintf("secrets.allowedFileDirectories[%d]", i), dir)
 		if err != nil {
@@ -311,7 +314,11 @@ func (c *Config) Validate() error {
 	}
 
 	if len(problems) > 0 {
-		err := domain.NewError(v1.CodeConfigInvalid, "config is invalid")
+		// 逐条列进 message，而不是只塞进 Details：Details 目前没有任何一处会被打印，
+		// 于是「配置不合法」会变成一句查不出所以然的报错——启动失败的消息正是运维
+		// 唯一能看到的线索。Details 仍然保留，供 API 调用方结构化读取。
+		err := domain.NewError(v1.CodeConfigInvalid, "config is invalid: %s",
+			strings.Join(problems, "; "))
 		err.Details = map[string]any{"problems": problems}
 		return err
 	}

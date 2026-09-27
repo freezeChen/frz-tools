@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"strings"
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/adapters/client"
 	"github.com/freezeChen/frz-tools/internal/cliutil"
 	"github.com/freezeChen/frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/pki"
 
 	"github.com/spf13/cobra"
 )
@@ -18,6 +22,17 @@ type rootOptions struct {
 	socket  string
 	timeout time.Duration
 	json    bool
+
+	// 远程目标（迭代 5a）。--host 与 --remote 都与 --socket 互斥。
+	host       string
+	remote     string
+	clientCert string
+	clientKey  string
+	caCert     string
+
+	// ready 是 PersistentPreRunE 里定好的客户端。为 nil 时退回本机 socket——
+	// 那条路不需要任何解析，因此即使预处理没跑（例如直接调内部函数）也仍然可用。
+	ready *client.Client
 }
 
 func main() {
@@ -36,14 +51,29 @@ func newRootCommand() *cobra.Command {
 		Short:         "opsctl 用于向 opsd 提交操作并查询状态与日志",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// 目标解析放在这里而不是每个命令里：`--host` 需要先查本机库才知道地址，
+		// 而那是一次可能失败的 IO。放在预处理里，所有命令都自动获得「选目标」的能力，
+		// 也不会有人漏判互斥。
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			return opts.prepare(cmd.Context(), cmd)
+		},
 	}
 
 	root.PersistentFlags().StringVar(&opts.socket, "socket", defaultSocket(), "opsd 的 unix socket 路径（也可用环境变量 OPSD_SOCKET）")
 	root.PersistentFlags().DurationVar(&opts.timeout, "timeout", 30*time.Second, "HTTP 客户端超时时间")
 	root.PersistentFlags().BoolVar(&opts.json, "json", false, "输出原始 JSON 而不是人类可读文本")
 
+	// 远程目标的三个选择与身份三件套。地址与证书刻意分成两组：--host 是从本机库
+	// 里查地址，--remote 直接给地址（排障时本机 opsd 可能正好没起来）。
+	root.PersistentFlags().StringVar(&opts.host, "host", "", "打到本机库里登记的那台主机上（地址从记录里读）")
+	root.PersistentFlags().StringVar(&opts.remote, "remote", "", "直接打到这个 host:port 上的 opsd（不查库，排障用）")
+	root.PersistentFlags().StringVar(&opts.clientCert, "client-cert", envOr("OPSD_CLIENT_CERT", ""), "mTLS 客户端证书路径；连接远程目标（--remote、host check、host list --check）时使用（也可用环境变量 OPSD_CLIENT_CERT）")
+	root.PersistentFlags().StringVar(&opts.clientKey, "client-key", envOr("OPSD_CLIENT_KEY", ""), "mTLS 客户端私钥路径，模式必须不宽于 0600（也可用环境变量 OPSD_CLIENT_KEY）")
+	root.PersistentFlags().StringVar(&opts.caCert, "ca-cert", envOr("OPSD_CA_CERT", ""), "校验对端证书用的 CA 路径；连接远程目标时使用（也可用环境变量 OPSD_CA_CERT）")
+
 	root.AddCommand(
 		newHealthCommand(opts),
+		newIdentityCommand(opts),
 		newOperationCommand(opts),
 		newArtifactCommand(opts),
 		newAppCommand(opts),
@@ -166,7 +196,93 @@ func defaultSocket() string {
 	return "/run/opsd/opsd.sock"
 }
 
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// prepare 决定这一次请求打到谁那里，并把客户端定下来。
+//
+// 互斥是硬要求而不是礼貌：`--socket` 与 `--remote` 同时给，只有一种顺序会让调用方
+// 得到它以为的结果，而另一种会静默地打到本机——「我以为我在操作生产、其实动的是本机」
+// 是这类工具最不该犯的错。因此宁可直接拒绝。
+func (o *rootOptions) prepare(ctx context.Context, cmd *cobra.Command) error {
+	chosen := make([]string, 0, 3)
+	if cmd.Flags().Changed("host") {
+		chosen = append(chosen, "--host")
+	}
+	if cmd.Flags().Changed("remote") {
+		chosen = append(chosen, "--remote")
+	}
+	if cmd.Flags().Changed("socket") {
+		chosen = append(chosen, "--socket")
+	}
+	if len(chosen) > 1 {
+		return domain.NewError(v1.CodeInvalidRequest,
+			"%s 互斥，只能给一个（不给就是本机 socket）", strings.Join(chosen, " 与 "))
+	}
+
+	switch {
+	case o.remote != "":
+		ready, err := o.remoteClient(o.remote)
+		if err != nil {
+			return err
+		}
+		o.ready = ready
+	case o.host != "":
+		ready, err := o.hostClient(ctx)
+		if err != nil {
+			return err
+		}
+		o.ready = ready
+	default:
+		o.ready = client.New(o.socket, o.timeout)
+	}
+	return nil
+}
+
+// hostClient 从**本机库**里查出那台主机的地址，再连过去。
+func (o *rootOptions) hostClient(ctx context.Context) (*client.Client, error) {
+	host, err := client.New(o.socket, o.timeout).GetHost(ctx, o.host)
+	if err != nil {
+		// 最可能的原因是本机 opsd 没在跑。把替代方案直接写进报错里：排障时
+		// 正是最需要连上另一台机的时候，而这时本机往往正好是坏的。
+		if domain.CodeOf(err) == v1.CodeInternal {
+			return nil, domain.NewError(v1.CodeInternal,
+				"--host %s 需要先问本机 opsd 要地址，但本机连不上（%v）；"+
+					"排障时可以直接用 --remote <host:port>", o.host, err)
+		}
+		return nil, err
+	}
+	if host.Address == "" {
+		return nil, domain.NewError(v1.CodeInvalidRequest,
+			"主机 %q 的 address 为空，它是**本机**记录：不要加 --host，直接执行即可", host.Name)
+	}
+	return o.remoteClient(host.Address)
+}
+
+// remoteClient 按地址与证书建一个远程客户端。
+func (o *rootOptions) remoteClient(address string) (*client.Client, error) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, domain.NewError(v1.CodeInvalidRequest,
+			"远程地址 %q 必须写成 host:port（例如 10.0.0.5:9443）", address)
+	}
+	// ServerName 取地址里的主机名：证书校验的对象是「我用来连它的那个名字」，
+	// 因此给目标机签证书时 SAN 必须包含它。
+	tlsConfig, err := pki.ClientTLSConfig(o.clientCert, o.clientKey, o.caCert, host)
+	if err != nil {
+		return nil, err
+	}
+	return client.NewRemote(address, tlsConfig, o.timeout), nil
+}
+
 func (o *rootOptions) client() *client.Client {
+	if o.ready != nil {
+		return o.ready
+	}
 	return client.New(o.socket, o.timeout)
 }
 

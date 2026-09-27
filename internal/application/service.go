@@ -81,6 +81,28 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		return nil, false, domain.NewError(v1.CodeInvalidRequest, "resource is required")
 	}
 
+	// D5：远程禁止 executor.command。
+	//
+	// executor.command 是「在目标机上跑一条（allowedPaths 白名单内的）程序」的通用入口。
+	// 它在本机 socket 形态下是合理的（等价于本地 shell），但暴露到网络上等于把
+	// 「有限制的任意命令执行」交给名单里的人。这是**刻意的能力缺口，不是遗漏**：
+	// 要跑命令就在目标机上跑 opsctl，或者用 deploy / runtime.* 这些有明确语义的操作。
+	//
+	// 判断放在创建路径的开头而不是某个 HTTP 处理器里：Service.Create 是创建操作的
+	// **唯一**入口，因此没有第二条能绕过去的旁路。
+	if principal, ok := domain.PrincipalFrom(ctx); ok && principal.IsRemote() && req.Kind == v1.KindExecutorCommand {
+		return nil, false, domain.RemoteForbidden(
+			"远程身份 %q 不能提交 executor.command：通用的命令执行入口不对外开放，"+
+				"请改用 deploy / runtime.* 这类有明确语义的操作", principal.Name)
+	}
+
+	// 应用白名单也在**解析之前**判：先回答「这件事归不归你做」，再回答「这件事现在
+	// 做不做得了」。反过来的话，一个越权请求会先拿到「本机没装 runtime 适配器」之类
+	// 的执行期答案，而那个答案既误导又暴露了本机的能力配置。
+	if err := s.authorizeResource(ctx, req.Resource); err != nil {
+		return nil, false, err
+	}
+
 	// D7：dryRun 没有真实副作用，也就没有「值得重试的失败」，把两者一起提交是规格误用。
 	if req.Retry != nil && req.DryRun {
 		return nil, false, domain.NewError(v1.CodeInvalidRequest,
@@ -209,6 +231,11 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		return nil, false, err
 	}
 
+	// 「谁做的」只在这一处决定。远程请求的 createdBy 是**不可信输入**（任何能连上的人
+	// 都能自称任何人），因此远程一律用证书 CN；本机能连上 socket 就等于本地运维，
+	// 沿用请求体里的值，与迭代 4 的行为逐字节一致。自报值与认证值不同时留下线索。
+	actor, claimedBy := domain.ClaimedActor(ctx, req.CreatedBy)
+
 	op := &domain.Operation{
 		ID:              s.newID(),
 		Kind:            req.Kind,
@@ -219,7 +246,8 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		RequestHash:     hash,
 		Spec:            specJSON,
 		CreatedAt:       s.now(),
-		CreatedBy:       req.CreatedBy,
+		CreatedBy:       actor,
+		ClaimedBy:       claimedBy,
 		Attempt:         1,
 		RetryPolicy:     retryPolicy,
 		RetryPolicyJSON: retryJSON,
@@ -233,6 +261,36 @@ func (s *Service) Create(ctx context.Context, req v1.CreateOperationRequest) (*d
 		s.notify()
 	}
 	return result.Operation, result.Created, nil
+}
+
+// authorizeResource 判定带应用白名单的身份能不能对这次操作指向的资源动手。
+//
+// 它存在的原因是 HTTP 层判不了这一半：`POST /api/v1/operations` 的应用来自请求体里的
+// resource，中间件看见的只是一个字符串。而 Service.Create 是创建操作的唯一入口
+// （runtime.* / deploy / rollback / backup.* 全部走它），因此在这里判一次就覆盖了
+// 全部写路径——包括「绕开 /applications/{id}/... 直接打 /operations」那条路。
+//
+// 资源不是应用时放行——白名单说的是「能碰哪些**应用**」，而不是「只能碰应用」。
+// 远程本来就被 D5 挡在 executor.command 之外，因此这里没有留下「用别的 kind 绕开
+// 白名单」的口子：备份类的资源是策略名与备份 ID，与「哪台机上的哪个应用」无关，
+// 它们由档位（read/write）管——这是 5a 授权粒度刻意的边界，更细的留给 5c 的 RBAC。
+func (s *Service) authorizeResource(ctx context.Context, resource string) error {
+	principal, ok := domain.PrincipalFrom(ctx)
+	if !ok || len(principal.Applications) == 0 {
+		return nil
+	}
+	application, err := s.repo.GetApplication(ctx, resource)
+	if err != nil {
+		if domain.CodeOf(err) == v1.CodeApplicationNotFound {
+			return nil
+		}
+		return err
+	}
+	if !principal.AllowsApplication(application.Name) {
+		return domain.RemoteForbidden(
+			"远程身份 %q 的白名单里没有应用 %q", principal.Name, application.Name)
+	}
+	return nil
 }
 
 // isRuntimeKind 判定 kind 是否由运行时适配器执行（而不是本机执行器）。

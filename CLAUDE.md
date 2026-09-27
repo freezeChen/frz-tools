@@ -62,6 +62,8 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 - `internal/domain`：领域模型、状态机、错误码载体、脱敏，纯逻辑无 IO。
 - `internal/application`：在 `ports.go` 定义端口并编排用例。**非测试代码不 import 任何具体适配器**。
 - `internal/adapters`：sqlite、executor、httpapi、client、config、blob、secret、manifest、runtime。
+- `internal/pki`：证书/私钥文件 → `crypto/tls` 配置，外加私钥文件的模式与属主检查。**opsd 与
+  opsctl 共用**，两边对「什么样的私钥才算合格」的判据只有一份。
 
 `RuntimeAdapter`（`internal/application/ports.go`）把应用规格映射到具体运行时，有两个实现：
 `runtime/systemd`（真实）与 `runtime/proc`（假适配器，让 macOS/CI 能跑同一套合约）。两者
@@ -104,6 +106,14 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 - `runtime.start`/`stop` 与 `POST /api/v1/operations` 走同一条 `Service.Create`：锁、幂等键、
   请求摘要、审计、日志、取消全部复用，因此 `operation get/logs/cancel/retry` 对它们同样适用。
   `runtime.*` 读的是应用的**当前**规格，不是创建时的快照。
+- **远程（迭代 5a）默认是关的**：没有 `remote.listen` 就完全不听 TCP。开了之后是 mTLS
+  （最低 TLS 1.2，为兼容 legacy 档 CentOS 7 的 openssl 1.0.2），**握手只验 CA、授权在
+  HTTP 层**（默认拒绝的 CN 白名单 + `read`/`write` + 可选应用白名单）——这样
+  「证书没签对」与「身份没被授权」是两种不同的错误。**`executor.command` 对远程全禁**。
+- **每条路由在注册处声明访问档位**（`httpapi/server.go` 的 `routes()`，唯一来源；漏写启动
+  即崩），**「谁做的」只在 `application.Service.Create` 一处决定**（远程用证书 CN，
+  本机用 `createdBy`）。这两条都是为了让「新增端点 / 新增写入口」不可能静默越权——
+  5a 实现时正是两处「授权代码失效却不报错」被自己的断言抓出来的（见迭代 5 文档 12.3）。
 - **`releases` 子树内部归 `ReleaseAdapter`**（`domain.InReleaseTree`）：根由物化建、release 目录
   由解包建、`current` 由切换建。运行时适配器的 `Prepare` **不得**把 `current`（或任何子树内的
   路径）建成实体目录——那样符号链接切换会因为改名目标是目录而失败，而报出来的是「改名失败」。
@@ -134,6 +144,8 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   是各迭代规格与验证记录，
   `2026-09-25-iteration-4.md` 是 Nginx 蓝绿的规格与验证记录（4a/4b/4c 均已实现并在
   **Linux 容器**里验证，见第 13–20 节；**legacy 档真机**上一整轮也跑通了，见第 21 节），
+  `2026-09-27-iteration-5.md` 是远程/多主机的规格与验证记录
+  （**5a 已实现并验证，5b–5e 未开始**），
   `2026-09-24-future-iterations.md` 是**未来迭代目标的停放区**（GFS 保留策略 +
   迭代 0–2 沉淀下来的待定项；**不是规格**，开工前要先升级成迭代文档）。验收标准
   必须给出「命令 / 结果 / 证据类型」。**1d（重试与并发策略）已于 2026-09-24 实现并提交**；
@@ -142,9 +154,17 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   **GFS 已移出**并停放在停放区第 2 节（未实现）。
   **迭代 3 的 3a / 3b / 3c 都已实现并验证**（制品解包成 release 目录、部署与回滚、资源限制与
   Java 运行时的解释器预检），含「部署出来的 release 跨重启存活」的真机证据。
+  **迭代 5 的 5a（远程连接与主机注册）已实现并验证**：`opsd` 可选的 mTLS 监听、证书身份、
+  默认拒绝的 CN 白名单（档位 + 应用白名单）、审计绑定认证身份、`GET /api/v1/identity`，
+  以及 `opsctl` 的 `--host` / `--remote` / `identity` / `host check` / `host list --check`。
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
-  「`%d` 项通过，`%d` 项失败」（迭代 4c 落地后为 **232 项**）；不要引用静态推导值或历史快照当结论。
-- **不得把未验证项写成已验证**。当前明确未验证：`legacy` 档的 **232～239 那一段**
+  「`%d` 项通过，`%d` 项失败」（迭代 4c 落地后为 **232 项**，5a 的回归复跑同为 **232/0**）；
+  不要引用静态推导值或历史快照当结论。
+- **不得把未验证项写成已验证**。迭代 5a 新增的未验证项：**跨物理主机**（全部远程断言都在
+  同一台机的两个 opsd 实例之间，真机上也**没加**远程段）、**证书的签发与轮换**（不做，
+  运维用 openssl 手工来，CRL/OCSP 都没有）、**SELinux/防火墙对监听端口的影响**、
+  **RBAC/审批/操作签名/审计导出**（5c）、**批量发布**（5b）。
+  原有明确未验证：`legacy` 档的 **232～239 那一段**
   （219 已在真实主机上验证，见 `2026-09-21-iteration-1c.md` 第 19 节）、
   sudoers/PAM 实际策略、
   `SudoConfig`（只有模型、零行为）、GFS 保留、store-wide 的备份孤儿回收、
