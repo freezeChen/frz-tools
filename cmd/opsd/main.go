@@ -169,6 +169,23 @@ func run(cmd *cobra.Command, _ []string) error {
 		Logger:         logger,
 	})
 
+	// 启动时的槽位对账（迭代 4c）：把库里那份 serving_slot 纠正到线上事实（Nginx 的
+	// 受管配置），并按 systemd 的实际状态重算槽位状态。
+	//
+	// 放在这里、worker 池启动之前是刻意的：此刻不可能有部署在跑（部署只在池里执行），
+	// 因此对账读到的是一个稳定的状态，不会与某次发布抢。
+	//
+	// **对账失败不影响 opsd 启动**：它是纠正动作，不是前置条件。一个应用的受管配置坏了，
+	// 不该让整个守护进程起不来。
+	reconciled, err := runtime.Slots.Reconcile(ctx)
+	if err != nil {
+		logger.Warn("启动时的槽位对账失败（不影响启动）", "error", err)
+	} else if reconciled.Checked > 0 || len(reconciled.Errors) > 0 {
+		logger.Info("槽位对账完成", "checked", reconciled.Checked,
+			"changes", len(reconciled.Changes), "skipped", len(reconciled.Skipped),
+			"errors", len(reconciled.Errors), "detail", reconciled.Summary())
+	}
+
 	// 本机 Host 记录是「应用挂在哪台主机上」的锚点。每次启动都确保它存在；
 	// 已存在时原样返回，不覆盖运维调整过的名字与标签。
 	localHost, err := runtime.Hosts.EnsureLocalHost(ctx)
@@ -203,6 +220,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		Schedules: runtime.Schedules,
 		Backups:   runtime.Backups,
 		Deploys:   runtime.Deploys,
+		Slots:     runtime.Slots,
 		Store:     store,
 		Workers:   runtime.Pool.Workers(),
 		Logger:    logger,

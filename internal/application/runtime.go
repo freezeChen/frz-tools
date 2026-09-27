@@ -65,6 +65,7 @@ type Runtime struct {
 	Scheduler *Scheduler
 	Backups   *BackupService
 	Deploys   *DeployService
+	Slots     *SlotService
 	Pool      *Pool
 }
 
@@ -120,6 +121,11 @@ func NewRuntime(opts Options) *Runtime {
 	scheduler := newScheduler(opts.Repo, idGen, opts.Logger, opts.Now, pool.Notify)
 	schedules := newScheduleService(opts.Repo, opts.Defaults, idGen, opts.Now, scheduler.Wake)
 
+	// 槽位的读用例与对账（迭代 4c）。它与 deployments 共用同一份适配器实例——
+	// 对账读的必须是「部署那一刻写下去的那个受管文件」，建两份适配器会让
+	// 「库与线上不一致」这件事在两边各有一套判断。
+	slots := newSlotService(opts.Repo, opts.RuntimeAdapter, opts.NginxAdapter, opts.Now, opts.Logger)
+
 	return &Runtime{
 		Service:   service,
 		Artifacts: artifacts,
@@ -130,6 +136,7 @@ func NewRuntime(opts Options) *Runtime {
 		Schedules: schedules,
 		Backups:   backups,
 		Deploys:   deploys,
+		Slots:     slots,
 		Scheduler: scheduler,
 		Pool:      pool,
 	}

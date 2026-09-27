@@ -70,6 +70,13 @@ type DeployTarget struct {
 	// 重复提交一次部署不该有任何副作用，而"重新物化一遍"既做不到（目录已存在会被拒）
 	// 也没有意义。
 	AlreadyActive bool
+	// Slot 是**这一次发布会落到哪一侧**（蓝绿应用才有值；单槽应用是空串）。
+	// 它与 Release.Slot 不是一回事：那个是「这一版当初上到了哪一侧」（历史），
+	// 这个是「这一次会上到哪一侧」（按提交时刻的线上状态推算）。
+	Slot domain.Slot
+	// Switching 表示这次发布**包含一次切流**。第一次部署没有流量可切，因此是 false
+	// ——这是调用方区分「首次上线」与「换版本」的最小信息。
+	Switching bool
 }
 
 // PrepareDeploy 在创建 Operation **之前**完成所有能提前做的事（规格 D6 第 1 步）。
@@ -146,13 +153,42 @@ func (s *DeployService) PrepareDeploy(
 		return nil, err
 	}
 
-	return &DeployTarget{Release: release, AlreadyActive: release.Status == domain.ReleaseActive}, nil
+	target := &DeployTarget{Release: release, AlreadyActive: release.Status == domain.ReleaseActive}
+	// 蓝绿应用：在创建期就把「这一次会上到哪一侧」算出来（迭代 4c 规格 §18.3）。
+	//
+	// 创建期算得准的理由是**锁**：同一资源上最多一个未完成 Operation，因此从提交到执行
+	// 之间没有别的部署能改掉 serving_slot。执行阶段仍然自己重算——启动对账可能在这中间
+	// 改过它，而那时该听的是线上事实。
+	if target.Slot, target.Switching, err = s.targetSlotFor(ctx, app.ID, spec); err != nil {
+		return nil, err
+	}
+	return target, nil
+}
+
+// targetSlotFor 算出这一次动作会落到哪一侧、以及它是否包含一次切流。
+//
+// 部署与回滚都用它，而且它**与执行阶段用的是同一个 nextSlot**——响应里说的和实际做的
+// 必须是同一件事，两处各写一遍就把「响应说 green、实际切到 blue」变成了可能。
+func (s *DeployService) targetSlotFor(ctx context.Context, applicationID string, spec *domain.ApplicationSpec) (domain.Slot, bool, error) {
+	if spec == nil || !spec.BlueGreen() {
+		// 单槽应用没有槽位这回事：两个字段都留空，而不是给一个"blue"去暗示它有。
+		return "", false, nil
+	}
+	serving, err := s.repo.ServingSlot(ctx, applicationID)
+	if err != nil {
+		return "", false, err
+	}
+	return nextSlot(serving), serving.Valid(), nil
 }
 
 // RollbackTarget 是一次回滚请求在创建期解析出来的结果。
 type RollbackTarget struct {
 	Release *domain.Release
 	From    *domain.Release
+	// Slot / Switching 的含义与 DeployTarget 上的同名字段一致：回滚也会切流，
+	// 因此调用方同样需要知道「会切到哪一侧」。
+	Slot      domain.Slot
+	Switching bool
 }
 
 // PrepareRollback 选出回滚的目标版本。
@@ -200,7 +236,17 @@ func (s *DeployService) PrepareRollback(ctx context.Context, appRef, toVersion s
 	if current != nil && current.ID == target.ID {
 		return nil, domain.NewError(v1.CodeReleaseConflict, "版本 %s 已经是当前版本", target.Version)
 	}
-	return &RollbackTarget{Release: target, From: current}, nil
+	// 目标版本用的是**它自己的规格**（与执行阶段一致）：回滚会连配置一起回滚，
+	// 而「这份应用是不是蓝绿」也以那一版的 manifest 为准。
+	spec, err := s.repo.GetApplicationSpecForRelease(ctx, app.ID, target.ID)
+	if err != nil {
+		return nil, err
+	}
+	slot, switching, err := s.targetSlotFor(ctx, app.ID, spec)
+	if err != nil {
+		return nil, err
+	}
+	return &RollbackTarget{Release: target, From: current, Slot: slot, Switching: switching}, nil
 }
 
 // ResolveDeployOperation 是 Service 与 DeployService 之间的接缝，与 runtime / backup 两个
@@ -243,21 +289,25 @@ func (s *DeployService) ResolveDeployOperation(ctx context.Context, kind, appRef
 // ---------------------------------------------------------------------------
 
 // ExecuteDeploy 执行一次部署（规格 D6 的 6 步）。
-func (s *DeployService) ExecuteDeploy(ctx context.Context, releaseID string, logf DeployLogf) error {
-	return s.apply(ctx, releaseID, false, logf)
+//
+// operationID 会随槽位时间线的每一条事件存下来（迭代 4c）：`app slot history` 要能回答
+// 「这次切流是哪次发布做的」。它**不由服务自己生成**——操作身份是任务引擎的事实，
+// 服务只是把它记下来。
+func (s *DeployService) ExecuteDeploy(ctx context.Context, releaseID, operationID string, logf DeployLogf) error {
+	return s.apply(ctx, releaseID, false, operationID, logf)
 }
 
 // ExecuteRollback 执行一次回滚。它与部署走**同一条**应用路径：回滚就是「把某个既有版本
 // 再应用一次」，差别只在目标的选择与它落在哪个状态上。
-func (s *DeployService) ExecuteRollback(ctx context.Context, releaseID string, logf DeployLogf) error {
-	return s.apply(ctx, releaseID, true, logf)
+func (s *DeployService) ExecuteRollback(ctx context.Context, releaseID, operationID string, logf DeployLogf) error {
+	return s.apply(ctx, releaseID, true, operationID, logf)
 }
 
 // apply 是部署与回滚的共同实现。
 //
 // 顺序（规格 D6）：物化 → 准备（目录、用户、unit、凭据）→ 切换 → 启动与就绪 → 记状态。
 // 任何一步失败都走同一条收尾：能切回原处就切回，删掉本次新建的目录，把 release 记成 failed。
-func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bool, logf DeployLogf) error {
+func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bool, operationID string, logf DeployLogf) error {
 	release, err := s.repo.GetRelease(ctx, releaseID)
 	if err != nil {
 		return err
@@ -291,7 +341,7 @@ func (s *DeployService) apply(ctx context.Context, releaseID string, rollback bo
 	// 蓝绿应用走另一条路（起新槽位 → 切流 → 观察 → 排空停旧槽位），见 deploy_slot.go。
 	// 两条路共用「读这一版自己的规格」「上一个版本是谁」这些准备，以及失败语义的三态。
 	if spec.BlueGreen() {
-		return s.applySlot(ctx, release, spec, rollback, logf)
+		return s.applySlot(ctx, release, spec, rollback, operationID, logf)
 	}
 
 	action := "部署"

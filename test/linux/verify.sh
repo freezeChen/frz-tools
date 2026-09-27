@@ -138,6 +138,17 @@ RUNTIME_SOCK=/run/opsd-root/opsd.sock
 runtimectl() { in_container /opt/frz-ops/opsctl --socket "${RUNTIME_SOCK}" "$@"; }
 rq() { runtimectl "$@" 2>/dev/null || true; }
 
+# start_root_opsd 以 root 启动第二个 opsd（runtime 组专用）。
+#
+# **启动方式只能有一处**：重启它（迭代 4c 的对账那一段要用）必须与新起时逐字一致——
+# 环境变量、配置路径、二进制路径。漏掉 `-e PROBE_ENV` 的表现是「对账那段全绿，而最后
+# check_runtime 报『environment secret PROBE_ENV is not set』」：一个离现场很远的报错
+# （2026-09-27 真的踩到，第一版重启就是这样漏掉的）。
+start_root_opsd() {
+  docker exec -d -e "PROBE_ENV=$(cat "$WORK_DIR/probe-env-value")" \
+    "$CID" /opt/frz-ops/opsd --config /etc/opsd/root.yaml
+}
+
 # 就绪要求连续通过 consecutiveSuccesses 次，因此启动后的第一次查询可能仍未就绪（1/2）。
 wait_for_ready() { # app
   local app=$1
@@ -1687,8 +1698,10 @@ MANIFEST
     "$(q sh -c "ss -lnt | grep -q ':${vport} ' && echo yes || echo no")"
 
   # B) 运维的那一步：在主配置里 include 受管目录（一行 conf.d 文件即可）。
+  # 用 in_container 而不是 q：**q 永远返回 0**（它把失败吞掉、交给断言去报），
+  # 而 require_ok 判的正是退出码——包一层 q，这条断言就变成了永远通过的空壳。
   require_ok "把受管目录加进主配置（运维的动作）" \
-    q sh -c "printf 'include /etc/nginx/frz-managed/*.conf;\n' > /etc/nginx/conf.d/frz-managed.conf && nginx -t"
+    in_container sh -c "printf 'include /etc/nginx/frz-managed/*.conf;\n' > /etc/nginx/conf.d/frz-managed.conf && nginx -t"
 
   # C) 第一次部署：1.0.0 落到 blue，对外端口能拿到 version=1.0.0。
   bg_deploy "第一次部署 1.0.0（落 blue）" 1.0.0 || return 0
@@ -1718,7 +1731,7 @@ done
 LOOP
   docker cp "$WORK_DIR/curl-loop.sh" "$CID:/opt/frz-ops/curl-loop.sh"
   require_ok "启动切流期间的请求循环" \
-    q sh -c 'rm -f /tmp/frz-bg-requests /tmp/frz-bg-stop; chmod 0755 /opt/frz-ops/curl-loop.sh; setsid nohup /opt/frz-ops/curl-loop.sh >/dev/null 2>&1 </dev/null & echo started'
+    in_container sh -c 'rm -f /tmp/frz-bg-requests /tmp/frz-bg-stop; chmod 0755 /opt/frz-ops/curl-loop.sh; setsid nohup /opt/frz-ops/curl-loop.sh >/dev/null 2>&1 </dev/null & echo started'
 
   local switched_ok=0
   if bg_deploy "第二次部署 2.0.0（切到 green）" 2.0.0; then
@@ -1755,6 +1768,126 @@ LOOP
   else
     fail "回滚未成功"
   fi
+
+  # ---- 迭代 4c：槽位视图、切换时间线、对账 ----
+
+  # 从 `app slot list --json` 里取某一侧那个对象（从 `"slot": "<侧>"` 到它自己的 `}`）。
+  # 用 --json 而不是人类可读输出：后者的字段标签是中文，塞进 sed 的模式里要按字节匹配，
+  # 而 JSON 的键全是 ASCII。
+  slot_item() { # 槽位名
+    rq app slot list --app "${app}" --json | sed -n "/\"slot\": \"$1\"/,/}/p"
+  }
+  slot_str() { # 槽位名 字段
+    slot_item "$1" | sed -n "s/.*\"$2\": *\"\([^\"]*\)\".*/\1/p" | head -1
+  }
+  slot_bool() { # 槽位名 字段
+    slot_item "$1" | sed -n "s/.*\"$2\": *\([a-z]*\).*/\1/p" | head -1
+  }
+  view_str() { # 字段（整个视图上的字段）
+    rq app slot list --app "${app}" --json | sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" | head -1
+  }
+  view_bool() { # 字段
+    rq app slot list --app "${app}" --json | sed -n "s/.*\"$1\": *\([a-z]*\).*/\1/p" | head -1
+  }
+
+  # F) 槽位视图：**两类事实并排**。此时流量在 blue、blue 在跑、green 被回滚停掉。
+  assert_eq "slot list 报的线上事实" "blue" "$(view_str servingSlot)"
+  assert_eq "slot list 报的库里记录" "blue" "$(view_str recordedSlot)"
+  assert_eq "两份事实一致时不报不一致" "false" "$(view_bool inconsistent)"
+  assert_eq "线上事实读得到（装了 Nginx 适配器）" "true" "$(view_bool onlineKnown)"
+  assert_eq "blue 这一侧在接流量（线上事实）" "true" "$(slot_bool blue serving)"
+  assert_eq "blue 的状态" "serving" "$(slot_str blue state)"
+  assert_eq "blue 跑的是回滚后的版本" "1.0.0" "$(slot_str blue version)"
+  assert_eq "blue 的 unit 名是按槽位派生的" "frz-bg-blue.service" "$(slot_str blue unitName)"
+  assert_eq "green 不接流量" "false" "$(slot_bool green serving)"
+  assert_eq "green 被回滚停掉之后状态是 stopped" "stopped" "$(slot_str green state)"
+  assert_eq "blue 报的端口是它自己声明的那个" "yes" \
+    "$(slot_item blue | grep -q "${blue_port}" && echo yes || echo no)"
+  assert_eq "green 报的端口是它自己声明的那个" "yes" \
+    "$(slot_item green | grep -q "${green_port}" && echo yes || echo no)"
+  assert_eq "blue 的进程状态来自 systemd" "active" "$(slot_str blue processState)"
+  assert_eq "green 的进程状态来自 systemd" "inactive" "$(slot_str green processState)"
+  # **「没探」与「探了不健康」是两件事**：green 停着，因此 ready 是 null（字段缺席），
+  # 而不是 false——把两者都显示成 false 会让「停着的槽位」看起来像「起来但没好」。
+  assert_eq "在跑的 blue 探了就绪" "true" "$(slot_bool blue ready)"
+  assert_eq "停着的 green 没被探活（ready 是 null）" "no" \
+    "$(slot_item green | grep -q '\"ready\"' && echo yes || echo no)"
+
+  # G) 切换时间线：谁在什么时候切到过哪一版。
+  local history
+  history=$(rq app slot history --app "${app}" --json)
+  assert_eq "时间线里有三次切流（两次部署 + 一次回滚）" "3" \
+    "$(printf '%s' "${history}" | grep -c '"kind": "switched"' || true)"
+  assert_eq "时间线里有排空停掉旧槽位的记录" "yes" \
+    "$(printf '%s' "${history}" | grep -q '"kind": "stopped"' && echo yes || echo no)"
+  assert_eq "时间线里有观察窗口通过的记录" "yes" \
+    "$(printf '%s' "${history}" | grep -q '"kind": "observed"' && echo yes || echo no)"
+  assert_eq "观察窗口的采样次数记下来了" "yes" \
+    "$(printf '%s' "${history}" | grep -q '次采样' && echo yes || echo no)"
+  assert_eq "时间线覆盖了两个版本" "yes" \
+    "$(printf '%s' "${history}" | grep -q '"version": "2.0.0"' && echo yes || echo no)"
+  assert_eq "事件带上了触发它的操作 id" "yes" \
+    "$(printf '%s' "${history}" | grep -q '"operationId": "op_' && echo yes || echo no)"
+  # **新的在前**：回滚那一次的最后一个动作是排空停掉 green。
+  assert_eq "时间线是新的在前（最新一条是回滚后停掉 green）" "stopped" \
+    "$(printf '%s' "${history}" | grep -m1 '"kind":' | sed -n 's/.*"kind": *"\([^"]*\)".*/\1/p')"
+
+  # H) 对账（迭代 4c 的核心）：**把库里那份改成过期的**，重启 opsd，它应当被按线上纠正。
+  #
+  #    直接用 sqlite3 改库是最干净的造法，它精确地模拟「库里那份镜像过期了」。真实成因是
+  #    切流成功之后、promote 落库之前进程被杀：受管文件已经指向新的一侧，而库里还记着旧的。
+  #    **刻意不动 Nginx**——线上那一侧才是事实（迭代 4 规格 D2）。
+  local root_db=/var/lib/opsd-root/opsd.db
+  require_ok "把库里的 serving_slot 与槽位状态改成过期的（模拟落库之前被杀）" \
+    in_container sqlite3 "${root_db}" "UPDATE applications SET serving_slot = 'green' WHERE name = '${app}';
+      UPDATE application_slots SET state = 'serving'
+        WHERE slot = 'green' AND application_id = (SELECT id FROM applications WHERE name = '${app}');"
+
+  # 对账之前：`slot list` 必须**把不一致报出来**，而不是挑一边显示。
+  assert_eq "库里那份过期之后，线上事实仍报 blue" "blue" "$(view_str servingSlot)"
+  assert_eq "库里那份过期之后，库里记录报 green" "green" "$(view_str recordedSlot)"
+  assert_eq "两份事实不一致时被标出来" "true" "$(view_bool inconsistent)"
+
+  # restart_root_opsd 重启 root 实例的 opsd（对账发生在启动时）。
+  #
+  # 用 **pgrep -x opsd + /proc/<pid>/cmdline** 精确定位那一个进程，而不是 pgrep -f 或宽匹配的
+  # pkill：容器里同时跑着**两个** opsd（frz-ops 与 root），按名字乱杀会把另一个一起带走。
+  # 这条纪律在真机上是用血的代价换来的（见 AGENTS.md），容器里照办。
+  restart_root_opsd() {
+    local pid gone=no
+    for pid in $(q pgrep -x opsd); do
+      if in_container sh -c "tr '\0' ' ' < /proc/${pid}/cmdline | grep -q 'opsd --config /etc/opsd/root.yaml'" 2>/dev/null; then
+        q kill "${pid}"
+      fi
+    done
+    # **等它把 socket 删掉再起新的**：socket 是陈旧文件的话 wait_for_socket 会立刻返回，
+    # 于是后面的断言打在旧那一代进程上——而「重启之后才对账」正是这一段要验的事。
+    for _ in $(seq 1 60); do
+      if ! docker exec "$CID" test -S "${RUNTIME_SOCK}" 2>/dev/null; then
+        gone=yes
+        break
+      fi
+      sleep 0.5
+    done
+    [ "${gone}" = "yes" ] || return 1
+    # 用与首次启动**同一个**函数，环境变量因此不会漏（见 start_root_opsd 的注释）。
+    start_root_opsd
+    wait_for_socket "${RUNTIME_SOCK}"
+  }
+  require_ok "重启 root 实例的 opsd（对账在启动时跑）" restart_root_opsd
+
+  # 线上那一侧是 blue（回滚之后 upstream 一直指着它），因此对账把库里那份**改回 blue**。
+  assert_eq "对账之后库里的记录被纠回线上那一侧" "blue" "$(view_str recordedSlot)"
+  assert_eq "对账之后两份事实一致" "false" "$(view_bool inconsistent)"
+  # 第二条规则：按 systemd 的实际状态重算槽位状态。green 那一行被我们改成了 serving，
+  # 而它的进程（回滚时停掉的）根本没在跑——**不自洽的状态会误导运维**，对账按事实纠回来。
+  assert_eq "对账按进程事实把 green 改成 stopped" "stopped" "$(slot_str green state)"
+  assert_eq "blue 仍在接流量那一侧，状态是 serving" "serving" "$(slot_str blue state)"
+  # **对账只镜像事实，不动流量**：Nginx 的 upstream 与两个进程都原样。
+  assert_eq "对账没有改 Nginx 的 upstream" "version=1.0.0" "$(served_version)"
+  assert_eq "对账没有动 blue 的进程" "active" "$(q systemctl is-active ${app}-blue.service)"
+  assert_eq "对账在时间线里留了痕" "yes" \
+    "$(rq app slot history --app "${app}" --json | grep -q '"kind": "reconciled"' && echo yes || echo no)"
 }
 
 main() {
@@ -1783,8 +1916,7 @@ main() {
   # 因此这里另起一个 root 实例（独立 socket/DB/日志），runtime 组只打在它上面。
   # PROBE_ENV 也在这个实例上注入：kind=env 凭据的值来自 opsd 自己的进程环境。
   log "以 root 启动第二个 opsd（runtime 组专用）"
-  docker exec -d -e "PROBE_ENV=$(cat "$WORK_DIR/probe-env-value")" \
-    "$CID" /opt/frz-ops/opsd --config /etc/opsd/root.yaml
+  start_root_opsd
   wait_for_socket "${RUNTIME_SOCK}"
 
   check_filesystem

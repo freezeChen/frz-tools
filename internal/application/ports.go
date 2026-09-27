@@ -72,6 +72,14 @@ type Repository interface {
 		state domain.SlotState, switchedAt *time.Time, now time.Time) error
 	ApplicationSlots(ctx context.Context, applicationID string) ([]domain.ApplicationSlot, error)
 
+	// AppendSlotEvent 追加一条槽位时间线事件（迭代 4c）。只追加、不更新。
+	AppendSlotEvent(ctx context.Context, event *domain.SlotEvent) error
+	// SlotEvents 按时间倒序读某个应用的时间线。
+	SlotEvents(ctx context.Context, applicationID string, limit int) ([]domain.SlotEvent, error)
+	// ApplicationsWithSlots 返回带蓝绿痕迹的应用 ID（有 serving_slot、有槽位行、
+	// 或有记着槽位的 release）。启动时的对账只扫这一批。
+	ApplicationsWithSlots(ctx context.Context) ([]string, error)
+
 	CreateSchedule(ctx context.Context, schedule *domain.Schedule) error
 	GetSchedule(ctx context.Context, ref string) (*domain.Schedule, error)
 	ListSchedules(ctx context.Context, limit int) ([]domain.Schedule, error)

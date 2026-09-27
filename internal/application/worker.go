@@ -587,9 +587,9 @@ func (p *Pool) executeDeploy(persistCtx, execCtx context.Context, op *domain.Ope
 
 	switch op.Kind {
 	case v1.KindAppRollback:
-		err = p.deploys.ExecuteRollback(execCtx, releaseID, logf)
+		err = p.deploys.ExecuteRollback(execCtx, releaseID, op.ID, logf)
 	default:
-		err = p.deploys.ExecuteDeploy(execCtx, releaseID, logf)
+		err = p.deploys.ExecuteDeploy(execCtx, releaseID, op.ID, logf)
 	}
 
 	if err != nil {

@@ -24,7 +24,9 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 （见 `docs/plans/2026-09-24-future-iterations.md` 第 2 节）。
 **迭代 3（Go/Java 通用进程部署）的 3a / 3b / 3c 都已实现并验证**（解包与 release 目录、
 部署与回滚、资源限制与 Java 运行时的解释器预检），3c 的真机验证（含**重启后部署版本仍存活**）
-在 legacy 档主机上完成，迭代 4–5 未开始。
+在 legacy 档主机上完成。**迭代 4（Nginx 蓝绿发布、观察窗口与回滚）的 4a/4b/4c 均已实现
+并在 Linux 容器里验证**（真 Nginx + 真 systemd + 真 curl，见 `2026-09-25-iteration-4.md`
+第 13–20 节）；迭代 5 未开始。
 **真实 Linux 主机的证据已于 2026-09-24 取得**，而且**两档都拿到了**：
 Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真实重启）与
 **CentOS 7 / systemd 219 / cgroup v1（legacy 档，118 项通过 / 0 项失败）**，见 `test/host/`。
@@ -47,8 +49,8 @@ Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真�
   GFS 已移出 2d，见第 22 节）
 - `docs/plans/2026-09-24-iteration-3.md`：Go/Java 通用进程部署（3a/3b/3c 已实现并验证，
   见 §12–17）
-- `docs/plans/2026-09-25-iteration-4.md`：Nginx 蓝绿发布、观察窗口与回滚（4a 已实现，
-  见第 13–14 节；4b/4c 未开始）
+- `docs/plans/2026-09-25-iteration-4.md`：Nginx 蓝绿发布、观察窗口与回滚
+  （4a/4b/4c 已实现并在 **Linux 容器**里验证，见第 13–20 节；**真实主机上的蓝绿未验证**）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -137,10 +139,11 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 197**（2026-09-27 迭代 4b 落地后实跑：197 通过 / 0 失败，其中 1c 的 `check_runtime`
+当前为 232**（2026-09-27 迭代 4c 落地后实跑：232 通过 / 0 失败，其中 1c 的 `check_runtime`
 49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项、2d 的 `check_prune` 13 项、
-3b 的 `check_deploy` 23 项、3c 的 `check_resources` 16 项、4b 的 `check_bluegreen` 27 项；
-历史快照：3c 时点 170 项、3b 时点 151 项、2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
+3b 的 `check_deploy` 23 项、3c 的 `check_resources` 16 项、4b/4c 的 `check_bluegreen` 62 项
+——4b 时点是 27 项）；
+历史快照：4b 时点 197 项、3c 时点 170 项、3b 时点 151 项、2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
 1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在

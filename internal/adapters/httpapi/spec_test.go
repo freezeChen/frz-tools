@@ -70,6 +70,7 @@ func newFullServer(t *testing.T, mutators ...func(*application.Options)) (*httpt
 		Hosts:     runtime.Hosts,
 		Runtimes:  runtime.Runtimes,
 		Backups:   runtime.Backups,
+		Slots:     runtime.Slots,
 		Store:     store,
 		Workers:   1,
 		Logger:    logger,

@@ -50,12 +50,14 @@ func (s *Server) handleDeployApplication(w http.ResponseWriter, r *http.Request)
 			APIVersion: v1.APIVersion,
 			Noop:       true,
 			Release:    releaseDTO(target.Release),
+			Slot:       string(target.Slot),
+			Switching:  target.Switching,
 		})
 		return
 	}
 
-	s.createDeployOperation(w, r, v1.KindAppDeploy, application, target.Release.ID,
-		req.IdempotencyKey, req.CreatedBy, req.Retry)
+	s.createDeployOperation(w, r, v1.KindAppDeploy, application, target.Release.ID, target.Slot,
+		target.Switching, req.IdempotencyKey, req.CreatedBy, req.Retry)
 }
 
 // handleRollbackApplication 回滚到某个既有版本。
@@ -83,18 +85,23 @@ func (s *Server) handleRollbackApplication(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	s.createDeployOperation(w, r, v1.KindAppRollback, application, target.Release.ID,
-		req.IdempotencyKey, req.CreatedBy, req.Retry)
+	s.createDeployOperation(w, r, v1.KindAppRollback, application, target.Release.ID, target.Slot,
+		target.Switching, req.IdempotencyKey, req.CreatedBy, req.Retry)
 }
 
 // createDeployOperation 把「部署/回滚哪个 release」写进 Operation 并交给 Service.Create。
 //
 // spec 里存的是 **releaseId**（而不是"当前规格"）：要跑的那个版本的配置在创建期就选好了，
 // 执行时不该再去读当前规格——否则回滚会回成一个「新配置 + 旧二进制」的混合体。
+//
+// slot / switching 只用于响应（它们描述的是这次发布**将要**做什么），不进 Operation：
+// 执行阶段会按那一刻的线上事实重算，把创建期的推算固化成参数，反而会在对账改过之后
+// 让执行与响应说的不是同一件事。
 func (s *Server) createDeployOperation(
 	w http.ResponseWriter,
 	r *http.Request,
-	kind, application, releaseID, idempotencyKey, createdBy string,
+	kind, application, releaseID string, slot domain.Slot, switching bool,
+	idempotencyKey, createdBy string,
 	retry *v1.RetrySpec,
 ) {
 	if s.deps.Service == nil {
@@ -137,6 +144,8 @@ func (s *Server) createDeployOperation(
 		APIVersion: v1.APIVersion,
 		Release:    releaseDTO(release),
 		Operation:  ptrOperation(operationDTO(op)),
+		Slot:       string(slot),
+		Switching:  switching,
 	})
 }
 

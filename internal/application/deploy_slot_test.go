@@ -26,7 +26,8 @@ type fakeNginxAdapter struct {
 	applyErrWhen func(domain.Slot) error
 	// onApply 在成功切流之后调用一次：测试用它制造「切流之后新槽位退化了」。
 	onApply func()
-	// current 是 Current 的返回值（本组用例不涉及对账）。
+	// current 是受管文件现在指向哪一侧：Apply 成功就跟着改（与真实适配器一致），
+	// 对账与 `app slot list` 读的就是它。
 	current domain.Slot
 }
 
@@ -47,6 +48,9 @@ func (f *fakeNginxAdapter) Apply(_ context.Context, _ *domain.ApplicationSpec, s
 	}
 	f.mu.Lock()
 	f.applied = append(f.applied, slot)
+	// 切流成功之后受管文件就指向这一侧了——对账与 `app slot list` 读的正是它。
+	// 假适配器也要跟上，否则每一条对账用例都会看到「库与线上不一致」这个假象。
+	f.current = slot
 	hook := f.onApply
 	f.mu.Unlock()
 	if hook != nil {
@@ -56,7 +60,17 @@ func (f *fakeNginxAdapter) Apply(_ context.Context, _ *domain.ApplicationSpec, s
 }
 
 func (f *fakeNginxAdapter) Current(_ context.Context, _ *domain.ApplicationSpec) (domain.Slot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.current, nil
+}
+
+// setCurrent 直接改写受管文件指向的槽位，模拟「有人手工改了 Nginx」或
+// 「切流成功但还没落库就被杀」这两种真实场景。
+func (f *fakeNginxAdapter) setCurrent(slot domain.Slot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.current = slot
 }
 
 // appliedSlots 返回成功切流过的槽位序列。

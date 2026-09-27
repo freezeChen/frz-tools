@@ -35,9 +35,16 @@ type fakeRuntimeAdapter struct {
 	// healthWhen 非 nil 时按槽位决定健康结果（见 Health）。
 	healthWhen func(domain.Slot) (domain.RuntimeHealth, error)
 	healthErr  error
+	// statusWhen 非 nil 时按槽位决定进程状态（对账用例要构造「这一侧的进程没在跑」）。
+	statusWhen func(domain.Slot) domain.RuntimeStatus
 
 	// startEntered 非 nil 时 Start 会先关闭它再阻塞到 ctx 结束，用于驱动取消路径。
 	startEntered chan struct{}
+
+	// started 记着哪些槽位真的被 Start 过。Status 按它回答——**真实的适配器就是这么做的**
+	// （没装过的 unit 是 inactive，不是 active）。让假适配器默认「处处 active」会把
+	// 「这一侧从没部署过」这种状态伪装成「跑着」。
+	started map[domain.Slot]bool
 }
 
 func (f *fakeRuntimeAdapter) record(name string, spec *domain.ApplicationSpec, slot domain.Slot) {
@@ -85,6 +92,12 @@ func (f *fakeRuntimeAdapter) Prepare(_ context.Context, spec *domain.Application
 
 func (f *fakeRuntimeAdapter) Start(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	f.record("start", spec, slot)
+	f.mu.Lock()
+	if f.started == nil {
+		f.started = map[domain.Slot]bool{}
+	}
+	f.started[slot] = true
+	f.mu.Unlock()
 	if f.startEntered != nil {
 		close(f.startEntered)
 		<-ctx.Done()
@@ -95,6 +108,9 @@ func (f *fakeRuntimeAdapter) Start(ctx context.Context, spec *domain.Application
 
 func (f *fakeRuntimeAdapter) Stop(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) error {
 	f.record("stop", spec, slot)
+	f.mu.Lock()
+	delete(f.started, slot)
+	f.mu.Unlock()
 	return f.stopErr
 }
 
@@ -110,7 +126,16 @@ func (f *fakeRuntimeAdapter) Health(_ context.Context, spec *domain.ApplicationS
 
 func (f *fakeRuntimeAdapter) Status(_ context.Context, spec *domain.ApplicationSpec, slot domain.Slot) (domain.RuntimeStatus, error) {
 	f.record("status", spec, slot)
-	return domain.RuntimeActive, nil
+	if f.statusWhen != nil {
+		return f.statusWhen(slot), nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.started[slot] {
+		return domain.RuntimeActive, nil
+	}
+	// 没被 Start 过的那一侧就是没在跑：真实的适配器对不存在的 unit 正是这么答的。
+	return domain.RuntimeInactive, nil
 }
 
 type fakePrepareReporter struct {

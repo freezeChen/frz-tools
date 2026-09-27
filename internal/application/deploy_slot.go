@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
@@ -19,13 +20,29 @@ import (
 // （按槽位 Prepare/Start/Stop/Health）、同一套失败语义（改动过线上就撤销，没动过就报原因码）。
 // 差别只在顺序与「谁在接流量」这一件事上。
 
+// nextSlot 算出「下一次部署会落到哪一侧」。
+//
+// 判据只有一条：**总是另一侧**。第一次部署没有 serving 槽位，用 blue——这个选择是刻意的
+// （谁先谁后不重要，重要的是它有确定的答案，而不是看哪个槽位恰好有目录）。
+//
+// 它被两处用到：创建期算给调用方看的「目标槽位」（`DeployResponse.Slot`），
+// 执行期算真正要用的那一侧。**必须是同一个函数**——两处各写一遍，
+// 「响应里说 green、实际切到 blue」就从不可能变成了可能。
+func nextSlot(serving domain.Slot) domain.Slot {
+	if serving.Valid() {
+		return serving.Opposite()
+	}
+	return domain.SlotBlue
+}
+
 // applySlot 是蓝绿的部署与回滚。
 //
 // 目标槽位由「现在谁在接流量」推出来：**总是切到另一侧**。第一次部署没有 serving 槽位，
 // 用 blue——这个选择刻意的（谁先谁后不重要，重要的是它有确定的答案，而不是看哪个槽位
 // 恰好有目录）。
 func (s *DeployService) applySlot(
-	ctx context.Context, release *domain.Release, spec *domain.ApplicationSpec, rollback bool, logf DeployLogf,
+	ctx context.Context, release *domain.Release, spec *domain.ApplicationSpec, rollback bool,
+	operationID string, logf DeployLogf,
 ) error {
 	if s.nginx == nil {
 		return domain.NewError(v1.CodeRuntimeUnsupport,
@@ -46,10 +63,7 @@ func (s *DeployService) applySlot(
 	if err != nil {
 		return err
 	}
-	target := domain.SlotBlue
-	if serving.Valid() {
-		target = serving.Opposite()
-	}
+	target := nextSlot(serving)
 	// 记下这次部署落在哪一侧：`releases.slot` 是「这个版本是怎么上的」的一部分，
 	// 排查与审计都要靠它回答「这一版当初上到了哪一侧」。
 	if err := s.repo.SetReleaseSlot(ctx, release.ID, target); err != nil {
@@ -86,6 +100,9 @@ func (s *DeployService) applySlot(
 		started  bool // 目标槽位的进程已经起来
 		switched bool // 流量已经切到目标槽位
 	)
+	// observedSamples 是观察窗口已经采样的次数。失败发生在窗口里时，这个数字要进时间线
+	// ——「看了十几眼才发现它退化」与「刚切过去就发现」是两件不同的事。
+	observedSamples := 0
 	fail := func(cause error) error {
 		var rollbackErr error
 		undone := false
@@ -94,7 +111,7 @@ func (s *DeployService) applySlot(
 			// 流量已经切过去了：把 upstream 切回来，并把旧槽位重新拉起来（正常情况下它
 			// 还在跑——我们只在发布成功之后才停它，而失败恰好意味着没走到那一步）。
 			undone = true
-			rollbackErr = s.switchTraffic(ctx, previousSpec, serving, previous, logf)
+			rollbackErr = s.switchTraffic(ctx, app.ID, previousSpec, serving, previous, target, operationID, logf)
 		case switched:
 			// 第一次部署就切过去了再失败：没有旧版本可以回去。只能把这一侧停掉、撤掉
 			// 对外入口——**这会儿这个应用没有任何版本在服务**，报错必须这么说。
@@ -114,6 +131,10 @@ func (s *DeployService) applySlot(
 			domain.SlotFailed, nil, s.now()); slotErr != nil {
 			s.logger.Warn("记录失败槽位状态失败", "slot", sub, "error", slotErr)
 		}
+		// 时间线里也留一条。**槽位状态会被对账按事实重算，历史不会**——这正是
+		// 「上一次在这边推失败了」该待的地方（见 SlotService.Reconcile 的注释）。
+		appendSlotEvent(ctx, s.repo, s.logger, app.ID, target, domain.SlotEventFailed,
+			slotFailureDetail(cause, observedSamples), release, &operationID, s.now())
 		if spec.Materializes() {
 			// 本次新建的目录：撤销之后它没有任何用处（内容可以从制品重新解出来）。
 			if err := s.releases.Remove(ctx, spec, release.ID); err != nil {
@@ -179,10 +200,19 @@ func (s *DeployService) applySlot(
 	switched = true
 	logf("info", domain.PhaseExecute, "流量已切到新槽位",
 		map[string]string{"slot": sub, "version": release.Version})
+	appendSlotEvent(ctx, s.repo, s.logger, app.ID, target, domain.SlotEventSwitched,
+		"流量切到这一侧（"+action+"）", release, &operationID, s.now())
 
 	// 3) 观察窗口：切流之后盯着新槽位，退化了就按失败处理（切回去）。
-	if err := s.observeSlot(ctx, spec, target, logf); err != nil {
+	samples, err := s.observeSlot(ctx, spec, target, logf)
+	observedSamples = samples
+	if err != nil {
 		return fail(err)
+	}
+	if spec.Nginx.ObservationSeconds > 0 {
+		appendSlotEvent(ctx, s.repo, s.logger, app.ID, target, domain.SlotEventObserved,
+			fmt.Sprintf("观察窗口通过：%d 次采样，窗口 %d 秒", samples, spec.Nginx.ObservationSeconds),
+			release, &operationID, s.now())
 	}
 
 	// 4) promote：先落 serving_slot（Nginx 那边第 2 步已经改完了——**线上事实在前**，
@@ -211,7 +241,7 @@ func (s *DeployService) applySlot(
 
 	// 5) 排空旧槽位之后停掉它。**只停进程，不删目录**——回滚就是把它重新拉起来。
 	if serving.Valid() && previousSpec != nil {
-		s.drainAndStop(ctx, previousSpec, serving, releaseIDOf(previous), app.ID, logf)
+		s.drainAndStop(ctx, previousSpec, serving, previous, app.ID, operationID, logf)
 	}
 
 	s.pruneReleases(ctx, spec, release.ID, logf)
@@ -223,8 +253,8 @@ func (s *DeployService) applySlot(
 // 用**旧版本的规格**：切回去要连配置一起切回去（listen、serverName、槽位端口都取自那一版），
 // 与 3b 的「回滚连配置一起回滚」是同一条要求。
 func (s *DeployService) switchTraffic(
-	ctx context.Context, previousSpec *domain.ApplicationSpec, serving domain.Slot,
-	previous *domain.Release, logf DeployLogf,
+	ctx context.Context, applicationID string, previousSpec *domain.ApplicationSpec, serving domain.Slot,
+	previous *domain.Release, failedSlot domain.Slot, operationID string, logf DeployLogf,
 ) error {
 	if !serving.Valid() || previousSpec == nil {
 		return domain.NewError(v1.CodeInternal, "没有可切回的槽位")
@@ -239,7 +269,14 @@ func (s *DeployService) switchTraffic(
 	if err := s.runtime.Start(ctx, previousSpec, serving); err != nil {
 		return err
 	}
-	return s.waitForReady(ctx, previousSpec, serving, logf)
+	if err := s.waitForReady(ctx, previousSpec, serving, logf); err != nil {
+		return err
+	}
+	// 切回来也是一次真实的切流，时间线必须记上——否则 `app slot history` 会读成
+	// 「流量一直在 blue」，而中间那一段其实跑在 green 上。
+	appendSlotEvent(ctx, s.repo, s.logger, applicationID, serving, domain.SlotEventSwitched,
+		"流量切回这一侧（槽位 "+string(failedSlot)+" 上的这次尝试失败）", previous, &operationID, s.now())
+	return nil
 }
 
 // teardownSlot 把新槽位收干净：停进程、撤指针。用在「流量从未动过」与「第一次部署切过去
@@ -260,7 +297,7 @@ func (s *DeployService) teardownSlot(ctx context.Context, spec *domain.Applicati
 // 让发布结果保持成功——把一次成功的发布报成失败，比多留一个空闲进程糟得多。
 func (s *DeployService) drainAndStop(
 	ctx context.Context, previousSpec *domain.ApplicationSpec, serving domain.Slot,
-	previousReleaseID, applicationID string, logf DeployLogf,
+	previous *domain.Release, applicationID, operationID string, logf DeployLogf,
 ) {
 	drain := previousSpec.Nginx.DrainSeconds
 	if drain > 0 {
@@ -277,10 +314,14 @@ func (s *DeployService) drainAndStop(
 			map[string]string{"slot": string(serving), "error": domain.MessageOf(err)})
 		return
 	}
-	if err := s.repo.PutApplicationSlot(ctx, applicationID, serving, previousReleaseID,
+	if err := s.repo.PutApplicationSlot(ctx, applicationID, serving, releaseIDOf(previous),
 		domain.SlotStopped, nil, s.now()); err != nil {
 		s.logger.Warn("记录旧槽位状态失败", "slot", string(serving), "error", err)
 	}
+	// 只有走到了这里（进程真的停了）才落事件：Stop 失败时那一侧还在跑，
+	// 时间线上写「已停止」就是一句假话。
+	appendSlotEvent(ctx, s.repo, s.logger, applicationID, serving, domain.SlotEventStopped,
+		"排空后停掉（它不再接流量）", previous, &operationID, s.now())
 }
 
 // observeSlot 是切流之后的观察窗口（迭代 4 规格 D4 第 6 步、D11 第 3 条）。
@@ -290,34 +331,52 @@ func (s *DeployService) drainAndStop(
 // 自动回滚，只做「窗口内发现退化就按失败处理」）。
 //
 // 窗口长度 0 表示不观察；默认 30 秒（domain.DefaultObservationSeconds）。
-func (s *DeployService) observeSlot(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot, logf DeployLogf) error {
+func (s *DeployService) observeSlot(ctx context.Context, spec *domain.ApplicationSpec, slot domain.Slot, logf DeployLogf) (int, error) {
 	seconds := spec.Nginx.ObservationSeconds
 	if seconds <= 0 {
-		return nil
+		return 0, nil
 	}
 	deadline := time.Now().Add(time.Duration(seconds) * time.Second)
 	logf("info", domain.PhaseExecute, "观察窗口开始", map[string]string{
 		"slot": string(slot), "seconds": itoa(seconds),
 	})
+	// samples 数的是**拿到结果的探测**次数（探测自己报错的那次不算——那说明我们没看见
+	// 那一侧的状况，而不是看见它不健康）。它最终要进时间线：窗口结束时记「看了几眼」，
+	// 窗口内退化时记「看了几眼才发现」。
+	samples := 0
 	for {
 		health, err := s.runtime.Health(ctx, spec, slot)
 		if err != nil {
-			return err
+			return samples, err
 		}
+		samples++
 		if !health.Ready {
-			return domain.NewError(v1.CodeRuntimeNotReady,
-				"观察窗口内槽位 %s 不再就绪（%s）", slot, health.Detail)
+			return samples, domain.NewError(v1.CodeRuntimeNotReady,
+				"观察窗口内槽位 %s 不再就绪（已采样 %d 次；%s）", slot, samples, health.Detail)
 		}
 		if !time.Now().Before(deadline) {
-			logf("info", domain.PhaseExecute, "观察窗口通过", map[string]string{"slot": string(slot)})
-			return nil
+			logf("info", domain.PhaseExecute, "观察窗口通过", map[string]string{
+				"slot": string(slot), "samples": itoa(samples)})
+			return samples, nil
 		}
 		select {
 		case <-ctx.Done():
-			return domain.NewError(v1.CodeExecCancelled, "观察窗口被取消")
+			return samples, domain.NewError(v1.CodeExecCancelled, "观察窗口被取消")
 		case <-time.After(readyPollInterval):
 		}
 	}
+}
+
+// slotFailureDetail 把一次失败写成时间线上的一行说明。
+//
+// 错误码在最前面：时间线是**扫**着看的，而「是配置问题还是起不来」这个区分
+// 比后面那串自然语言更先被需要。
+func slotFailureDetail(cause error, samples int) string {
+	detail := fmt.Sprintf("%s: %s", domain.CodeOf(cause), domain.MessageOf(cause))
+	if samples > 0 {
+		detail += fmt.Sprintf("（观察窗口里已采样 %d 次）", samples)
+	}
+	return detail
 }
 
 // sleepContext 是可取消的等待。取消时立刻返回，让「排空」这一步不至于把取消拖住。

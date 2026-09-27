@@ -33,4 +33,15 @@ type DeployResponse struct {
 	Noop       bool       `json:"noop,omitempty"`
 	Release    Release    `json:"release"`
 	Operation  *Operation `json:"operation,omitempty"`
+
+	// Slot 是**这一次发布会落到哪一侧**（蓝绿应用才有值）。它与 Release.Slot 不是一回事：
+	// 那个是「这一版当初上到了哪一侧」（历史），这个是「这一次会上到哪一侧」（按提交时刻
+	// 的线上状态推算，迭代 4c 规格 §18.3）。单槽应用两个都为空。
+	Slot string `json:"slot,omitempty"`
+	// Switching 表示这次发布**包含一次切流**。第一次部署没有流量可切，因此是 false
+	// ——这是调用方区分「首次上线」与「换版本」的最小信息。
+	//
+	// 它说的是「这次发布有没有切流这个动作」，**不是**「流量已经切过去了」：切流是异步的，
+	// 结果要看 Operation。
+	Switching bool `json:"switching,omitempty"`
 }

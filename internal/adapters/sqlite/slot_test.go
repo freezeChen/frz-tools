@@ -181,3 +181,160 @@ func TestServingSlotRoundTrip(t *testing.T) {
 		t.Fatalf("不存在的应用应当报 APPLICATION_NOT_FOUND，got %v", err)
 	}
 }
+
+// ==== 迭代 4c：槽位时间线 ====
+
+// 时间线按「新的在前」读，且每个字段都原样往返（尤其 version 与 operation_id：
+// 它们是「这条事件是谁、什么时候、把哪一版切到哪一侧」的全部依据）。
+func TestSlotEventsRoundTripNewestFirst(t *testing.T) {
+	store, ctx := newSpecStore(t)
+	appID := seedApplication(t, store, ctx, "orders-api")
+	artifactID := seedArtifact(t, store, ctx)
+	base := time.Now().UTC()
+
+	if _, err := store.CreateRelease(ctx, &domain.Release{
+		ID: "rel_1", ApplicationID: appID, ArtifactID: artifactID,
+		Version: "1.0.0", CreatedAt: base, CreatedBy: "tester",
+	}); err != nil {
+		t.Fatalf("CreateRelease: %v", err)
+	}
+
+	events := []*domain.SlotEvent{
+		{ApplicationID: appID, Slot: domain.SlotBlue, ReleaseID: "rel_1", Version: "1.0.0",
+			Kind: domain.SlotEventSwitched, Detail: "流量切到这一侧（部署）",
+			OperationID: "op_1", At: base.Add(time.Second)},
+		{ApplicationID: appID, Slot: domain.SlotBlue, ReleaseID: "rel_1", Version: "1.0.0",
+			Kind: domain.SlotEventObserved, Detail: "观察窗口通过：150 次采样，窗口 30 秒",
+			OperationID: "op_1", At: base.Add(2 * time.Second)},
+		{ApplicationID: appID, Slot: domain.SlotGreen, Kind: domain.SlotEventReconciled,
+			Detail: "对账：按线上事实把状态从 serving 改成 standby", At: base.Add(3 * time.Second)},
+	}
+	for _, event := range events {
+		if err := store.AppendSlotEvent(ctx, event); err != nil {
+			t.Fatalf("AppendSlotEvent: %v", err)
+		}
+	}
+
+	got, err := store.SlotEvents(ctx, appID, 0)
+	if err != nil {
+		t.Fatalf("SlotEvents: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 events, got %d", len(got))
+	}
+	if got[0].Kind != domain.SlotEventReconciled || got[2].Kind != domain.SlotEventSwitched {
+		t.Fatalf("应当按时间倒序（新的在前），got %+v", got)
+	}
+	if got[2].Version != "1.0.0" || got[2].OperationID != "op_1" || got[2].Slot != domain.SlotBlue {
+		t.Fatalf("字段没有原样往返：%+v", got[2])
+	}
+	// 没有 release 的事件（对账产生的）读回来仍是空串，而不是被写成别的什么。
+	if got[0].ReleaseID != "" || got[0].Version != "" || got[0].OperationID != "" {
+		t.Fatalf("可空字段应当原样是空，got %+v", got[0])
+	}
+	if !got[0].At.Equal(events[2].At) {
+		t.Fatalf("时刻往返不一致：want %s got %s", events[2].At, got[0].At)
+	}
+	// 只读某个应用的事件：别的应用不该混进来。
+	other := seedApplication(t, store, ctx, "billing-api")
+	if events, err := store.SlotEvents(ctx, other, 0); err != nil || len(events) != 0 {
+		t.Fatalf("别的应用应当没有事件，got %d err=%v", len(events), err)
+	}
+}
+
+// limit 生效，且 limit ≤ 0 取默认条数（而不是「一条都不返回」）。
+func TestSlotEventsLimit(t *testing.T) {
+	store, ctx := newSpecStore(t)
+	appID := seedApplication(t, store, ctx, "orders-api")
+	base := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		if err := store.AppendSlotEvent(ctx, &domain.SlotEvent{
+			ApplicationID: appID, Slot: domain.SlotBlue, Kind: domain.SlotEventReconciled,
+			Detail: "第 " + string(rune('A'+i)) + " 条", At: base.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatalf("AppendSlotEvent: %v", err)
+		}
+	}
+
+	got, err := store.SlotEvents(ctx, appID, 2)
+	if err != nil {
+		t.Fatalf("SlotEvents: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("limit 应当生效，got %d", len(got))
+	}
+	if got[0].Detail != "第 E 条" {
+		t.Fatalf("取的应当是最新的两条，got %+v", got)
+	}
+	if _, err := store.SlotEvents(ctx, appID, -1); err != nil {
+		t.Fatalf("limit ≤ 0 应当取默认条数而不是报错：%v", err)
+	}
+}
+
+// 非法输入要被拒绝，而不是写进去一行读不出来的东西。
+func TestSlotEventRejectsBadInput(t *testing.T) {
+	store, ctx := newSpecStore(t)
+	appID := seedApplication(t, store, ctx, "orders-api")
+	now := time.Now().UTC()
+
+	if err := store.AppendSlotEvent(ctx, &domain.SlotEvent{
+		ApplicationID: appID, Slot: "purple", Kind: domain.SlotEventSwitched, At: now,
+	}); domain.CodeOf(err) != v1.CodeInvalidRequest {
+		t.Fatalf("非法槽位应当报 INVALID_REQUEST，got %v", err)
+	}
+	if err := store.AppendSlotEvent(ctx, &domain.SlotEvent{
+		ApplicationID: appID, Slot: domain.SlotBlue, Kind: "unknown-kind", At: now,
+	}); domain.CodeOf(err) != v1.CodeInvalidRequest {
+		t.Fatalf("非法事件种类应当报 INVALID_REQUEST，got %v", err)
+	}
+	if err := store.AppendSlotEvent(ctx, &domain.SlotEvent{
+		ApplicationID: "app_nope", Slot: domain.SlotBlue, Kind: domain.SlotEventSwitched, At: now,
+	}); domain.CodeOf(err) != v1.CodeApplicationNotFound {
+		t.Fatalf("不存在的应用应当报 APPLICATION_NOT_FOUND，got %v", err)
+	}
+}
+
+// 对账要扫的那一批：**带蓝绿痕迹**的应用。三条痕迹各构造一个，另加一个干净的。
+func TestApplicationsWithSlots(t *testing.T) {
+	store, ctx := newSpecStore(t)
+	artifactID := seedArtifact(t, store, ctx)
+	now := time.Now().UTC()
+
+	serving := seedApplication(t, store, ctx, "serving-app")
+	rowed := seedApplication(t, store, ctx, "rowed-app")
+	released := seedApplication(t, store, ctx, "released-app")
+	clean := seedApplication(t, store, ctx, "clean-app")
+
+	if err := store.SetServingSlot(ctx, serving, domain.SlotBlue, now); err != nil {
+		t.Fatalf("SetServingSlot: %v", err)
+	}
+	if err := store.PutApplicationSlot(ctx, rowed, domain.SlotGreen, "", domain.SlotStopped, nil, now); err != nil {
+		t.Fatalf("PutApplicationSlot: %v", err)
+	}
+	if _, err := store.CreateRelease(ctx, &domain.Release{
+		ID: "rel_1", ApplicationID: released, ArtifactID: artifactID,
+		Version: "1.0.0", CreatedAt: now, CreatedBy: "tester",
+	}); err != nil {
+		t.Fatalf("CreateRelease: %v", err)
+	}
+	if err := store.SetReleaseSlot(ctx, "rel_1", domain.SlotGreen); err != nil {
+		t.Fatalf("SetReleaseSlot: %v", err)
+	}
+
+	ids, err := store.ApplicationsWithSlots(ctx)
+	if err != nil {
+		t.Fatalf("ApplicationsWithSlots: %v", err)
+	}
+	want := map[string]bool{serving: true, rowed: true, released: true}
+	if len(ids) != len(want) {
+		t.Fatalf("want %d 个应用，got %d：%v", len(want), len(ids), ids)
+	}
+	for _, id := range ids {
+		if !want[id] {
+			t.Fatalf("多出了不该被扫的应用 %s（干净的应用不该参与对账）", id)
+		}
+	}
+	if want[clean] {
+		t.Fatal("干净的应用不该参与对账")
+	}
+}

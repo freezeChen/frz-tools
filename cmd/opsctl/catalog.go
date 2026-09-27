@@ -26,6 +26,9 @@ func newAppCommand(opts *rootOptions) *cobra.Command {
 		// 「登记一条版本记录」，而部署是「把某个版本真正跑起来」。
 		newAppDeployCommand(opts),
 		newAppRollbackCommand(opts),
+		// 槽位的运营视图与切换时间线（迭代 4c）。挂在 app 下而不是独立命令：
+		// 槽位是**应用**的属性，脱离应用没有意义。
+		newAppSlotCommand(opts),
 	)
 	return cmd
 }
@@ -331,10 +334,15 @@ func reportDeploy(opts *rootOptions, result *v1.DeployResponse, action string) e
 		return nil
 	}
 	fmt.Printf("已提交%s：release %s（版本 %s）\n", action, result.Release.ID, result.Release.Version)
-	// 蓝绿应用才有的信息：这一版上到了哪一侧。切流是异步的（走 Operation），
-	// 因此这里说的是「目标槽位」，不是「流量已经切过去了」。
-	if result.Release.Slot != "" {
-		fmt.Printf("目标槽位：%s（切流进度见下面的操作日志）\n", result.Release.Slot)
+	// 蓝绿应用才有的信息：这一次会上到哪一侧、以及它是不是一次切流。
+	// 切流是异步的（走 Operation），因此这里说的是「目标槽位」与「这次有没有切流这个动作」，
+	// **不是**「流量已经切过去了」。
+	if result.Slot != "" {
+		if result.Switching {
+			fmt.Printf("目标槽位：%s（本次包含一次切流，进度见下面的操作日志）\n", result.Slot)
+		} else {
+			fmt.Printf("目标槽位：%s（首次部署：还没有流量可切）\n", result.Slot)
+		}
 	}
 	if result.Operation != nil {
 		printOperation(result.Operation)

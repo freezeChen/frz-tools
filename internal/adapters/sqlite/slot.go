@@ -148,3 +148,108 @@ func (s *Store) ServingSlot(ctx context.Context, applicationID string) (domain.S
 	}
 	return domain.Slot(slot.String), nil
 }
+
+// ==== 时间线（迭代 4c）====
+
+// AppendSlotEvent 追加一条槽位时间线事件。
+//
+// 只追加、不更新：时间线的价值恰恰在于它**不会被后来的动作改写**。
+func (s *Store) AppendSlotEvent(ctx context.Context, event *domain.SlotEvent) error {
+	if !event.Slot.Valid() {
+		return domain.NewError(v1.CodeInvalidRequest, "slot 取值非法: %q", event.Slot)
+	}
+	if !event.Kind.Valid() {
+		return domain.NewError(v1.CodeInvalidRequest, "槽位事件种类取值非法: %q", event.Kind)
+	}
+	if _, err := s.GetApplication(ctx, event.ApplicationID); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO slot_events
+			(application_id, slot, release_id, version, kind, detail, operation_id, at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ApplicationID, string(event.Slot), nullString(event.ReleaseID), nullString(event.Version),
+		string(event.Kind), nullString(event.Detail), nullString(event.OperationID), formatTime(event.At))
+	return err
+}
+
+// SlotEvents 按**时间倒序**读某个应用的时间线（limit ≤ 0 时取默认条数）。
+//
+// 倒序是刻意的：问「最近这次是什么时候切的」远比问「第一次是什么时候」常见，
+// 而调用方要正序自己反转一下就是了，反过来（默认正序、想倒序要读全表）做不到。
+func (s *Store) SlotEvents(ctx context.Context, applicationID string, limit int) ([]domain.SlotEvent, error) {
+	if limit <= 0 {
+		limit = defaultSlotEventLimit
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, application_id, slot, release_id, version, kind, detail, operation_id, at
+		FROM slot_events WHERE application_id = ?
+		ORDER BY at DESC, id DESC LIMIT ?`, applicationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []domain.SlotEvent
+	for rows.Next() {
+		var (
+			event       domain.SlotEvent
+			slotName    string
+			releaseID   sql.NullString
+			version     sql.NullString
+			kind        string
+			detail      sql.NullString
+			operationID sql.NullString
+			at          string
+		)
+		if err := rows.Scan(&event.ID, &event.ApplicationID, &slotName, &releaseID, &version,
+			&kind, &detail, &operationID, &at); err != nil {
+			return nil, err
+		}
+		event.Slot = domain.Slot(slotName)
+		event.ReleaseID = releaseID.String
+		event.Version = version.String
+		event.Kind = domain.SlotEventKind(kind)
+		event.Detail = detail.String
+		event.OperationID = operationID.String
+		if event.At, err = parseTime(at); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+// defaultSlotEventLimit 是 `app slot history` 不带 --limit 时的条数。
+// 时间线是给人看的，几十行足够回答「最近发生过什么」。
+const defaultSlotEventLimit = 50
+
+// ApplicationsWithSlots 返回**带蓝绿痕迹**的应用 ID：有 serving_slot、有槽位行，
+// 或某个 release 记着槽位。
+//
+// 对账只扫这一批。判据是「我们写过槽位相关的任何一列」——受管 Nginx 配置是**我们自己**
+// 写下去的，因此线上有它的应用必然在库里留下过痕迹；没有痕迹的应用去问 Nginx 只是
+// 白起一个进程（而且会把「这个应用不是蓝绿」和「这台主机没有 nginx」两件事混在一起）。
+func (s *Store) ApplicationsWithSlots(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM applications WHERE serving_slot IS NOT NULL
+		UNION
+		SELECT application_id FROM application_slots
+		UNION
+		SELECT application_id FROM releases WHERE slot IS NOT NULL
+		ORDER BY 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
