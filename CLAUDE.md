@@ -62,6 +62,8 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 - `internal/domain`：领域模型、状态机、错误码载体、脱敏，纯逻辑无 IO。
 - `internal/application`：在 `ports.go` 定义端口并编排用例。**非测试代码不 import 任何具体适配器**。
 - `internal/adapters`：sqlite、executor、httpapi、client、config、blob、secret、manifest、runtime。
+- `internal/fleet`：**客户端侧**的批量发布编排（5b），只经 `HostClient` 接口与远端说话，
+  刻意不持有任何状态（没有库、没有批次表）。
 - `internal/pki`：证书/私钥文件 → `crypto/tls` 配置，外加私钥文件的模式与属主检查。**opsd 与
   opsctl 共用**，两边对「什么样的私钥才算合格」的判据只有一份。
 
@@ -106,6 +108,15 @@ go run ./cmd/opsctl --socket /run/opsd/opsd.sock health
 - `runtime.start`/`stop` 与 `POST /api/v1/operations` 走同一条 `Service.Create`：锁、幂等键、
   请求摘要、审计、日志、取消全部复用，因此 `operation get/logs/cancel/retry` 对它们同样适用。
   `runtime.*` 读的是应用的**当前**规格，不是创建时的快照。
+- **批量发布（迭代 5b）在客户端侧**：`internal/fleet` 编排、`opsctl app deploy/rollback
+  --hosts` 驱动，**批次状态不落库**——每台机上的 `opsd` 是它那次部署的唯一事实来源，
+  批次只是一个视图，批次号就是每台机上的幂等键（`<batchID>:<action>:<application>`），
+  「继续」= 同名重跑、「重来」= 换一个批次号。三条不变量：**部署目标是声明的意图而不是
+  观测状态**（探测不通的机器必须仍出现在批次里，标成 `skipped`）；**汇总恒等式**
+  成功+失败+跳过+未执行=总数；**准备阶段先行**（任何一台部署之前完成全员检查），默认
+  不过就一台都不动（`BATCH_PREFLIGHT_FAILED` 36），跑完但有主机没成功是 `BATCH_FAILED` 37
+  ——两个码分开「什么都没发生」与「动了一部分」。`--hosts` 模式要求 manifest 按
+  `artifact.digest` 引用制品（`artifact.id` 只在某一台机上有意义）。
 - **远程（迭代 5a）默认是关的**：没有 `remote.listen` 就完全不听 TCP。开了之后是 mTLS
   （最低 TLS 1.2，为兼容 legacy 档 CentOS 7 的 openssl 1.0.2），**握手只验 CA、授权在
   HTTP 层**（默认拒绝的 CN 白名单 + `read`/`write` + 可选应用白名单）——这样
@@ -145,7 +156,8 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
   `2026-09-25-iteration-4.md` 是 Nginx 蓝绿的规格与验证记录（4a/4b/4c 均已实现并在
   **Linux 容器**里验证，见第 13–20 节；**legacy 档真机**上一整轮也跑通了，见第 21 节），
   `2026-09-27-iteration-5.md` 是远程/多主机的规格与验证记录
-  （**5a 已实现并验证，5b–5e 未开始**），
+  （**5a 与 5b 已实现**：5a = 远程连接与主机注册，5b = 部署目标与批量发布；5c–5e 未开始。
+  **5b 的「多主机上都真的换了版本」未验证**，理由见该文档 §16.3），
   `2026-09-24-future-iterations.md` 是**未来迭代目标的停放区**（GFS 保留策略 +
   迭代 0–2 沉淀下来的待定项；**不是规格**，开工前要先升级成迭代文档）。验收标准
   必须给出「命令 / 结果 / 证据类型」。**1d（重试与并发策略）已于 2026-09-24 实现并提交**；
@@ -160,7 +172,11 @@ SQL 迁移在仓库根 `migrations/`，由 `migrations` 包的 `go:embed` 导出
 - `make verify-linux` 的断言清单与断言数以 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的
   「`%d` 项通过，`%d` 项失败」（迭代 4c 落地后为 **232 项**，5a 的回归复跑同为 **232/0**）；
   不要引用静态推导值或历史快照当结论。
-- **不得把未验证项写成已验证**。迭代 5a 新增的未验证项：**跨物理主机**（全部远程断言都在
+- **不得把未验证项写成已验证**。迭代 5b 新增的未验证项：**批量发布「多台主机上都真的
+换了版本」**（容器里造不出来——systemd 的 unit 名字空间是机器级的，同一台机上两个 `opsd`
+实例部署同名应用写的是同一个 unit 文件，那里的「一台成功、一台失败」是测试装置的产物；
+e2e 只证明编排与协议接线那一半。补齐需要**两台真实主机**）、大规模并发与波次（没压过）、
+部分失败现场的人工处置流程。迭代 5a 新增的未验证项：**跨物理主机**（全部远程断言都在
   同一台机的两个 opsd 实例之间，真机上也**没加**远程段）、**证书的签发与轮换**（不做，
   运维用 openssl 手工来，CRL/OCSP 都没有）、**SELinux/防火墙对监听端口的影响**、
   **RBAC/审批/操作签名/审计导出**（5c）、**批量发布**（5b）。

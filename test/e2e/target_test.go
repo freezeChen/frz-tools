@@ -398,3 +398,55 @@ func TestBatchDeployVerifiesLocalArtifactDigest(t *testing.T) {
 		t.Fatalf("报错要说清是摘要对不上：%v", err)
 	}
 }
+
+// 批次号就是每台机上的幂等键：同名重跑**不重做**已经完成（或已经失败）的机器。
+//
+// 这个断言需要「目标机上真的建出了操作」，而那只在装配了 runtime 适配器的平台上成立
+// （非 Linux 上 deploy 在**创建期**就被 RUNTIME_UNSUPPORTED 拒掉，一条操作都不会有）。
+// 因此这里按平台分开表述，并把「为什么跳过」写清楚——一条被跳过的断言只有在理由
+// 具体时才不算装饰。
+func TestBatchRerunDoesNotRedoFinishedHosts(t *testing.T) {
+	f := newTargetFixture(t, 1, "orders-api")
+	digest := f.prepareTarget(t, "web-1", "orders-api", []byte("orders-v1"))
+	manifest := writeBatchManifest(t, f.dir, "batch.yaml", batchManifest("orders-api", digest))
+
+	args := func() []string {
+		return f.args("app", "deploy", "--app", "orders-api", "--file", manifest,
+			"--hosts", "web-1", "--batch", "batch_fixed_for_rerun", "--json")
+	}
+
+	first, _, _ := runOpsctlBinary(t, args()...)
+	var firstReport batchReport
+	if err := json.Unmarshal([]byte(first), &firstReport); err != nil {
+		t.Fatalf("decode report from %q: %v", first, err)
+	}
+	firstReport.assertCountsAddUp(t)
+
+	database := f.targets["web-1"].daemon.database
+	afterFirst := countOperations(t, database, v1.KindAppDeploy)
+	if afterFirst == 0 {
+		t.Skipf("这台机上没有 runtime 适配器（非 Linux），部署在创建期就被拒：" +
+			"「批次号即幂等键」由 internal/fleet 的单元测试覆盖")
+	}
+
+	// 记录下来第一次的键，第二次必须完全一样——否则「继续」会变成「重做」。
+	key := f.lastIdempotencyKey(t)
+	if key != "batch_fixed_for_rerun:deploy:orders-api" {
+		t.Fatalf("幂等键的拼法不对：%q", key)
+	}
+
+	second, _, _ := runOpsctlBinary(t, args()...)
+	var secondReport batchReport
+	if err := json.Unmarshal([]byte(second), &secondReport); err != nil {
+		t.Fatalf("decode report from %q: %v", second, err)
+	}
+	secondReport.assertCountsAddUp(t)
+
+	if afterSecond := countOperations(t, database, v1.KindAppDeploy); afterSecond != afterFirst {
+		t.Fatalf("同一个批次号重跑不该产生新操作：之前 %d 条，之后 %d 条", afterFirst, afterSecond)
+	}
+	// 两个批次的结论必须一致（含失败——失败的机器**不会**被自动重试）。
+	if firstReport.Failed != secondReport.Failed || firstReport.Succeeded != secondReport.Succeeded {
+		t.Fatalf("同名重跑改变了结论：%+v → %+v", firstReport, secondReport)
+	}
+}

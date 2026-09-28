@@ -605,3 +605,22 @@ func TestOpsdRefusesToStartWithWorldReadableKey(t *testing.T) {
 		t.Fatalf("应当是配置错误：%s", output)
 	}
 }
+
+// lastIdempotencyKey 读回最近一条 app.deploy 操作的幂等键。
+//
+// 直接查库而不是走 API：`operation get` 需要先知道操作 id，而这里要验的正是
+// 「批次号有没有被拼成那把键」。
+func (f *targetFixture) lastIdempotencyKey(t *testing.T) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+f.targets["web-1"].daemon.database)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	var key sql.NullString
+	if err := db.QueryRow(`SELECT idempotency_key FROM operations
+		WHERE kind = 'app.deploy' ORDER BY created_at DESC, id DESC LIMIT 1`).Scan(&key); err != nil {
+		t.Fatalf("read idempotency key: %v", err)
+	}
+	return key.String
+}
