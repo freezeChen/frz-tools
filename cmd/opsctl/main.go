@@ -87,6 +87,9 @@ func newRootCommand() *cobra.Command {
 		newConfigCommand(opts),
 	)
 	localizeBuiltinCommands(root)
+	// 放在 localizeBuiltinCommands 之后：cobra 自带的 help/completion 是在那一步才
+	// 被创建出来的，早于它的遍历会漏掉它们。
+	cliutil.RequireKnownSubcommand(root)
 	return root
 }
 
