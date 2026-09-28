@@ -225,6 +225,7 @@ func run(cmd *cobra.Command, _ []string) error {
 		Catalogs:  runtime.Catalogs,
 		Specs:     runtime.Specs,
 		Hosts:     runtime.Hosts,
+		Targets:   runtime.Targets,
 		Runtimes:  runtime.Runtimes,
 		Schedules: runtime.Schedules,
 		Backups:   runtime.Backups,

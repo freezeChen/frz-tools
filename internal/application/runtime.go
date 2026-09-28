@@ -60,6 +60,7 @@ type Runtime struct {
 	Catalogs  *CatalogService
 	Specs     *SpecService
 	Hosts     *HostService
+	Targets   *TargetService
 	Runtimes  *RuntimeService
 	Schedules *ScheduleService
 	Scheduler *Scheduler
@@ -115,6 +116,7 @@ func NewRuntime(opts Options) *Runtime {
 	catalogs := newCatalogService(opts.Repo, idGen, opts.Now)
 	specs := newSpecService(opts.Repo, opts.Now)
 	hosts := newHostService(opts.Repo, idGen, opts.Now)
+	targets := newTargetService(opts.Repo, opts.Now)
 
 	// 调度器是触发时刻的唯一权威；它与 worker 池共享唤醒通道，
 	// 计划发生变化时立刻重算等待时间，而不是等兜底周期。
@@ -132,6 +134,7 @@ func NewRuntime(opts Options) *Runtime {
 		Catalogs:  catalogs,
 		Specs:     specs,
 		Hosts:     hosts,
+		Targets:   targets,
 		Runtimes:  runtimes,
 		Schedules: schedules,
 		Backups:   backups,

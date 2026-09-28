@@ -8,7 +8,9 @@ import (
 
 	v1 "github.com/freezeChen/frz-tools/api/v1"
 	"github.com/freezeChen/frz-tools/internal/adapters/client"
+	"github.com/freezeChen/frz-tools/internal/adapters/manifest"
 	"github.com/freezeChen/frz-tools/internal/domain"
+	"github.com/freezeChen/frz-tools/internal/fleet"
 
 	"github.com/spf13/cobra"
 )
@@ -29,6 +31,9 @@ func newAppCommand(opts *rootOptions) *cobra.Command {
 		// 槽位的运营视图与切换时间线（迭代 4c）。挂在 app 下而不是独立命令：
 		// 槽位是**应用**的属性，脱离应用没有意义。
 		newAppSlotCommand(opts),
+		// 部署目标（迭代 5b）：一个应用**应该**跑在哪些主机上。同样挂在 app 下——
+		// 它是应用的属性，而「哪些机器」是它的取值范围。
+		newTargetCommand(opts),
 	)
 	return cmd
 }
@@ -247,18 +252,22 @@ func printLabels(labels map[string]string) {
 
 func newAppDeployCommand(opts *rootOptions) *cobra.Command {
 	flags := &actionFlags{}
+	batch := &batchFlags{}
 	var (
 		app  string
 		file string
 	)
 
 	cmd := &cobra.Command{
-		Use:   "deploy --app <name> --file <manifest.yaml>",
+		Use:   "deploy --app <name> --file <manifest.yaml> [--to <主机...>]",
 		Short: "部署一个版本：物化制品、准备运行时、切换并启动",
 		Long: "把 manifest 里声明的制品解成一个带版本的 release 目录，然后切换 current 指针、" +
 			"启动并等就绪。**健康通过才算部署成功**；任何一步失败都会把上一个稳定版本放回去，" +
 			"并以 DEPLOY_ROLLED_BACK（退出码 29）收场。\n\n" +
-			"同一版本重复部署是幂等的：它已经是当前版本时什么都不做。",
+			"同一版本重复部署是幂等的：它已经是当前版本时什么都不做。\n\n" +
+			"给了 --to 就是**批量部署**：同一个版本按批次推到多台主机上。批量模式下 manifest " +
+			"必须按 artifact.digest 引用制品（art_xxx 只在某一台机上有效），而且**先全员准备、" +
+			"再开始第一批**——任何一台连不上、没登记这个应用或缺制品时，一台都不会动。",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if app == "" || file == "" {
@@ -267,6 +276,9 @@ func newAppDeployCommand(opts *rootOptions) *cobra.Command {
 			raw, err := os.ReadFile(file)
 			if err != nil {
 				return domain.NewError(v1.CodeInvalidRequest, "无法读取 manifest %q：%v", file, err)
+			}
+			if batch.enabled() {
+				return startDeployBatch(cmd, opts, app, raw, flags, batch)
 			}
 			in, err := flags.input(cmd)
 			if err != nil {
@@ -283,25 +295,80 @@ func newAppDeployCommand(opts *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&app, "app", "", "应用名称或 ID（必填）")
 	cmd.Flags().StringVar(&file, "file", "", "应用 manifest 文件路径（必填）")
 	flags.bind(cmd)
+	batch.bind(cmd)
 	return cmd
+}
+
+// startDeployBatch 是批量部署在提交任何东西之前的那一段。
+//
+// 它拦下两类会在多台机上放大后果的错误：manifest 用 art_xxx 引用制品（那个 ID 只在
+// 某一台机上有意义），以及本地制品文件与 manifest 里的摘要对不上（否则五台机都会
+// 装上错的制品，而每台机上的部署都会成功——它们的校验对着的是自己刚收到的那份字节）。
+func startDeployBatch(cmd *cobra.Command, opts *rootOptions, app string, raw []byte, flags *actionFlags, batch *batchFlags) error {
+	if err := rejectIncompatibleBatchFlags(cmd, flags); err != nil {
+		return err
+	}
+
+	spec, err := manifest.Parse(raw)
+	if err != nil {
+		return err
+	}
+	digest := strings.TrimSpace(spec.Artifact.Digest)
+	if digest == "" {
+		return domain.NewError(v1.CodeInvalidRequest,
+			"--to 模式下 manifest 必须按 artifact.digest 引用制品，不能写 artifact.id："+
+				"art_xxx 是某一台机上的那一行，换一台机要么找不到、要么指向别的东西；"+
+				"而 digest 是内容寻址的，在每台机上指同一份字节")
+	}
+
+	artifactPath := batch.artifact
+	if artifactPath != "" {
+		if err := verifyLocalArtifact(artifactPath, digest); err != nil {
+			return err
+		}
+	}
+
+	return runBatch(cmd.Context(), opts, batch, fleet.Request{
+		Action:       fleet.ActionDeploy,
+		Application:  app,
+		Manifest:     string(raw),
+		Digest:       digest,
+		ArtifactPath: artifactPath,
+		CreatedBy:    flags.createdBy,
+	})
 }
 
 func newAppRollbackCommand(opts *rootOptions) *cobra.Command {
 	flags := &actionFlags{}
+	batch := &batchFlags{}
 	var (
 		app string
 		to  string
 	)
 
 	cmd := &cobra.Command{
-		Use:   "rollback --app <name> [--to <version>]",
+		Use:   "rollback --app <name> [--to <version>] [--hosts <主机...>]",
 		Short: "回滚到上一个（或指定的）版本",
 		Long: "回滚**连配置一起回滚**：每个 release 都记着它当时那份 manifest，回滚时用的是它，\n" +
-			"不会出现「旧二进制配新配置」的混合体。不带 --to 时回到上一个曾经激活过的版本。",
+			"不会出现「旧二进制配新配置」的混合体。不带 --to 时回到上一个曾经激活过的版本。\n\n" +
+			"给了 --hosts 就是**批量回滚**，与批量部署共用同一套批次、准备与汇总逻辑。" +
+			"批量目标刻意不叫 --to：那个旗标在回滚上已经是「回到哪个版本」，一个旗标两种含义\n" +
+			"会让 `--to 1.0.0` 与 `--to web-1` 长得一模一样，而它们要做的事完全不同。",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if app == "" {
 				return domain.NewError(v1.CodeInvalidRequest, "必须给出 --app")
+			}
+			if batch.enabled() {
+				if err := rejectIncompatibleBatchFlags(cmd, flags); err != nil {
+					return err
+				}
+				return runBatch(cmd.Context(), opts, batch, fleet.Request{
+					Action:      fleet.ActionRollback,
+					Application: app,
+					Version:     to,
+					CreatedBy:   flags.createdBy,
+				})
 			}
 			in, err := flags.input(cmd)
 			if err != nil {
@@ -318,6 +385,7 @@ func newAppRollbackCommand(opts *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&app, "app", "", "应用名称或 ID（必填）")
 	cmd.Flags().StringVar(&to, "to", "", "回滚到哪个版本（省略则回到上一个曾经激活过的版本）")
 	flags.bind(cmd)
+	batch.bind(cmd)
 	return cmd
 }
 

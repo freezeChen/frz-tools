@@ -85,6 +85,19 @@ const (
 	// CodeRemoteForbidden 是**身份认出来了，但这件事不归它做**：CN 不在 clients
 	// 名单里、档位不够，或者超出了它的应用白名单。
 	CodeRemoteForbidden ErrorCode = "REMOTE_FORBIDDEN"
+
+	// 批量发布（迭代 5b）。这两个码由 **opsctl** 产生，不会出现在 HTTP 响应里——
+	// 批次是客户端侧的编排，服务端只看见一台机上一次独立的部署。放在 api/v1 是因为
+	// 退出码映射表在这里，而运维与脚本消费的正是退出码。
+	//
+	// CodeBatchPreflightFailed 是**准备阶段没过，一台都没动**：某台机不可达、没登记这个
+	// 应用，或缺这个制品。它与 BATCH_FAILED 刻意分开——那个码回答「去哪几台看现场」，
+	// 这个码回答「去改什么输入」，两者要做的事完全不同。
+	CodeBatchPreflightFailed ErrorCode = "BATCH_PREFLIGHT_FAILED"
+	// CodeBatchFailed 是**批次跑完了，但有主机没成功**：线上处于混合版本，需要人工
+	// 看一眼哪些机器在哪一侧。刻意不复用单台的失败码（DEPLOY_ROLLED_BACK 等）：那些
+	// 说的是「那一台怎么了」，这个说的是「这一批没有全成功」。
+	CodeBatchFailed ErrorCode = "BATCH_FAILED"
 )
 
 var httpStatusByCode = map[ErrorCode]int{
@@ -189,6 +202,8 @@ var exitCodeByCode = map[ErrorCode]int{
 	CodeHostUnreachable:          33,
 	CodeHostTLSFailed:            34,
 	CodeRemoteForbidden:          35,
+	CodeBatchPreflightFailed:     36,
+	CodeBatchFailed:              37,
 }
 
 func ExitCode(code ErrorCode) int {

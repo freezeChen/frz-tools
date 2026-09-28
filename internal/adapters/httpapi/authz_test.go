@@ -84,6 +84,8 @@ func newAuthzFixture(t *testing.T, identities RemoteIdentityLookup) *authzFixtur
 			Service:          runtime.Service,
 			Catalogs:         runtime.Catalogs,
 			Specs:            runtime.Specs,
+			Hosts:            runtime.Hosts,
+			Targets:          runtime.Targets,
 			Backups:          runtime.Backups,
 			Store:            store,
 			Workers:          1,
@@ -436,5 +438,40 @@ func TestUnknownRouteIsNotReportedAsWiringError(t *testing.T) {
 	recorder = withIdentities.callRemote(t, "opsctl-central", http.MethodGet, "/api/v1/operations", "")
 	if recorder.Code == http.StatusInternalServerError {
 		t.Fatalf("方法不对不该报成 500：%s", recorder.Body.String())
+	}
+}
+
+// 部署目标也是「针对某个应用」的端点，因此同样受应用白名单约束。
+//
+// 一条 PUT /targets/{app} 改的是**这个应用该发到哪些机器**，它比一次部署影响更大：
+// 一次部署只动一台机上的一个版本，而改目标会改变以后每一次批量发布的范围。
+func TestApplicationAllowlistCoversTargets(t *testing.T) {
+	f := newAuthzFixture(t, staticIdentities{
+		"opsctl-central": {
+			CN:           "opsctl-central",
+			Scope:        domain.ScopeWrite,
+			Applications: []string{"orders-api"},
+		},
+	})
+
+	inList := f.callRemote(t, "opsctl-central", http.MethodPut,
+		"/api/v1/targets/orders-api", `{"hosts":["local"]}`)
+	if inList.Code == http.StatusForbidden {
+		t.Fatalf("orders-api 在名单里，不该被授权拒掉：%s", inList.Body.String())
+	}
+
+	outList := f.callRemote(t, "opsctl-central", http.MethodPut,
+		"/api/v1/targets/billing-api", `{"hosts":["local"]}`)
+	if outList.Code != http.StatusForbidden {
+		t.Fatalf("名单外的应用应当被拒，得到 %d %s", outList.Code, outList.Body.String())
+	}
+	if decoded := decodeErrorResponse(t, outList); decoded.Code != v1.CodeRemoteForbidden {
+		t.Fatalf("want REMOTE_FORBIDDEN，得到 %s", decoded.Code)
+	}
+
+	// 列出全部目标是一次跨应用的读：与其它跨应用的读一样，只受档位约束。
+	all := f.callRemote(t, "opsctl-central", http.MethodGet, "/api/v1/targets", "")
+	if all.Code == http.StatusForbidden {
+		t.Fatalf("跨应用的读不该被应用白名单拒掉：%s", all.Body.String())
 	}
 }

@@ -105,6 +105,16 @@ type Repository interface {
 	CreateHost(ctx context.Context, host *domain.Host) error
 	GetHost(ctx context.Context, ref string) (*domain.Host, error)
 	ListHosts(ctx context.Context) ([]domain.Host, error)
+
+	// 部署目标（迭代 5b）：一个应用**应该**跑在哪些主机上。按应用名索引而不是
+	// 外键关联本机的 applications 表——登记目标的这台机器上可能根本没有这个应用。
+	//
+	// Replace 是**替换**语义（同一事务内先删后插）：它表达「现在应该在哪几台」，
+	// 不是「历史上曾经在哪几台」。任一主机名不存在时返回 HOST_NOT_FOUND 且
+	// **什么都不改**——写进去一半比不写更糟。
+	ReplaceApplicationTargets(ctx context.Context, application string, hostNames []string, now time.Time) error
+	ListApplicationTargets(ctx context.Context, application string) ([]string, error)
+	ListAllApplicationTargets(ctx context.Context) ([]domain.ApplicationTargets, error)
 	FindLocalHost(ctx context.Context) (*domain.Host, error)
 
 	CreateEnvironment(ctx context.Context, environment *domain.Environment) error

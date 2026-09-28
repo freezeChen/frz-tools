@@ -31,6 +31,7 @@ type Dependencies struct {
 	Catalogs  *application.CatalogService
 	Specs     *application.SpecService
 	Hosts     *application.HostService
+	Targets   *application.TargetService
 	Runtimes  *application.RuntimeService
 	Schedules *application.ScheduleService
 	Backups   *application.BackupService
@@ -111,6 +112,13 @@ func (s *Server) routes() []route {
 		{"POST /api/v1/applications/{id}/rollback", accessWrite, s.handleRollbackApplication},
 		{"POST /api/v1/releases", accessWrite, s.handleCreateRelease},
 		{"GET /api/v1/releases/{id}", accessRead, s.handleGetRelease},
+
+		// 部署目标（迭代 5b）。`/targets` 是顶层集合而不是挂在某个应用下：
+		// 这里的 {application} 是**跨主机一致的应用名**，而登记目标的这台机器上
+		// 可能根本没有这个应用（它跑在别处），因此不能外键关联本机的 applications。
+		{"GET /api/v1/targets", accessRead, s.handleListTargets},
+		{"PUT /api/v1/targets/{application}", accessWrite, s.handleSetTargets},
+		{"GET /api/v1/targets/{application}", accessRead, s.handleGetTargets},
 
 		{"GET /api/v1/hosts", accessRead, s.handleListHosts},
 		{"POST /api/v1/hosts", accessWrite, s.handleCreateHost},

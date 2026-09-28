@@ -121,9 +121,13 @@ const (
 	applicationRoutePrefix = "/api/v1/applications/{id}"
 	// applicationRouteRoot 是同一批端点在真实路径上的前缀。
 	applicationRouteRoot = "/api/v1/applications/"
+	// targetsRoutePrefix 下的 {application} **就是应用名**（迭代 5b），不需要再解析。
+	// 注册表的键是跨主机一致的名字，而不是本机 applications 表里的那一行。
+	targetsRoutePrefix = "/api/v1/targets/{application}"
+	targetsRouteRoot   = "/api/v1/targets/"
 )
 
-// applicationRef 从请求里取出应用引用。
+// applicationRef 从请求里取出应用引用，并说明它是不是已经是一个**名字**。
 //
 // **不能**用 r.PathValue("id")：路径参数是 ServeMux 在派发时填进去的，而中间件跑在
 // 它之前。这里曾经就是这么写的，而结果是白名单**一次都没生效过**（取到空串就放行了），
@@ -132,12 +136,24 @@ const (
 // 也不能直接拿 pattern 去比前缀：mux.Handler 返回的 pattern **带方法**（例如
 // `GET /api/v1/applications/{id}`）。所以先剥掉方法，再按已知形状取真实路径里的那一段。
 // pattern 仍然是 mux 自己解析出来的（不是我们猜的），「哪条路由」这一半是准的。
-func applicationRef(r *http.Request, pattern string) string {
-	if !strings.HasPrefix(patternPath(pattern), applicationRoutePrefix) {
-		return ""
+func applicationRef(r *http.Request, pattern string) (ref string, isName bool) {
+	path := patternPath(pattern)
+
+	// /api/v1/targets/{application}：路径上那一段就是应用名，不需要查库。
+	if strings.HasPrefix(path, targetsRoutePrefix) {
+		return pathSegment(r.URL.Path, targetsRouteRoot), true
 	}
-	rest := strings.TrimPrefix(r.URL.Path, applicationRouteRoot)
-	if rest == r.URL.Path {
+	if !strings.HasPrefix(path, applicationRoutePrefix) {
+		return "", false
+	}
+	// /api/v1/applications/{id}：这里可能是名字、也可能是不透明 ID，要查一次才知道。
+	return pathSegment(r.URL.Path, applicationRouteRoot), false
+}
+
+// pathSegment 取 root 之后的第一段路径。取不到时返回空串。
+func pathSegment(path, root string) string {
+	rest := strings.TrimPrefix(path, root)
+	if rest == path {
 		return ""
 	}
 	if i := strings.IndexByte(rest, '/'); i >= 0 {
@@ -157,19 +173,29 @@ func patternPath(pattern string) string {
 // checkApplicationScope 判定这个身份能不能碰这次请求指向的应用。
 //
 // 只有在身份带应用白名单时才查——绝大多数身份（以及本机的所有请求）没有白名单，
-// 这里一次数据库读都不做。
+// 这里一次数据库读都不做（`/targets/{application}` 那条更是连读都不用）。
 //
 // 它覆盖不了 `POST /api/v1/operations`：那条路的应用来自请求体里的 resource，
 // 在 HTTP 层看不出来。那一半在 application.Service.Create 里判——那是创建操作的
-// **唯一**入口，因此没有第二条旁路。
+// **唯一**入口，因此没有第二条旁路。`GET /api/v1/targets`（全部应用）同理覆盖不了，
+// 它是跨应用的读，与其它跨应用的读一样只受档位约束。
 func (s *Server) checkApplicationScope(r *http.Request, pattern string, principal domain.Principal) error {
 	if len(principal.Applications) == 0 {
 		return nil
 	}
-	ref := applicationRef(r, pattern)
+	ref, isName := applicationRef(r, pattern)
 	if ref == "" {
 		return nil
 	}
+	if isName {
+		// 已经是应用名，直接比——不必为了一次授权判断去查一次库。
+		if !principal.AllowsApplication(ref) {
+			return domain.RemoteForbidden(
+				"身份 %q 的白名单里没有应用 %q", principalLabel(principal), ref)
+		}
+		return nil
+	}
+
 	if s.deps.Catalogs == nil {
 		return domain.NewError(v1.CodeInternal, "应用目录服务未配置")
 	}
