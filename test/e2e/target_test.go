@@ -450,3 +450,55 @@ func TestBatchRerunDoesNotRedoFinishedHosts(t *testing.T) {
 		t.Fatalf("同名重跑改变了结论：%+v → %+v", firstReport, secondReport)
 	}
 }
+
+// 批量回滚走同一套批次机制，而且 **`--to` 仍然是「回到哪个版本」、`--hosts` 才是目标**。
+//
+// 这条断言刻意用一个**在这几台机上都不存在的版本**：准备阶段会因此把它们标成 skipped
+// （退出码 36），而这件事**在任何平台上都一样**——它不依赖「这台机上部署会不会成功」，
+// 因此不会退化成「断言平台的脾气」。要验的正是那个旗标语义：如果 `--to` 被当成了目标名单，
+// 报出来的会是「没有这台主机」，而不是「没有这个版本」。
+func TestBatchRollbackKeepsToAsVersion(t *testing.T) {
+	f := newTargetFixture(t, 2, "orders-api")
+	f.prepareTarget(t, "web-1", "orders-api", []byte("orders-v1"))
+	f.prepareTarget(t, "web-2", "orders-api", []byte("orders-v1"))
+
+	// 目标来自登记的注册表（`@应用名`），顺带验批量回滚也能用登记好的目标。
+	if _, _, err := runOpsctl(t, f.coord.socket, "app", "target", "set",
+		"--app", "orders-api", "--hosts", "web-1,web-2"); err != nil {
+		t.Fatalf("target set: %v", err)
+	}
+
+	before := countOperations(t, f.targets["web-1"].daemon.database, v1.KindAppRollback)
+
+	stdout, code, err := runOpsctlBinary(t, f.args("app", "rollback",
+		"--app", "orders-api", "--to", "v9.9.9", "--hosts", "@orders-api", "--json")...)
+	if code != 36 {
+		t.Fatalf("want exit 36 (BATCH_PREFLIGHT_FAILED), got %d：%s %v", code, stdout, err)
+	}
+
+	var report batchReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("decode report from %q: %v", stdout, err)
+	}
+	report.assertCountsAddUp(t)
+	if report.Action != "rollback" {
+		t.Fatalf("报告里的动作应当是 rollback，得到 %q", report.Action)
+	}
+	if len(report.Results) != 2 {
+		t.Fatalf("注册表里有两台，回滚的批次里就该有两台，得到 %d：%+v", len(report.Results), report.Results)
+	}
+	for _, result := range report.Results {
+		if result.Status != "skipped" {
+			t.Fatalf("%s 应当是 skipped（版本不存在），得到 %q", result.Host, result.Status)
+		}
+		// 原因必须指向**那个版本**。指向主机名就说明 `--to` 被当成了目标名单。
+		if !strings.Contains(result.Detail, "v9.9.9") {
+			t.Fatalf("%s 的跳过原因应当提到那个版本：%q", result.Host, result.Detail)
+		}
+	}
+
+	// 准备阶段没过 → 这台机上一个回滚操作都没有。
+	if after := countOperations(t, f.targets["web-1"].daemon.database, v1.KindAppRollback); after != before {
+		t.Fatalf("准备阶段没过时不该提交任何回滚：之前 %d 条，之后 %d 条", before, after)
+	}
+}
