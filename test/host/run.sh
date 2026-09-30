@@ -9,6 +9,16 @@
 #   FRZ_HOST_JAVA_HOME=/opt/jdk-17.0.20.1+1 bash test/host/run.sh   # 主机的 JDK 不在默认路径时
 #                                               （FRZ_PROBE_PORT / FRZ_DEPLOY_PORT / FRZ_JAVA_PORT 同理）
 #
+# **两台模式（迭代 6d 批量段）**：设置 FRZ_HOST2=<ssh 目标> 时，主主机（FRZ_HOST）作为
+# 控制点把第二台也登记进批次，验证「多台主机上都真的换了版本」的组合。要点：
+#   - **控制点必须能免密 ssh 到第二台**（BatchMode）——第二台的装配、逐台盘面断言、
+#     失败注入与收尾都从主主机经 ssh 过去（批次本身走 mTLS，不经 ssh）。这是 harness
+#     的环境前提；没有第二台时不设 FRZ_HOST2，单台部分的断言照跑、两台专属的逐条 skip。
+#   - FRZ_HOST2_ADDR：控制点连第二台的 mTLS 地址（host 部分），默认取 FRZ_HOST2 里
+#     ssh 目标的主机部分；两台机内网外网地址不同时用它显式给。
+#   - FRZ_FLEET_PORT / FRZ_FLEET_PORT2 / FRZ_FLEET_APP_PORT：两台 opsd 的远程监听端口
+#     （默认 28590/28591）与批量应用的探针端口（默认 28586），与既有夹具端口不重叠。
+#
 # 它做三件事：交叉编译 linux/amd64 的两个二进制与探针 → 上传到主机 →
 # 在主机上以 root 执行断言脚本（脚本经 stdin 送入，因此它结尾把自己所在的目录删掉
 # 也不会影响正在执行的自己）。
@@ -27,7 +37,10 @@
 # 主机上会创建并**在结束时删除**：系统用户/组 frz-ops 与 frz-probe、
 # /etc/opsd、/var/lib/opsd、/var/log/opsd、/run/opsd、/opt/frz-ops、/opt/opsd（release
 # 目录树）、/var/lib/frz-probe、/var/log/frz-probe、以及 unit 文件；迭代 3 又加了三个
-# 夹具应用（frz-dep / frz-java / frz-javabad）与它们的用户、unit、目录。
+# 夹具应用（frz-dep / frz-java / frz-javabad）与它们的用户、unit、目录；迭代 6d 再加
+# 批量应用 frz-fleet、证书目录 /etc/opsd/pki 与 $FRZ_HOST_DIR/pki（CA 与两台的服务端、
+# 控制点的客户端证书，全部是本轮现做的）；两台模式下第二台上的对应物由主主机的收尾
+# 经 ssh 调第二台的 fleet2-cleanup 阶段删掉。
 # 这是生产机，跑完就走比留现场重要。
 #
 # **在那台主机上排查时不要用 `pkill` / `killall` 这类宽匹配的杀进程方式**：它上面跑着
@@ -70,6 +83,9 @@ cp "$REPO_ROOT/test/host/opsd.host.verify.yaml" "$WORK_DIR/"
 # Java 探针的源码跟着上传，**由主机上的真 JDK 编译打包**：那一档要证明的正是
 # 「真 JVM 能跑」，在开发机上交叉编译一个 jar 反而绕开了要验的东西。
 cp "$REPO_ROOT/test/host/JavaProbe.java" "$WORK_DIR/"
+# 断言脚本本体也进包：两台模式下主主机要把它经 ssh 再送到第二台（fleet2-* 阶段
+# 与主主机跑的是同一份脚本，见 verify.sh 头部的两台模式分工）。
+cp "$REPO_ROOT/test/host/verify.sh" "$WORK_DIR/"
 
 # kind=file 凭据的源：多行、含反斜杠与引号、**不以换行结尾**——与容器 harness 同一份
 # 内容，这样两个 harness 在这条断言上比的是同一件事。
@@ -91,6 +107,9 @@ ssh -o BatchMode=yes "$FRZ_HOST" \
   FRZ_HOST_MYSQL_DSN="${FRZ_HOST_MYSQL_DSN:-}" FRZ_HOST_PHASE="${FRZ_HOST_PHASE:-full}" \
   FRZ_HOST_JAVA_HOME="${FRZ_HOST_JAVA_HOME:-}" FRZ_DEPLOY_PORT="${FRZ_DEPLOY_PORT:-}" \
   FRZ_JAVA_PORT="${FRZ_JAVA_PORT:-}" \
+  FRZ_HOST2="${FRZ_HOST2:-}" FRZ_HOST2_ADDR="${FRZ_HOST2_ADDR:-}" \
+  FRZ_FLEET_PORT="${FRZ_FLEET_PORT:-}" FRZ_FLEET_PORT2="${FRZ_FLEET_PORT2:-}" \
+  FRZ_FLEET_APP_PORT="${FRZ_FLEET_APP_PORT:-}" \
   bash -s < "$REPO_ROOT/test/host/verify.sh"
 status=$?
 set -e

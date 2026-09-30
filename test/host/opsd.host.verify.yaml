@@ -58,5 +58,21 @@ secrets:
   allowedFileDirectories:
     - /etc/opsd/secrets
 
+# 远程监听（迭代 6d 批量段）：控制点（同一台主机上的 opsctl）经真 TCP + mTLS 打这个
+# 端口，把本机登记为批量目标后走一次 app deploy --hosts。证书由 verify.sh 的 provision
+# 在启动 opsd **之前**生成（真机上没有现成 CA，而本工具只消费证书、不签发，见迭代 5
+# 文档 D10）；私钥模式不宽于 0600 且属主必须是运行用户，否则启动即失败。
+# 端口默认 28590，可被 FRZ_FLEET_PORT 覆盖（provision 会重写这一行）。
+# clients 是默认拒绝的白名单：CN 不在名单里一律拒绝；服务端证书的 SAN 必须包含
+# 客户端用来连它的那个名字（这里是 127.0.0.1）。
+remote:
+  listen: "127.0.0.1:28590"
+  certFile: /etc/opsd/pki/opsd-server.crt
+  keyFile: /etc/opsd/pki/opsd-server.key
+  clientCAFile: /etc/opsd/pki/ca.crt
+  clients:
+    - cn: opsctl-verify
+      scope: write
+
 sudo:
   allowedCommands: []

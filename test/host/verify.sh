@@ -19,7 +19,16 @@
 #   · 迭代 3c：用主机上真实的 JDK 跑一个真实的 JAR，并断言资源限制在 systemd 与
 #     内核两侧都是声明的那个值；
 #   · 迭代 4：发行版的包装出来的 nginx（不是容器里那个）+ 真真切流，以及 opsd **作为
-#     服务**重启之后的对账。
+#     服务**重启之后的对账；
+#   · 迭代 6d：批量发布的组合证据——控制点（同一台主机上的 opsctl）经**真 TCP + mTLS**
+#     打本机 opsd 的远程端口，把本机登记为批量目标后走一次完整的 app deploy --hosts。
+#     设置 FRZ_HOST2 时第二台主机也进批次（两台专属用例；需要本机能免密 ssh 到第二台）。
+#
+# **两台模式（FRZ_HOST2）的分工**：主主机（FRZ_HOST）是控制点，也是编排者——它用
+# openssl 生成 CA 与两台的服务端证书、把第二台的夹具推过去、驱动批次、并在批次之后
+# **ssh 到第二台上**断言盘面事实（三处互证）。因此两台模式要求控制点能免密 ssh 到
+# 第二台（BatchMode）；这是 harness 的环境前提，不是产品的。单台模式不碰第二台，
+# 既有断言的路径与结果不受影响。
 #
 # 刻意**不**重复容器 harness 的哪些断言，以及为什么（避免两套断言各自漂移）：
 #   · 「以非 root 用户运行 opsd」那一组（socket ACL、非授权可执行文件被拒、计划与
@@ -36,7 +45,8 @@
 #   cleanup      只做收尾（跑到一半被打断时用）
 #
 # 结束时会把本轮创建的一切**删干净**（用户、组、unit、目录），并逐项报告；
-# 设置 FRZ_HOST_KEEP=1 可以保留现场用于排查。
+# 设置 FRZ_HOST_KEEP=1 可以保留现场用于排查。两台模式下第二台上由批量段创建的
+# 东西也会一并清理（主主机的收尾经 ssh 调第二台的 fleet2-cleanup 阶段）。
 
 set -euo pipefail
 
@@ -83,10 +93,39 @@ BG_GREEN_PORT=${FRZ_BG_GREEN_PORT:-28585}
 BG_MANAGED=/etc/nginx/frz-managed/${BG_APP}.conf
 BG_INCLUDE=/etc/nginx/conf.d/frz-managed.conf
 
-# 迭代 3/4 的夹具应用：清理与前置检查都按这张表走，免得新增一个就漏一处。
+# 迭代 6d 的批量段夹具：控制点经 mTLS 打 opsd 的远程端口，把本机（与设置 FRZ_HOST2
+# 时的第二台主机）登记为批量目标后走 app deploy --hosts。端口继续沿 2858x/2859x
+# 排布，与前面所有夹具不重叠：28586 是批量应用的探针端口，28590/28591 分别是
+# 主主机与第二台 opsd 的远程监听端口。
+FLEET_APP=frz-fleet
+FLEET_UNIT=${FLEET_APP}.service
+FLEET_APP_PORT=${FRZ_FLEET_APP_PORT:-28586}
+FLEET_PORT_REMOTE=${FRZ_FLEET_PORT:-28590}
+FLEET_PORT2=${FRZ_FLEET_PORT2:-28591}
+FLEET_VERSION_A=1.0.0
+FLEET_VERSION_B=2.0.0
+# 控制点的客户端证书 CN——它写在两台 opsd 的 remote.clients 白名单里（scope: write）。
+FLEET_CLIENT_CN=opsctl-verify
+# 证书与私钥的生成目录（harness 夹具，随 $FRZ_HOST_DIR 删除）。服务端三件套会另外
+# 装进 /etc/opsd/pki（配置文件里写的是那边），随 /etc/opsd 删除。
+FLEET_PKI_SRC="$FRZ_HOST_DIR/pki"
+# 两台专属：第二台主机的 ssh 目标与 mTLS 连接地址。地址默认取 ssh 目标里的主机部分
+# （root@IP → IP）；两台机内网外网地址不同时用 FRZ_HOST2_ADDR 显式给。
+FRZ_HOST2=${FRZ_HOST2:-}
+FRZ_HOST2_ADDR=${FRZ_HOST2_ADDR:-}
+if [ -n "$FRZ_HOST2" ] && [ -z "$FRZ_HOST2_ADDR" ]; then
+  FRZ_HOST2_ADDR=${FRZ_HOST2##*@}
+  FRZ_HOST2_ADDR=${FRZ_HOST2_ADDR%%:*}
+fi
+# 第二台上的 harness 夹具目录（另一台机器，路径可以与主主机相同）。
+FLEET2_DIR=${FRZ_HOST2_DIR:-$FRZ_HOST_DIR}
+# 第二台是否已被本轮装配过（决定收尾要不要去清它）。
+FLEET2_PROVISIONED=0
+
+# 迭代 3/4/6d 的夹具应用：清理与前置检查都按这张表走，免得新增一个就漏一处。
 # 蓝绿应用的两个 unit 是**派生**名字（`<app>-<slot>.service`），不在这一列里，由 cleanup
 # 单独按槽位删。
-HOST_APPS=("$DEPLOY_APP" "$JAVA_APP" "$JAVA_BAD_APP" "$BG_APP")
+HOST_APPS=("$DEPLOY_APP" "$JAVA_APP" "$JAVA_BAD_APP" "$BG_APP" "$FLEET_APP")
 
 START_OP_ID=""
 # 蓝绿那一段的回车：操作 id，以及「nginx 是不是我们起的」（收尾要还原成借之前的样子）。
@@ -266,6 +305,26 @@ wait_for_ready() { # 就绪要求连续通过 consecutiveSuccesses 次，第一�
   return 1
 }
 
+# ==== 两台模式的编排放大器 ====
+#
+# 主主机（控制点）对第二台的全部动作——推夹具、装配、查盘面、停/起 opsd、收尾——
+# 都从这两条函数走。BatchMode 是硬的：交互式输密码会把断言卡死在半路。
+fleet2_ssh() { ssh -o BatchMode=yes "$@"; }
+
+# fleet2_cleanup_best_effort 清掉第二台上由批量段创建的东西。失败**不中断**：
+# 收尾删不掉比中断更糟的道理与 remove_path 相同，差别只是它在另一台机上，
+# 连重试都要操作员自己来——所以把手工命令原样打出来。
+fleet2_cleanup_best_effort() {
+  if ! fleet2_ssh -o ConnectTimeout=10 env FRZ_HOST_DIR="$FLEET2_DIR" \
+      FRZ_HOST_KEEP="${FRZ_HOST_KEEP:-0}" FRZ_HOST_PHASE=fleet2-cleanup \
+      bash -s < "$FRZ_HOST_DIR/verify.sh" 2>/dev/null; then
+    printf '收尾：第二台主机（%s）清理失败。请手工执行：\n' "$FRZ_HOST2" >&2
+    printf '  ssh %s "env FRZ_HOST_DIR=%s FRZ_HOST_PHASE=fleet2-cleanup bash -s" < test/host/verify.sh\n' \
+      "$FRZ_HOST2" "$FLEET2_DIR" >&2
+  fi
+  FLEET2_PROVISIONED=0
+}
+
 # ==== 收尾 ====
 # 一律执行，并报告删了什么。这是生产机，「跑完就走」比「留着现场」重要得多。
 #
@@ -337,6 +396,15 @@ cleanup() {
   # RuntimeAdapter 的 Prepare 与 ReleaseAdapter 的物化共同建出来，因此也必须由这里删掉
   # ——生产机上留一棵没人认领的目录树是最不该发生的事。cleanup 敢直接 rm 是因为
   # check_preconditions 已经断言过它本轮之前不存在。
+  # 迭代 6d：批量段在**第二台主机**上创建的东西（若本轮真的装配过它）也一并清理。
+  # 必须在本机删除 $FRZ_HOST_DIR 之前做——fleet2-cleanup 的脚本正文正从那里经 stdin
+  # 送过去。失败不中断（见 fleet2_cleanup_best_effort），前置失败路径早已提前返回，
+  # 不会走到这里。
+  if [ "$FLEET2_PROVISIONED" = "1" ]; then
+    printf '收尾：第二台主机（%s）上的批量段夹具也一并清理\n' "$FRZ_HOST2"
+    fleet2_cleanup_best_effort
+  fi
+
   for path in /etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops /opt/opsd \
     "/var/lib/$RUNTIME_APP" "/var/log/$RUNTIME_APP" "/var/lib/${RUNTIME_APP}-extra" "/usr/local/$MS_DIR" \
     "$FRZ_HOST_DIR"; do
@@ -351,6 +419,8 @@ cleanup() {
     "${HOST_APPS[*]}"
   printf '        迭代 4 另加：两个槽位 unit %s-{blue,green}.service、nginx 受管配置 %s、\n' "$BG_APP" "$BG_MANAGED"
   printf '        以及我们往主配置里加的那一行 include %s（nginx 装了但没在跑时一并停掉）\n' "$BG_INCLUDE"
+  printf '        迭代 6d 另加：批量应用 %s 的用户与 unit 与目录（上面那张表已含）、\n' "$FLEET_APP"
+  printf '        证书目录 /etc/opsd/pki（随 /etc/opsd）与 %s/pki（随夹具目录）\n' "$FRZ_HOST_DIR"
 }
 
 # ==== 环境事实 ====
@@ -381,10 +451,11 @@ check_preconditions() {
   done
   [ "$dirty" -eq 0 ] && pass "本轮涉及的用户与目录此时都不存在"
 
-  for port in "$RUNTIME_PORT" "$DEPLOY_PORT" "$JAVA_PORT" "$BG_VPORT" "$BG_BLUE_PORT" "$BG_GREEN_PORT"; do
+  for port in "$RUNTIME_PORT" "$DEPLOY_PORT" "$JAVA_PORT" "$BG_VPORT" "$BG_BLUE_PORT" "$BG_GREEN_PORT" \
+    "$FLEET_APP_PORT" "$FLEET_PORT_REMOTE"; do
     ss -lntH "sport = :$port" 2>/dev/null | grep -q . && { fail "端口 $port 已被占用"; dirty=1; }
   done
-  [ "$dirty" -eq 0 ] && pass "夹具端口都空闲（$RUNTIME_PORT / $DEPLOY_PORT / $JAVA_PORT / $BG_VPORT / $BG_BLUE_PORT / $BG_GREEN_PORT）"
+  [ "$dirty" -eq 0 ] && pass "夹具端口都空闲（$RUNTIME_PORT / $DEPLOY_PORT / $JAVA_PORT / $BG_VPORT / $BG_BLUE_PORT / $BG_GREEN_PORT / ${FLEET_APP_PORT} / ${FLEET_PORT_REMOTE}）"
 
   # 迭代 4：nginx 的受管配置与那一行 include 也必须是干净的——它们是**我们**写的，
   # 主机上本来就该没有。有的话说明上一轮没收干净，而 cleanup 敢直接删它们正靠这一条。
@@ -396,6 +467,190 @@ check_preconditions() {
   # 这一条让 cleanup 知道「机器不干净」，从而**什么都不删**（见 cleanup 的注释）。
   PRECONDITION_FAILED=$dirty
   return 0
+}
+
+# ==== 迭代 6d：证书供给 ====
+#
+# 真机上没有现成 CA，而本工具只消费证书、不签发也不轮换（迭代 5 文档 D10）——harness
+# 因此在主主机上用 openssl 现做一套：CA → 两台 opsd 的服务端证书 → 控制点的客户端证书。
+# 这与 e2e 用 crypto/x509 现签的是同一套做法，搬到 shell/openssl 而已。
+#
+# **写法迁就 CentOS 7 的 openssl 1.0.2**：那一版没有 -addext，SAN 必须用 -extfile
+# 配置文件写；算法用 RSA 2048（不用 ed25519，1.0.2 不认）。服务端证书的 SAN 里必须有
+# 客户端用来连它的那个名字——客户端校验的对象是「我用来连它的那个地址」
+# （pki.ClientTLSConfig 用地址里的主机名当 ServerName），漏了 SAN 握手就会被正确地拒掉。
+generate_fleet_certs() {
+  local pki="$FLEET_PKI_SRC"
+  if ! command -v openssl >/dev/null 2>&1; then
+    printf 'FAIL  主机上没有 openssl：批量段的证书无法生成，而 opsd 配了 remote.listen，\n' >&2
+    printf '      没有证书它根本起不来。这是本轮的硬前提（Rocky/CentOS 都自带 openssl）。\n' >&2
+    exit 1
+  fi
+  rm -rf "$pki"
+  install -d -m 0700 "$pki"
+  # openssl req 的最低配置：1.0.2 即使 subject 全部经 -subj 给出，也要求配置里有
+  # distinguished_name 段，否则报「unable to find 'distinguished_name' in config」。
+  cat > "$pki/req.cnf" <<'CNF'
+[req]
+distinguished_name = dn
+[dn]
+CNF
+  # CA 证书的扩展（req -x509 从这里取）：显式写 CA:TRUE，不依赖发行版默认配置里
+  # 有没有 v3_ca 段。
+  cat > "$pki/ca.cnf" <<'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+[dn]
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+CNF
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3 \
+    -keyout "$pki/ca.key" -out "$pki/ca.crt" \
+    -subj "/CN=frz-host-verify-ca" -config "$pki/ca.cnf" >/dev/null 2>&1
+  chmod 0600 "$pki/ca.key"
+  # 控制点的客户端证书：CN 就是身份本身（写在两台 opsd 的 remote.clients 白名单里）。
+  fleet_sign_cert "$FLEET_CLIENT_CN" "" client
+  # 本机 opsd 的服务端证书：控制点用 127.0.0.1 连它，SAN 必须含 127.0.0.1。
+  fleet_sign_cert opsd-server "DNS:localhost,IP:127.0.0.1" server
+  # 两台模式才有第二张：控制点经 FRZ_HOST2_ADDR 连它。地址按 IPv4 字面量还是域名
+  # 分别写成 IP:/DNS:（IPv6 字面量不在两台模式的设定里；那种地址请用域名形式给）。
+  if [ -n "$FRZ_HOST2" ]; then
+    local host2_san="DNS:localhost,IP:127.0.0.1"
+    case "$FRZ_HOST2_ADDR" in
+      *[!0-9.]*) host2_san="${host2_san},DNS:${FRZ_HOST2_ADDR}" ;;
+      *) host2_san="${host2_san},IP:${FRZ_HOST2_ADDR}" ;;
+    esac
+    fleet_sign_cert opsd-server-host2 "$host2_san" server
+  fi
+  # 服务端三件套装进 opsd 的配置目录（配置文件里写的是这里的路径）。私钥 0600 且
+  # 属主必须是 opsd 的运行用户（本轮是 root）——pki.CheckPrivateKey 启动时就查这两条。
+  install -d -m 0700 /etc/opsd/pki
+  install -m 0644 "$pki/ca.crt" /etc/opsd/pki/ca.crt
+  install -m 0644 "$pki/opsd-server.crt" /etc/opsd/pki/opsd-server.crt
+  install -m 0600 "$pki/opsd-server.key" /etc/opsd/pki/opsd-server.key
+}
+
+# fleet_sign_cert 签一张叶子证书。生成失败由 set -e 当场停：带着残缺的证书继续，
+# opsd 只会在启动时报一句更难懂的 CONFIG_INVALID。
+fleet_sign_cert() { # 名字（也是 CN） SAN 用途（server|client）
+  local name=$1 san=$2 usage=$3 pki="$FLEET_PKI_SRC"
+  local ext="$pki/$name.ext"
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$pki/$name.key" -out "$pki/$name.csr" \
+    -subj "/CN=$name" -config "$pki/req.cnf" >/dev/null 2>&1
+  # SAN 一行写完（1.0.2 的 -extfile 里这样写最稳）：如 DNS:localhost,IP:127.0.0.1。
+  # **这里不能用 `return 0` 收尾**：return 在函数内的 { } 组里会从整个函数返回，
+  # 下面的签名命令就永远执行不到了（本机演练抓出来的）。
+  {
+    printf 'basicConstraints = CA:FALSE\n'
+    printf 'keyUsage = critical, digitalSignature, keyEncipherment\n'
+    if [ "$usage" = "server" ]; then
+      printf 'extendedKeyUsage = serverAuth\n'
+    else
+      printf 'extendedKeyUsage = clientAuth\n'
+    fi
+    if [ -n "$san" ]; then
+      printf 'subjectAltName = %s\n' "$san"
+    fi
+  } > "$ext"
+  openssl x509 -req -in "$pki/$name.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" \
+    -CAcreateserial -out "$pki/$name.crt" -days 3 -extfile "$ext" >/dev/null 2>&1
+  chmod 0600 "$pki/$name.key"
+}
+
+# ==== 迭代 6d：第二台主机的装配（fleet2-* 阶段用） ====
+#
+# 这些函数只在**第二台上**经 fleet2-prepare / fleet2-check / fleet2-cleanup 阶段跑到
+# （主主机经 ssh 调起）。语义与主主机的 provision / 前置检查同形，差异只有两处：
+# 远程监听绑定 0.0.0.0（主主机跨机连它）、端口是 FLEET_PORT2。
+check_fleet2_preconditions() {
+  log "前置（第二台）：这台机器上要动的东西必须都还不存在"
+  local dirty=0 user path
+  assert_eq "运行身份" "root" "$(id -un)"
+  for user in frz-ops "$FLEET_APP"; do
+    id "$user" >/dev/null 2>&1 && { fail "$user 用户已存在，无法从干净主机开始"; dirty=1; }
+  done
+  # /opt/opsd 在列表里同样是安全前提：cleanup 会删掉整棵 /opt/opsd（见主主机的注释）。
+  for path in /etc/opsd /var/lib/opsd /var/log/opsd /run/opsd /opt/frz-ops /opt/opsd \
+    "/var/lib/$FLEET_APP" "/var/log/$FLEET_APP"; do
+    [ -e "$path" ] && { fail "$path 已存在，无法从干净主机开始"; dirty=1; }
+  done
+  ss -lntH "sport = :$FLEET_PORT2" 2>/dev/null | grep -q . && { fail "端口 $FLEET_PORT2 已被占用"; dirty=1; }
+  [ "$dirty" -eq 0 ] && pass "第二台涉及的用户与目录此时都不存在"
+  PRECONDITION_FAILED=$dirty
+  return 0
+}
+
+provision_fleet2() {
+  log "第二台：专用用户、目录、配置与证书"
+
+  groupadd --system frz-ops
+  useradd --system -g frz-ops --no-create-home --home-dir /var/lib/opsd frz-ops
+  install -d -m 0750 -o frz-ops -g frz-ops /etc/opsd /var/lib/opsd /var/log/opsd
+  install -d -m 0755 /opt/frz-ops
+  install -m 0755 "$FRZ_HOST_DIR/bin/opsd" /opt/frz-ops/opsd
+  # 服务端证书由主主机生成并推到 $FRZ_HOST_DIR/pki，这里装进配置目录。私钥 0600 且
+  # 属主必须是运行用户（root）——与主主机同一条 pki.CheckPrivateKey 的硬前提。
+  install -d -m 0700 /etc/opsd/pki
+  install -m 0644 "$FRZ_HOST_DIR/pki/ca.crt" /etc/opsd/pki/ca.crt
+  install -m 0644 "$FRZ_HOST_DIR/pki/opsd-server-host2.crt" /etc/opsd/pki/opsd-server-host2.crt
+  install -m 0600 "$FRZ_HOST_DIR/pki/opsd-server-host2.key" /etc/opsd/pki/opsd-server-host2.key
+  # 配置在脚本里现写：监听绑定 0.0.0.0 且端口是 FLEET_PORT2，其余与主主机同形。
+  # clients 白名单同样是默认拒绝：只有主主机生成的那个客户端 CN 进得来。
+  install -m 0600 -o frz-ops -g frz-ops /dev/null /etc/opsd/config.yaml
+  cat > /etc/opsd/config.yaml <<CONFIG
+apiVersion: ops.frz.io/v1alpha1
+kind: OpsdConfig
+socket:
+  path: /run/opsd/opsd.sock
+  mode: "0660"
+database:
+  path: /var/lib/opsd/opsd.db
+runtime:
+  workDirectory: /var/lib/opsd/work
+  logDirectory: /var/log/opsd
+  workers: 2
+execution:
+  defaultTimeoutSeconds: 60
+  maxOutputBytes: 65536
+  allowedPaths:
+    - /bin
+    - /usr/bin
+    - /usr/local/bin
+    - /opt/frz-ops
+  sensitiveEnvKeys:
+    - TOKEN
+    - MYSQL_PWD
+artifactStore:
+  root: /var/lib/opsd/artifacts
+  fileMode: "0640"
+  dirMode: "0750"
+  maxUploadBytes: 8388608
+  quotaBytes: 33554432
+remote:
+  listen: "0.0.0.0:${FLEET_PORT2}"
+  certFile: /etc/opsd/pki/opsd-server-host2.crt
+  keyFile: /etc/opsd/pki/opsd-server-host2.key
+  clientCAFile: /etc/opsd/pki/ca.crt
+  clients:
+    - cn: ${FLEET_CLIENT_CN}
+      scope: write
+CONFIG
+}
+
+# wait_fleet2_listener 等第二台的远程端口真的开始监听。断言的是 TCP 监听本身
+# （不是 socket）：这一阶段之后主主机要跨机连它，socket 起来不算数。
+wait_fleet2_listener() {
+  local _
+  for _ in $(seq 1 60); do
+    ss -lntH "sport = :$FLEET_PORT2" 2>/dev/null | grep -q . && return 0
+    sleep 0.5
+  done
+  fail "第二台的远程端口 $FLEET_PORT2 没有监听（journalctl -u $OPSD_UNIT 排查）"
+  return 1
 }
 
 # ==== 安装态（模拟安装脚本留下的状态）====
@@ -410,6 +665,16 @@ provision() {
   install -d -m 0750 -o frz-ops -g frz-ops /etc/opsd /var/lib/opsd /var/log/opsd
   install -d -m 0700 -o frz-ops -g frz-ops /etc/opsd/secrets
   install -d -m 0755 /opt/frz-ops
+
+  # 迭代 6d：证书必须在这里（opsd 启动之前）生成——配置里配了 remote.listen，opsd
+  # 启动时就会校验证书文件存在、私钥模式不宽于 0600 且属主是运行用户，缺一样都起不来，
+  # 而后面所有断言（包括既有的那些）都跑不到。
+  generate_fleet_certs
+  # 远程监听端口来自环境变量，配置文件里写的是默认值。重写做在**源文件**上再安装：
+  # 直接 sed -i /etc/opsd/config.yaml 会以临时文件改名的方式把属主换成 root，
+  # 破坏「配置属主 frz-ops:frz-ops」那条既有断言。
+  sed -i "s/^  listen: .*/  listen: \"127.0.0.1:${FLEET_PORT_REMOTE}\"/" \
+    "$FRZ_HOST_DIR/opsd.host.verify.yaml"
 
   install -m 0755 "$OPSD" /opt/frz-ops/opsd
   install -m 0755 "$OPSCTL" /opt/frz-ops/opsctl
@@ -1617,6 +1882,432 @@ MANIFEST
 }
 
 
+# ==== 迭代 6d：批量发布的组合证据 ====
+#
+# 迭代 5b 留下的那条缺口（iteration-5 文档 §16.3）：e2e 证明了编排与协议接线，
+# 3b/3c/4b 证明了「一台机上真的部署成功」，缺的是**组合**。这一段把控制点架在真机上：
+# opsctl 经**真 TCP + mTLS**（不是 socket）打本机 opsd 的远程端口，把本机登记为批量
+# 目标后走一次完整的 app deploy --hosts。它比 e2e 又进一步（真机、真 systemd、真证书
+# 文件、真网络栈——哪怕是回环），**但不等于跨机**：两台专属的用例在 FRZ_HOST2 未设时
+# 逐条 skip（跳过不是通过），「多台主机上都真的换了版本」的实跑证据停放待第二台主机。
+#
+# 「部署真的换了版本」用三个互相独立的来源互证，任何一个单独都可能是假象：
+#   ① unit 文件的 ExecStart 指到该应用的 release——systemd 将要执行的东西；
+#   ② release 目录树真的存在、current 指向其中——磁盘上的事实；
+#   ③ 探针上报的版本——进程里的事实，值来自这次部署的 manifest 环境变量
+#     （环境文件是 unit 交给进程的，HTTP 正文是进程正在服务的，报告是它自己写的）。
+
+# —— 批量段的共用函数（**顶层定义，不嵌套**）：单台段在本机直接调它们；两台模式下
+# 第二台的 fleet2-check 阶段也要跑同一份 assert_fleet_release_serving，而那份脚本在
+# 第二台上只走 main() 的 fleet2 分支、不会执行 check_fleet_batch——嵌套定义在那里
+# 就不存在了。它们只依赖脚本内常量与本机文件系统，不引用任何控制点状态。
+
+# fleet_manifest 造一份**跨主机成立**的 manifest：制品按 digest 引用（5b 规格 D3），
+# 版本号与探针要上报的版本写进 manifest 的 artifact.version 与环境变量——三处互证里
+# 「进程里的事实」就来自它。
+fleet_manifest() { # 版本 输出文件
+  cat > "$2" <<MANIFEST
+apiVersion: ops.frz.io/v1alpha1
+kind: ApplicationSpec
+application: ${FLEET_APP}
+runtime: go
+artifact:
+  digest: ${FLEET_DIGEST}
+  version: $1
+  fileName: bin/frz-probe
+  unpack:
+    strategy: none
+exec:
+  argv:
+    - bin/frz-probe
+    - --report
+    - /var/lib/${FLEET_APP}/probe-report.txt
+    - --listen
+    - 127.0.0.1:${FLEET_APP_PORT}
+  workingDirectory: /var/lib/${FLEET_APP}
+  runUser: ${FLEET_APP}
+  environment:
+    FRZ_PROBE_VERSION: "$1"
+  ports:
+    - ${FLEET_APP_PORT}
+health:
+  readiness:
+    type: tcp
+    target: "127.0.0.1:${FLEET_APP_PORT}"
+    consecutiveSuccesses: 2
+  startTimeoutSeconds: 30
+  stopTimeoutSeconds: 30
+logs:
+  directory: /var/log/${FLEET_APP}
+release:
+  keepLast: 3
+MANIFEST
+  chmod 0644 "$2"
+}
+
+# fleet_run 跑一次批量部署，把**退出码与报告**留在全局（FLEET_RC / FLEET_REPORT）。
+# **不用 $( ) 取返回值**：命令替换是子 shell，里面的东西出不来（蓝绿段 2026-09-26
+# 踩过），而这里要的退出码才是接口，报告只是细节。
+fleet_run() { # --hosts 的值 批次号 manifest [其余旗标...]
+  local hosts=$1 batch=$2 file=$3
+  shift 3
+  FLEET_RC=0
+  FLEET_REPORT=$("$OPSCTL" --socket /run/opsd/opsd.sock "${FLEET_TLS[@]}" \
+    app deploy --app "$FLEET_APP" --hosts "$hosts" --artifact "$ARTIFACT_PATH" \
+    --batch "$batch" --file "$file" --json "$@" 2>/dev/null) || FLEET_RC=$?
+}
+
+# 报告是 MarshalIndent 的 pretty JSON（顶层字段两格缩进、results 元素六格）。
+# 下面几个取值器**都不接管道**：脚本开着 pipefail，`sed | head -1` 会被 head 截断，
+# sed 拿到 SIGPIPE 后整条管道以 141 退出，而调用点是赋值语句——整个脚本会因此退出
+# （AGENTS.md 里那条「赋值语句静默终止脚本」的坑，这里从源头避开）。
+report_field() { # json 顶层字段名（字符串或数字）
+  printf '%s' "$1" | sed -n "s/^  \"$2\": \"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}\$/\1/p"
+}
+report_host_field() { # json 主机名 字段名——从那一台的结果对象里取
+  printf '%s' "$1" | sed -n "/\"host\": \"$2\"/,/}/s/.*\"$3\": *\"\([^\"]*\)\".*/\1/p"
+}
+report_host_has() { # json 主机名 子串 → yes/no
+  # 切片里可能有多行命中（例如地址同时出现在 address 与 detail 里），也可能一行都没有
+  # ——所以这里只问「有没有命中」，命中与否各回答一次 yes/no，而不是把 sed 的输出
+  # 原样交出去（多行 yes 或空串都会让 assert_eq 比出假失败）。
+  local hits
+  hits=$(printf '%s' "$1" | sed -n "/\"host\": \"$2\"/,/}/s/^.*$3.*$/yes/p")
+  [ -n "$hits" ] && printf yes || printf no
+}
+report_result_count() { # json → results 数组的条数
+  # **不用 grep -c**：结果为 0 时 grep 以 1 退出，`x=$(grep -c …)` 会把那个状态交给
+  # set -e。sed 数行、wc 收尾，三个都存在的命令，管道没有退出码意外。
+  printf '%s' "$1" | sed -n '/"results": \[/,/^  \]/s/^      "host": /x/p' | wc -l | tr -d ' '
+}
+assert_report_counts() { # json 期望总数——汇总恒等式（5b 的地基：每台都必须有结局）
+  local json=$1 total=$2
+  local succeeded failed skipped not_run
+  succeeded=$(report_field "$json" succeeded)
+  failed=$(report_field "$json" failed)
+  skipped=$(report_field "$json" skipped)
+  not_run=$(report_field "$json" notRun)
+  # ${:-0} 兜底：字段缺席时算术式会变成语法错误而不是 0——宁可断言失败得可读。
+  assert_eq "报告的计数恒等式（成功+失败+跳过+未执行 = 总数）" "$total" \
+    "$(( ${succeeded:-0} + ${failed:-0} + ${skipped:-0} + ${not_run:-0} ))"
+}
+
+fleet_served_version() {
+  curl -s -m 3 "http://127.0.0.1:${FLEET_APP_PORT}/" | tr -d '\r\n' || true
+}
+wait_for_fleet_served() { # 期望版本
+  local want=$1 got
+  for _ in $(seq 1 40); do
+    got=$(fleet_served_version)
+    [ "$got" = "version=$want" ] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+# assert_fleet_release_serving 在**本机**断言三处互证（① unit / ② release 目录 /
+# ③ 探针上报）。单台模式在本机直接调它；两台模式在第二台上经 fleet2-check 阶段跑
+# 同一份代码——「逐台到各自主机上查」因此不是转述。
+assert_fleet_release_serving() { # 期望版本
+  local want=$1 exec_line resolved
+  exec_line=$(grep '^ExecStart=' "/etc/systemd/system/$FLEET_UNIT" 2>/dev/null || true)
+  case "$exec_line" in
+    *"/opt/opsd/apps/${FLEET_APP}/releases/current/bin/frz-probe"*)
+      pass "① unit 的 ExecStart 指到该应用的 release（systemd 将要执行的）" ;;
+    *)
+      fail "① unit 的 ExecStart 没有指到该应用的 release：${exec_line:-<无>}" ;;
+  esac
+  assert_eq "$FLEET_UNIT 在跑" "active" "$(systemctl is-active "$FLEET_UNIT" 2>/dev/null)"
+  assert_eq "$FLEET_UNIT 开机自启" "enabled" "$(systemctl is-enabled "$FLEET_UNIT" 2>/dev/null)"
+
+  resolved=$(readlink -f "/opt/opsd/apps/$FLEET_APP/releases/current" 2>/dev/null || true)
+  case "$resolved" in
+    "/opt/opsd/apps/${FLEET_APP}/releases/rel_"*)
+      pass "② release 目录存在且 current 指向它（${resolved}）" ;;
+    *)
+      fail "② current 没有解析到该应用的 release 目录：${resolved:-<空>}" ;;
+  esac
+  assert_eq "② release 里的探针可执行" "yes" \
+    "$([ -x "$resolved/bin/frz-probe" ] && printf yes || printf no)"
+
+  assert_eq "③ 环境文件里的版本（EnvironmentFile 交给进程的）" "yes" \
+    "$(grep -q "^FRZ_PROBE_VERSION=\"${want}\"\$" "/etc/opsd/apps/${FLEET_APP}.env" 2>/dev/null && printf yes || printf no)"
+  if wait_for_fleet_served "$want"; then
+    pass "③ 探针上报的版本 = ${want}（进程里的事实）"
+  else
+    fail "③ 探针上报的是 $(fleet_served_version)，期望 version=${want}"
+  fi
+  assert_eq "③ 探针的自述报告已落盘" "yes" \
+    "$([ -f "/var/lib/${FLEET_APP}/probe-report.txt" ] && printf yes || printf no)"
+}
+
+release_dir_count() {
+  local listing count=0 line
+  listing=$(find "/opt/opsd/apps/$FLEET_APP/releases" -mindepth 1 -maxdepth 1 \
+    -type d -name 'rel_*' 2>/dev/null || true)
+  while IFS= read -r line; do
+    [ -n "$line" ] && count=$((count + 1))
+  done <<< "$listing"
+  printf '%s' "$count"
+}
+
+# ==== 迭代 6d：批量段主体（注册进 full 分支，在蓝绿之后） ====
+check_fleet_batch() {
+  log "迭代 6d：批量发布（控制点经 mTLS 打远程端口，本机作为批量目标）"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    fail "主机上没有 curl：探针上报版本这一来源没法断言，批量段的证据不完整"
+    return 0
+  fi
+
+  # 证书在 provision 里生成（配置配了 remote.listen，没有证书 opsd 根本起不来——
+  # 能跑到这里本身就说明证书齐了）。这里断言落盘的模式与证书链。
+  assert_eq "/etc/opsd/pki 模式" "700" "$(mode_of /etc/opsd/pki)"
+  assert_eq "服务端私钥模式（不宽于 0600，启动时的硬前提）" "600" \
+    "$(mode_of /etc/opsd/pki/opsd-server.key)"
+  require_ok "本轮生成的证书都链到本轮的 CA（服务端 + 客户端）" \
+    openssl verify -CAfile "$FLEET_PKI_SRC/ca.crt" \
+      "$FLEET_PKI_SRC/opsd-server.crt" "$FLEET_PKI_SRC/${FLEET_CLIENT_CN}.crt"
+
+  # 客户端身份三件套：这一段里所有 mTLS 调用都带这一组。客户端私钥同样受
+  # pki.CheckPrivateKey 约束（模式不宽于 0600、属主是运行用户）——生成时已 chmod 0600。
+  FLEET_TLS=(--client-cert "$FLEET_PKI_SRC/${FLEET_CLIENT_CN}.crt"
+    --client-key "$FLEET_PKI_SRC/${FLEET_CLIENT_CN}.key"
+    --ca-cert "$FLEET_PKI_SRC/ca.crt")
+
+  # —— 登记：控制点把本机登记为远程目标（地址指向自己的远程端口）。
+  require_ok "登记本机为远程目标（frz-fleet-self → 127.0.0.1:${FLEET_PORT_REMOTE}）" \
+    opsctl host create frz-fleet-self --address "127.0.0.1:${FLEET_PORT_REMOTE}"
+
+  # host check 是 5a 留给运维的那条「远程通道通不通」的命令：backend / clientCn /
+  # scope 三个字段正好对应链路上最容易错的三处。断言它们，就是断言这张证书网是通的。
+  local identity_json
+  identity_json=$("$OPSCTL" --socket /run/opsd/opsd.sock "${FLEET_TLS[@]}" \
+    host check frz-fleet-self --json 2>/dev/null) || true
+  assert_eq "host check 报的传输层（真 TCP + mTLS，不是 socket）" "tls" \
+    "$(printf '%s' "$identity_json" | sed -n 's/.*"backend": *"\([^"]*\)".*/\1/p')"
+  assert_eq "host check 报的客户端身份（证书 CN）" "$FLEET_CLIENT_CN" \
+    "$(printf '%s' "$identity_json" | sed -n 's/.*"clientCn": *"\([^"]*\)".*/\1/p')"
+  assert_eq "host check 报的档位" "write" \
+    "$(printf '%s' "$identity_json" | sed -n 's/.*"scope": *"\([^"]*\)".*/\1/p')"
+
+  # 应用注册**走 mTLS**（顺带证明远程写端点可用）；部署目标是控制点上的声明，走
+  # socket 与其它段一致。
+  require_ok "经 mTLS 在本机 opsd 注册批量应用" \
+    "$OPSCTL" --remote "127.0.0.1:${FLEET_PORT_REMOTE}" "${FLEET_TLS[@]}" \
+    app create "$FLEET_APP"
+
+  if [ -n "$FRZ_HOST2" ]; then
+    # 第二台的主机记录在这里就要登记（部署目标是**声明**，登记不探测连通性——
+    # 那台机的 opsd 此刻还没装，批次准备阶段自会去探）。
+    require_ok "登记第二台主机（frz-host2 → ${FRZ_HOST2_ADDR}:${FLEET_PORT2}）" \
+      opsctl host create frz-host2 --address "${FRZ_HOST2_ADDR}:${FLEET_PORT2}"
+    FLEET_TARGETS="frz-fleet-self,frz-host2"
+  else
+    FLEET_TARGETS="frz-fleet-self"
+  fi
+  require_ok "登记部署目标（${FLEET_TARGETS}）" \
+    opsctl app target set --app "$FLEET_APP" --hosts "$FLEET_TARGETS"
+  assert_eq "部署目标读回一致（声明的意图，不是探测结果）" "yes" \
+    "$(opsctl app target list --app "$FLEET_APP" --json | grep -q '"name": *"frz-fleet-self"' && printf yes || printf no)"
+
+  # 制品摘要**在本地算**：批量 manifest 按 digest 引用制品（5b 规格 D3——art_xxx 只在
+  # 某一台机上有意义），digest 是内容寻址的，在每台机上指同一份字节，不需要先问谁。
+  ARTIFACT_PATH=/opt/frz-ops/frz-probe
+  local digest_hex
+  if ! digest_hex=$(sha256sum "$ARTIFACT_PATH" | cut -d' ' -f1); then
+    fail "算不出制品摘要：${ARTIFACT_PATH} 不存在？"
+    return 0
+  fi
+  FLEET_DIGEST="sha256:${digest_hex}"
+
+  # —— 单台批次：@注册表展开成登记的那台，走准备阶段（身份、应用、制品）→ 部署 →
+  # 逐台结论。制品不用预先上传：--artifact 让准备阶段把缺它的机器补齐（内容寻址、幂等）。
+  log "单台批次：app deploy --hosts @注册表（经 mTLS 的完整批次）"
+  fleet_manifest "$FLEET_VERSION_A" "$FRZ_HOST_DIR/fleet-${FLEET_VERSION_A}.yaml"
+  fleet_run "@${FLEET_APP}" fleet-host-ok "$FRZ_HOST_DIR/fleet-${FLEET_VERSION_A}.yaml"
+  assert_eq "单台批次的退出码" "0" "$FLEET_RC"
+  if [ "$FLEET_RC" -ne 0 ]; then
+    fail "单台批次没有成功"
+    printf '%s\n' "$FLEET_REPORT" >&2
+    return 0
+  fi
+  assert_eq "报告的批次号" "fleet-host-ok" "$(report_field "$FLEET_REPORT" batchId)"
+  assert_eq "报告里只有登记的那一台" "1" "$(report_result_count "$FLEET_REPORT")"
+  assert_eq "这一台的结论" "succeeded" \
+    "$(report_host_field "$FLEET_REPORT" frz-fleet-self status)"
+  assert_eq "这一台的版本" "$FLEET_VERSION_A" \
+    "$(report_host_field "$FLEET_REPORT" frz-fleet-self version)"
+  assert_report_counts "$FLEET_REPORT" 1
+
+  # 审计的身份绑定（迭代 5a D4）：这条 Operation 经 mTLS 创建，「谁做的」必须是证书
+  # 的 CN，而不是任何人自报的名字——审计里的 actor 以认证身份为准。
+  FLEET_FIRST_OP=$(report_host_field "$FLEET_REPORT" frz-fleet-self operationId)
+  assert_eq "经 mTLS 创建的操作在审计里记的是证书身份" "$FLEET_CLIENT_CN" \
+    "$(q operation get "$FLEET_FIRST_OP" --json | sed -n 's/.*"createdBy": *"\([^"]*\)".*/\1/p')"
+
+  assert_fleet_release_serving "$FLEET_VERSION_A"
+
+  # —— 幂等重跑：批次号就是每台机上的幂等键。这台机已经是这个版本，服务端返回
+  # noop（本来就是这个版本、没有动作），**不是**一条新操作——这是 CLI 层能拿到的
+  # 「零新操作」证据；盘上的 release 目录数与探针版本作为旁证。
+  log "同一批次号重跑：已完成的主机不会被重做（幂等键）"
+  local dirs_before
+  dirs_before=$(release_dir_count)
+  fleet_run "@${FLEET_APP}" fleet-host-ok "$FRZ_HOST_DIR/fleet-${FLEET_VERSION_A}.yaml"
+  assert_eq "重跑的退出码" "0" "$FLEET_RC"
+  assert_eq "重跑没有产生新操作（无新 operationId）" "no" \
+    "$(report_host_has "$FLEET_REPORT" frz-fleet-self '"operationId"')"
+  assert_eq "重跑的结论仍是成功（noop：本来就是这个版本）" "yes" \
+    "$(report_host_has "$FLEET_REPORT" frz-fleet-self '"noop": true')"
+  assert_eq "重跑没有建出新的 release 目录" "$dirs_before" "$(release_dir_count)"
+  assert_eq "探针服务的版本没变" "version=${FLEET_VERSION_A}" "$(fleet_served_version)"
+
+  # —— 两台专属：FRZ_HOST2 未设时逐条 skip 并写明原因（跳过不是通过）。
+  if [ -z "$FRZ_HOST2" ]; then
+    skip "两台专属：两台批次与逐台的三处互证（待第二台主机：未设置 FRZ_HOST2，实跑证据停放）"
+    skip "两台专属：host check 对第二台报 backend=tls（待第二台主机）"
+    skip "两台专属：准备阶段失败默认一台都不动（退出码 36，待第二台主机）"
+    skip "两台专属：--allow-partial 与部分失败的现场处置走查（待第二台主机）"
+    return 0
+  fi
+  check_fleet_batch_two_hosts
+}
+
+# ==== 迭代 6d 两台专属：第二台主机进批次 ====
+#
+# 前提（run.sh 头部也写了）：主主机必须能免密 ssh 到第二台——第二台的装配、盘面
+# 断言、失败注入与收尾都从这条 ssh 走。批次本身不经过 ssh：控制点经 mTLS 连两台。
+check_fleet_batch_two_hosts() {
+  log "迭代 6d 两台专属：${FRZ_HOST2}（控制点 = 本机，目标 = 本机 + 第二台）"
+
+  if ! fleet2_ssh -o ConnectTimeout=10 true 2>/dev/null; then
+    fail "本机无法免密 ssh 到 ${FRZ_HOST2}：两台模式要求控制点能 ssh 到第二台（BatchMode），先配好再跑"
+    return 0
+  fi
+  pass "控制点可以免密 ssh 到第二台主机"
+
+  # 推夹具：第二台只需要 opsd 二进制、证书与这份脚本。它的断言段是盘面与 systemd 的
+  # 事实，不需要 opsctl——探针在制品里，由批次经 mTLS 补齐。
+  if ! tar -C "$FRZ_HOST_DIR" -cf - verify.sh bin/opsd pki |
+      fleet2_ssh "mkdir -p '$FLEET2_DIR' && tar -C '$FLEET2_DIR' -xf -"; then
+    fail "向第二台主机推送夹具失败"
+    return 0
+  fi
+  pass "已推送 opsd、证书与断言脚本到第二台主机"
+
+  # 装配第二台：跑这份脚本自己的 fleet2-prepare 阶段（同一套 provision 语义）。
+  if fleet2_ssh env FRZ_HOST_DIR="$FLEET2_DIR" FRZ_HOST_KEEP="${FRZ_HOST_KEEP:-0}" \
+      FRZ_FLEET_PORT2="$FLEET_PORT2" FRZ_HOST_PHASE=fleet2-prepare \
+      bash -s < "$FRZ_HOST_DIR/verify.sh"; then
+    pass "第二台主机的 opsd 已装配并在远程端口监听"
+  else
+    fail "第二台主机的装配没有通过（fleet2-prepare，输出见上）"
+    fleet2_cleanup_best_effort
+    return 0
+  fi
+  FLEET2_PROVISIONED=1
+
+  # 身份：控制点经 mTLS 连第二台。backend=tls 证明走的真 TCP + mTLS；hostname 与
+  # ssh 侧看到的对上，证明连的确实是那台机（防「打错了机器」）。
+  local host2_hostname check2
+  host2_hostname=$(fleet2_ssh hostname 2>/dev/null) || true
+  check2=$("$OPSCTL" --socket /run/opsd/opsd.sock "${FLEET_TLS[@]}" \
+    host check frz-host2 --json 2>/dev/null) || true
+  assert_eq "第二台的 host check 报的传输层" "tls" \
+    "$(printf '%s' "$check2" | sed -n 's/.*"backend": *"\([^"]*\)".*/\1/p')"
+  assert_eq "第二台的 host check 报的主机名（与 ssh 看到的一致）" "$host2_hostname" \
+    "$(printf '%s' "$check2" | sed -n 's/.*"hostname": *"\([^"]*\)".*/\1/p')"
+
+  # 第二台上注册应用（经 mTLS）：批量准备阶段会查「应用已登记」，不登记的那台会被
+  # 跳过——这一步顺带证明远程写端点对第二台同样可用。
+  require_ok "经 mTLS 在第二台主机注册批量应用" \
+    "$OPSCTL" --remote "${FRZ_HOST2_ADDR}:${FLEET_PORT2}" "${FLEET_TLS[@]}" \
+    app create "$FLEET_APP"
+  require_ok "把两台都登记为部署目标" \
+    opsctl app target set --app "$FLEET_APP" --hosts "frz-fleet-self,frz-host2"
+
+  log "两台批次：${FLEET_VERSION_A} → 本机 + 第二台（「多台主机上都真的换了版本」的主体证据）"
+  fleet_run "@${FLEET_APP}" fleet-two-ok "$FRZ_HOST_DIR/fleet-${FLEET_VERSION_A}.yaml"
+  assert_eq "两台批次的退出码" "0" "$FLEET_RC"
+  if [ "$FLEET_RC" -ne 0 ]; then
+    fail "两台批次没有成功"
+    printf '%s\n' "$FLEET_REPORT" >&2
+    return 0
+  fi
+  assert_eq "两台批次的成功计数" "2" "$(report_field "$FLEET_REPORT" succeeded)"
+  assert_report_counts "$FLEET_REPORT" 2
+  assert_eq "本机的结论" "succeeded" \
+    "$(report_host_field "$FLEET_REPORT" frz-fleet-self status)"
+  assert_eq "第二台的结论" "succeeded" \
+    "$(report_host_field "$FLEET_REPORT" frz-host2 status)"
+
+  # 逐台三处互证：本机的直接断言 + **ssh 到第二台上**跑同一份断言代码。
+  assert_fleet_release_serving "$FLEET_VERSION_A"
+  if fleet2_ssh env FRZ_HOST_DIR="$FLEET2_DIR" \
+      FLEET_EXPECTED_VERSION="$FLEET_VERSION_A" FRZ_HOST_PHASE=fleet2-check \
+      bash -s < "$FRZ_HOST_DIR/verify.sh"; then
+    pass "第二台主机上的三处互证（unit / release 目录 / 探针上报）"
+  else
+    fail "第二台主机上的三处互证没有通过（fleet2-check，输出见上）"
+  fi
+  local dirs_two_ok
+  dirs_two_ok=$(release_dir_count)
+
+  # —— 准备阶段失败：停掉第二台的 opsd（指名道姓的 systemctl stop，见 run.sh 头部
+  # 纪律），批次默认**一台都不动**：退出码 36，可达的那台是 not-run。
+  # 用 2.0.0 的 manifest 造这个失败，「一台都没动」才是盘上可观察的：本机还在服务
+  # 1.0.0，2.0.0 的 release 没有出现。
+  log "准备阶段失败：第二台的 opsd 停下 → 默认一台都不动（退出码 36）"
+  require_ok "停下第二台的 opsd（systemctl stop，指名道姓）" \
+    fleet2_ssh systemctl stop "$OPSD_UNIT"
+  fleet_manifest "$FLEET_VERSION_B" "$FRZ_HOST_DIR/fleet-${FLEET_VERSION_B}.yaml"
+  fleet_run "frz-fleet-self,frz-host2" fleet-two-preflight \
+    "$FRZ_HOST_DIR/fleet-${FLEET_VERSION_B}.yaml"
+  assert_eq "准备阶段失败时的退出码（BATCH_PREFLIGHT_FAILED）" "36" "$FLEET_RC"
+  assert_eq "不可达那台的结论是 skipped" "skipped" \
+    "$(report_host_field "$FLEET_REPORT" frz-host2 status)"
+  assert_eq "skipped 的那台说明了原因（指向它的地址）" "yes" \
+    "$(report_host_has "$FLEET_REPORT" frz-host2 "$FRZ_HOST2_ADDR")"
+  assert_eq "可达那台的结论是 not-run（批次没有开始）" "not-run" \
+    "$(report_host_field "$FLEET_REPORT" frz-fleet-self status)"
+  assert_report_counts "$FLEET_REPORT" 2
+  assert_fleet_release_serving "$FLEET_VERSION_A"
+  assert_eq "被拒的批次没有建出新的 release 目录" "$dirs_two_ok" "$(release_dir_count)"
+
+  # —— --allow-partial：放行其余的主机。不可达那台标 skipped，可达那台真的被部署。
+  log "--allow-partial：放行其余的主机（混合版本现场由此产生）"
+  fleet_run "frz-fleet-self,frz-host2" fleet-two-partial \
+    "$FRZ_HOST_DIR/fleet-${FLEET_VERSION_B}.yaml" --allow-partial
+  assert_eq "--allow-partial 的退出码（skipped 不算批次失败）" "0" "$FLEET_RC"
+  assert_eq "本机被部署到 ${FLEET_VERSION_B}" "succeeded" \
+    "$(report_host_field "$FLEET_REPORT" frz-fleet-self status)"
+  assert_eq "第二台仍是 skipped" "skipped" \
+    "$(report_host_field "$FLEET_REPORT" frz-host2 status)"
+  assert_report_counts "$FLEET_REPORT" 2
+  assert_fleet_release_serving "$FLEET_VERSION_B"
+
+  # —— 部分失败的现场处置走查（note，不是断言）：工具只报状态，处置是人做的。
+  note "部分失败现场（走查）：${FLEET_APP} 现在是混合版本——本机 ${FLEET_VERSION_B}、第二台 ${FLEET_VERSION_A}，且第二台的 opsd 停着"
+  note "处置第 1 步：到第二台把 opsd 拉起来（systemctl start ${OPSD_UNIT}）——harness 演到这里，见下一条"
+  note "处置第 2 步：用同一个批次号重跑（--hosts frz-fleet-self,frz-host2 --batch fleet-two-partial）：本机命中幂等键返回 noop，第二台真正部署——这就是「继续」的语义"
+  note "处置第 3 步：要整批重来就换批次号（--batch 新值）；要单独重试某一台用 opsctl --host frz-host2 operation retry <op>"
+
+  require_ok "把第二台的 opsd 拉回来（处置第 1 步）" \
+    fleet2_ssh systemctl start "$OPSD_UNIT"
+  if fleet2_ssh env FRZ_HOST_DIR="$FLEET2_DIR" \
+      FLEET_EXPECTED_VERSION="$FLEET_VERSION_A" FRZ_HOST_PHASE=fleet2-check \
+      bash -s < "$FRZ_HOST_DIR/verify.sh"; then
+    pass "第二台恢复后仍服务它自己的版本（混合版本的另一半，等处置第 2 步去收口）"
+  else
+    fail "第二台恢复后没有回到 ${FLEET_VERSION_A} 的服务状态"
+  fi
+
+  # 两台的部分到这里全部验完：就地清掉第二台，trap 的收尾不再重复。
+  fleet2_cleanup_best_effort
+}
+
+
 record_boot_identity() {
   log "记录重启前的主机身份（用来证明真的重启过，而不是在检查一台没重启的机器）"
   # CLI 没有 operation list，因此 start 操作的 ID 由 check_lifecycle 记在变量里。
@@ -1850,7 +2541,39 @@ main() {
       # 迭代 4：真机上的 Nginx 蓝绿（切流、时间线、对账）。**只进 full**：
       # 它不参与重启验证那一轮（prepare/check），因此「蓝绿跨机器重启存活」仍未验证。
       check_bluegreen_host
+      # 迭代 6d：批量发布的组合证据（控制点经 mTLS）。**只进 full**，理由同蓝绿——
+      # 「批量部署跨机器重启存活」是另一条未验证，不与这一轮混。
+      check_fleet_batch
       report
+      ;;
+    # ==== 迭代 6d 的第二台主机阶段（由主主机经 ssh 调起）====
+    #
+    # fleet2-prepare  装配第二台的 opsd（远程监听绑定 0.0.0.0，端口 FRZ_FLEET_PORT2）。
+    #                 **不设收尾 trap**：装配失败时由主主机那边显式调 fleet2-cleanup，
+    #                 这里留下的半套状态正好是排查现场。
+    # fleet2-check    第二台盘面上的三处互证（期望版本经 FLEET_EXPECTED_VERSION 传入）。
+    # fleet2-cleanup  复用 cleanup：它删的东西在第二台上语义相同（unit、用户、目录、
+    #                 /etc/opsd、/opt/opsd 与推过来的夹具目录）；多删的 nginx 路径在
+    #                 第二台上本来就不存在（remove_path 静默容忍）。
+    fleet2-prepare)
+      env_facts
+      check_fleet2_preconditions
+      stop_if_preconditions_failed
+      provision_fleet2
+      install_opsd_unit
+      wait_fleet2_listener
+      ;;
+    fleet2-check)
+      if [ -z "${FLEET_EXPECTED_VERSION:-}" ]; then
+        printf 'fleet2-check 需要 FLEET_EXPECTED_VERSION 环境变量（期望的版本）\n' >&2
+        exit 1
+      fi
+      assert_eq "$FLEET_UNIT 状态" "active" "$(systemctl is-active "$FLEET_UNIT" 2>/dev/null)"
+      assert_fleet_release_serving "$FLEET_EXPECTED_VERSION"
+      report
+      ;;
+    fleet2-cleanup)
+      cleanup
       ;;
   esac
 }
