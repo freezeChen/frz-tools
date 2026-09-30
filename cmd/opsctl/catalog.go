@@ -259,13 +259,13 @@ func newAppDeployCommand(opts *rootOptions) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "deploy --app <name> --file <manifest.yaml> [--to <host...>]",
+		Use:   "deploy --app <name> --file <manifest.yaml> [--hosts <host...>]",
 		Short: "部署一个版本：物化制品、准备运行时、切换并启动",
 		Long: "把 manifest 里声明的制品解成一个带版本的 release 目录，然后切换 current 指针、" +
 			"启动并等就绪。**健康通过才算部署成功**；任何一步失败都会把上一个稳定版本放回去，" +
 			"并以 DEPLOY_ROLLED_BACK（退出码 29）收场。\n\n" +
 			"同一版本重复部署是幂等的：它已经是当前版本时什么都不做。\n\n" +
-			"给了 --to 就是**批量部署**：同一个版本按批次推到多台主机上。批量模式下 manifest " +
+			"给了 --hosts 就是**批量部署**：同一个版本按批次推到多台主机上。批量模式下 manifest " +
 			"必须按 artifact.digest 引用制品（art_xxx 只在某一台机上有效），而且**先全员准备、" +
 			"再开始第一批**——任何一台连不上、没登记这个应用或缺制品时，一台都不会动。",
 		Args: cobra.NoArgs,
@@ -316,7 +316,7 @@ func startDeployBatch(cmd *cobra.Command, opts *rootOptions, app string, raw []b
 	digest := strings.TrimSpace(spec.Artifact.Digest)
 	if digest == "" {
 		return domain.NewError(v1.CodeInvalidRequest,
-			"--to 模式下 manifest 必须按 artifact.digest 引用制品，不能写 artifact.id："+
+			"--hosts 模式下 manifest 必须按 artifact.digest 引用制品，不能写 artifact.id："+
 				"art_xxx 是某一台机上的那一行，换一台机要么找不到、要么指向别的东西；"+
 				"而 digest 是内容寻址的，在每台机上指同一份字节")
 	}
