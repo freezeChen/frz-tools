@@ -35,7 +35,7 @@ func newTargetSetCommand(opts *rootOptions) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "set --app <应用名> --hosts <主机名,主机名...>",
+		Use:   "set --app <name> --hosts <name,name...>",
 		Short: "替换某个应用的部署目标列表",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -73,7 +73,7 @@ func newTargetListCommand(opts *rootOptions) *cobra.Command {
 	var app string
 
 	cmd := &cobra.Command{
-		Use:   "list [--app <应用名>]",
+		Use:   "list [--app <name>]",
 		Short: "列出部署目标；不给 --app 时列出全部应用（跨主机汇总）",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {

@@ -259,7 +259,7 @@ func newAppDeployCommand(opts *rootOptions) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "deploy --app <name> --file <manifest.yaml> [--to <主机...>]",
+		Use:   "deploy --app <name> --file <manifest.yaml> [--to <host...>]",
 		Short: "部署一个版本：物化制品、准备运行时、切换并启动",
 		Long: "把 manifest 里声明的制品解成一个带版本的 release 目录，然后切换 current 指针、" +
 			"启动并等就绪。**健康通过才算部署成功**；任何一步失败都会把上一个稳定版本放回去，" +
@@ -347,7 +347,7 @@ func newAppRollbackCommand(opts *rootOptions) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "rollback --app <name> [--to <version>] [--hosts <主机...>]",
+		Use:   "rollback --app <name> [--to <version>] [--hosts <host...>]",
 		Short: "回滚到上一个（或指定的）版本",
 		Long: "回滚**连配置一起回滚**：每个 release 都记着它当时那份 manifest，回滚时用的是它，\n" +
 			"不会出现「旧二进制配新配置」的混合体。不带 --to 时回到上一个曾经激活过的版本。\n\n" +

@@ -44,7 +44,7 @@ func newScheduleCreateCommand(opts *rootOptions) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "create --name <n> --resource <r> (--cron <表达式> | --interval <时长>) [--operation-kind <kind>] -- <argv...>",
+		Use:   "create --name <name> --resource <resource> (--cron <expr> | --interval <duration>) [--operation-kind <kind>] -- <argv...>",
 		Short: "创建定时计划",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {

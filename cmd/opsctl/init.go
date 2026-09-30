@@ -135,7 +135,7 @@ func newInitCommand(opts *rootOptions) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "init <路径>",
+		Use:   "init <path>",
 		Short: "生成一份 opsd 配置骨架到指定路径，不连接 opsd",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
