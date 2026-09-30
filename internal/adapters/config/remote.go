@@ -130,7 +130,7 @@ func (c *Config) validateRemote() []string {
 		field := fmt.Sprintf("remote.clients[%d]", i)
 		cn := strings.TrimSpace(client.CN)
 		if cn == "" {
-			problems = append(problems, field+".cn is required")
+			problems = append(problems, field+".cn 必填")
 		} else if first, dup := seen[cn]; dup {
 			// 重复的 CN 会让「以第几条为准」变成一个必须记住的规则，而两条内容
 			// 不同时，实际生效的那条与写在后面那条看起来一样合理。

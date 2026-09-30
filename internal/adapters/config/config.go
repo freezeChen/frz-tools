@@ -142,7 +142,7 @@ var migrations = map[string]func(doc map[string]any) error{}
 func Load(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, domain.NewError(v1.CodeConfigInvalid, "cannot read config %q: %v", path, err)
+		return nil, domain.NewError(v1.CodeConfigInvalid, "无法读取配置文件 %q：%v", path, err)
 	}
 	defer file.Close()
 	return LoadReader(file)
@@ -155,20 +155,20 @@ func LoadBytes(data []byte) (*Config, error) {
 func LoadReader(r io.Reader) (*Config, error) {
 	raw, err := io.ReadAll(r)
 	if err != nil {
-		return nil, domain.NewError(v1.CodeConfigInvalid, "cannot read config: %v", err)
+		return nil, domain.NewError(v1.CodeConfigInvalid, "无法读取配置：%v", err)
 	}
 
 	var env envelope
 	if err := yaml.Unmarshal(raw, &env); err != nil {
-		return nil, domain.NewError(v1.CodeConfigInvalid, "invalid config: %v", err)
+		return nil, domain.NewError(v1.CodeConfigInvalid, "配置无法解析：%v", err)
 	}
 	if env.APIVersion == "" {
-		return nil, domain.NewError(v1.CodeConfigInvalid, "config must declare apiVersion")
+		return nil, domain.NewError(v1.CodeConfigInvalid, "配置必须声明 apiVersion")
 	}
 
 	doc := map[string]any{}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return nil, domain.NewError(v1.CodeConfigInvalid, "invalid config: %v", err)
+		return nil, domain.NewError(v1.CodeConfigInvalid, "配置无法解析：%v", err)
 	}
 	if err := migrate(doc, env.APIVersion); err != nil {
 		return nil, err
@@ -176,7 +176,7 @@ func LoadReader(r io.Reader) (*Config, error) {
 
 	normalized, err := yaml.Marshal(doc)
 	if err != nil {
-		return nil, domain.NewError(v1.CodeConfigInvalid, "cannot normalize config: %v", err)
+		return nil, domain.NewError(v1.CodeConfigInvalid, "无法规范化配置：%v", err)
 	}
 
 	decoder := yaml.NewDecoder(bytes.NewReader(normalized))
@@ -184,7 +184,7 @@ func LoadReader(r io.Reader) (*Config, error) {
 
 	var cfg Config
 	if err := decoder.Decode(&cfg); err != nil {
-		return nil, domain.NewError(v1.CodeConfigInvalid, "invalid config: %v", err)
+		return nil, domain.NewError(v1.CodeConfigInvalid, "配置无法解析：%v", err)
 	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
@@ -198,20 +198,20 @@ func migrate(doc map[string]any, from string) error {
 	for step := 0; version != APIVersion; step++ {
 		if step >= maxMigrationSteps {
 			return domain.NewError(v1.CodeConfigInvalid,
-				"config migration starting at %q did not converge", from)
+				"从 %q 开始的配置迁移未能在 %d 步内收敛", from, maxMigrationSteps)
 		}
 		apply, ok := migrations[version]
 		if !ok {
 			return domain.NewError(v1.CodeConfigInvalid,
-				"unsupported config apiVersion %q; this build understands %q", from, APIVersion)
+				"不支持的配置 apiVersion %q；本构建只认识 %q", from, APIVersion)
 		}
 		if err := apply(doc); err != nil {
-			return domain.NewError(v1.CodeConfigInvalid, "cannot migrate config from %q: %v", version, err)
+			return domain.NewError(v1.CodeConfigInvalid, "无法从 %q 迁移配置：%v", version, err)
 		}
 		next, _ := doc["apiVersion"].(string)
 		if next == version {
 			return domain.NewError(v1.CodeConfigInvalid,
-				"migration from %q did not advance apiVersion", version)
+				"从 %q 出发的迁移没有推进 apiVersion", version)
 		}
 		version = next
 	}
@@ -266,10 +266,10 @@ func (c *Config) Validate() error {
 	var problems []string
 
 	if c.APIVersion != APIVersion {
-		problems = append(problems, fmt.Sprintf("apiVersion must be %q, got %q", APIVersion, c.APIVersion))
+		problems = append(problems, fmt.Sprintf("apiVersion 必须是 %q，实际是 %q", APIVersion, c.APIVersion))
 	}
 	if c.Kind != Kind {
-		problems = append(problems, fmt.Sprintf("kind must be %q, got %q", Kind, c.Kind))
+		problems = append(problems, fmt.Sprintf("kind 必须是 %q，实际是 %q", Kind, c.Kind))
 	}
 	if err := requireAbsolute("socket.path", c.Socket.Path); err != nil {
 		problems = append(problems, err.Error())
@@ -284,16 +284,16 @@ func (c *Config) Validate() error {
 		problems = append(problems, err.Error())
 	}
 	if c.Runtime.Workers < 1 {
-		problems = append(problems, "runtime.workers must be at least 1")
+		problems = append(problems, "runtime.workers 至少为 1")
 	}
 	if c.Execution.DefaultTimeoutSeconds < 1 {
-		problems = append(problems, "execution.defaultTimeoutSeconds must be at least 1")
+		problems = append(problems, "execution.defaultTimeoutSeconds 至少为 1")
 	}
 	if c.Execution.MaxOutputBytes < 1 {
-		problems = append(problems, "execution.maxOutputBytes must be at least 1")
+		problems = append(problems, "execution.maxOutputBytes 至少为 1")
 	}
 	if len(c.Execution.AllowedPaths) == 0 {
-		problems = append(problems, "execution.allowedPaths must list at least one directory or executable")
+		problems = append(problems, "execution.allowedPaths 至少要列出一个目录或可执行文件")
 	}
 	for i, p := range c.Execution.AllowedPaths {
 		if err := requireAbsolute(fmt.Sprintf("execution.allowedPaths[%d]", i), p); err != nil {
@@ -317,8 +317,8 @@ func (c *Config) Validate() error {
 		// 逐条列进 message，而不是只塞进 Details：Details 目前没有任何一处会被打印，
 		// 于是「配置不合法」会变成一句查不出所以然的报错——启动失败的消息正是运维
 		// 唯一能看到的线索。Details 仍然保留，供 API 调用方结构化读取。
-		err := domain.NewError(v1.CodeConfigInvalid, "config is invalid: %s",
-			strings.Join(problems, "; "))
+		err := domain.NewError(v1.CodeConfigInvalid, "配置不合法：%s",
+			strings.Join(problems, "；"))
 		err.Details = map[string]any{"problems": problems}
 		return err
 	}
@@ -341,13 +341,13 @@ func (c *Config) validateArtifactStore() []string {
 		problems = append(problems, err.Error())
 	}
 	if c.ArtifactStore.MaxUploadBytes < 1 {
-		problems = append(problems, "artifactStore.maxUploadBytes must be at least 1")
+		problems = append(problems, "artifactStore.maxUploadBytes 至少为 1")
 	}
 	if c.ArtifactStore.QuotaBytes < 1 {
-		problems = append(problems, "artifactStore.quotaBytes must be at least 1")
+		problems = append(problems, "artifactStore.quotaBytes 至少为 1")
 	}
 	if c.ArtifactStore.QuotaBytes > 0 && c.ArtifactStore.MaxUploadBytes > c.ArtifactStore.QuotaBytes {
-		problems = append(problems, "artifactStore.maxUploadBytes must not exceed artifactStore.quotaBytes")
+		problems = append(problems, "artifactStore.maxUploadBytes 不能超过 artifactStore.quotaBytes")
 	}
 	return problems
 }
@@ -379,10 +379,10 @@ func (c *Config) SocketFileMode() (os.FileMode, error) {
 func parseOctalMode(field, value string) (os.FileMode, error) {
 	mode, err := strconv.ParseUint(value, 8, 32)
 	if err != nil {
-		return 0, fmt.Errorf("%s %q is not an octal file mode", field, value)
+		return 0, fmt.Errorf("%s %q 不是合法的八进制文件模式", field, value)
 	}
 	if mode > 0o777 {
-		return 0, fmt.Errorf("%s %q must not exceed 0777", field, value)
+		return 0, fmt.Errorf("%s %q 不能超过 0777", field, value)
 	}
 	return os.FileMode(mode), nil
 }
@@ -421,10 +421,10 @@ func (c *Config) AllowedSecretDirectories() []string {
 
 func requireAbsolute(field, value string) error {
 	if value == "" {
-		return fmt.Errorf("%s is required", field)
+		return fmt.Errorf("%s 必填", field)
 	}
 	if !filepath.IsAbs(value) {
-		return fmt.Errorf("%s must be an absolute path, got %q", field, value)
+		return fmt.Errorf("%s 必须是绝对路径，实际是 %q", field, value)
 	}
 	return nil
 }

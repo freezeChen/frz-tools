@@ -38,7 +38,10 @@ type rootOptions struct {
 func main() {
 	root := newRootCommand()
 	if err := root.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "opsctl:", domain.MessageOf(err))
+		// 码必须出现在文本里（迭代 6 规格 D4）：退出码表按码组织，文本里没有码，
+		// 用户就得拿「退出码 7」去反查表——而码就攥在手里却没显示。码保持英文原样，
+		// 消息保持中文；--json 路径不变（结构化字段里本来就有码）。
+		fmt.Fprintf(os.Stderr, "opsctl: %s: %s\n", domain.CodeOf(err), domain.MessageOf(err))
 		os.Exit(v1.ExitCode(domain.CodeOf(err)))
 	}
 }

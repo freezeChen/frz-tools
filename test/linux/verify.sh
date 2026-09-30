@@ -1948,6 +1948,22 @@ check_init() {
     "$(printf '%s' "${remote_out}" | grep -q '/etc/opsd/pki/server.key' && echo yes || echo no)"
   assert_eq "失败消息指向缺失的 ca.crt" "yes" \
     "$(printf '%s' "${remote_out}" | grep -q '/etc/opsd/pki/ca.crt' && echo yes || echo no)"
+
+  # 迭代 6b：配置报错的中文化。故意写坏两处（kind 错、socket.path 是相对路径），
+  # 报错应当**逐条**列出全部问题、语言是中文，而字段路径保持英文原样——
+  # 运维拿字段路径回去改配置，拿中文句子看懂原因。
+  in_container sh -c 'printf "apiVersion: ops.frz.io/v1alpha1\nkind: NotOpsdConfig\nsocket:\n  path: relative.sock\ndatabase:\n  path: /var/lib/opsd/opsd.db\nruntime:\n  workDirectory: /var/lib/opsd/work\n  logDirectory: /var/log/opsd\nexecution:\n  allowedPaths:\n    - /usr/bin\n" > /opt/frz-ops/init/invalid.yaml'
+  local invalid_out=""
+  # 校验失败本身就是预期：用 if 接住退出状态，避免 set -e 提前终结脚本；
+  # 「真的失败了」不再单独计断言——命令若意外成功，下面那条 grep 自然失败。
+  if ! invalid_out=$(in_container /opt/frz-ops/opsctl config validate --file /opt/frz-ops/init/invalid.yaml 2>&1); then
+    :
+  fi
+  assert_eq "写坏的配置报错是中文逐条（头一句中文 + 字段路径原样）" "yes" \
+    "$(printf '%s' "${invalid_out}" | grep -q '配置不合法' \
+      && printf '%s' "${invalid_out}" | grep -q 'kind' \
+      && printf '%s' "${invalid_out}" | grep -q 'socket.path' \
+      && echo yes || echo no)"
 }
 
 main() {
