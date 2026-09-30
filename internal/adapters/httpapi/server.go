@@ -24,6 +24,13 @@ import (
 
 const maxRequestBytes = 1 << 20
 
+// 操作列表端点（迭代 6 规格 §5）的条数约束。越界一律 400 INVALID_REQUEST，
+// 不为它新增错误码。
+const (
+	operationsListDefaultLimit = 10
+	operationsListMaxLimit     = 100
+)
+
 // Dependencies 把 API 需要的端口显式列出，避免处理器直接依赖具体实现。
 type Dependencies struct {
 	Service   *application.Service
@@ -74,6 +81,7 @@ func (s *Server) routes() []route {
 		{"GET /api/v1/identity", accessRead, s.handleIdentity},
 		{"GET /api/v1/health", accessRead, s.handleHealth},
 		{"POST /api/v1/operations", accessWrite, s.handleCreateOperation},
+		{"GET /api/v1/operations", accessRead, s.handleListOperations},
 		{"GET /api/v1/operations/{id}", accessRead, s.handleGetOperation},
 		{"POST /api/v1/operations/{id}/cancel", accessWrite, s.handleCancelOperation},
 		{"POST /api/v1/operations/{id}/retry", accessWrite, s.handleRetryOperation},
@@ -303,6 +311,44 @@ func (s *Server) handleGetOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, v1.OperationResponse{APIVersion: v1.APIVersion, Operation: operationDTO(op)})
+}
+
+// handleListOperations 是最近的操作列表（迭代 6 规格 D3）：纯只读、按创建时间倒序，
+// 回答「有没有在跑的、最近失败的」。limit 缺省 10、上限 100；status 按单个状态值
+// 过滤。元素与单条查询完全同构。
+func (s *Server) handleListOperations(w http.ResponseWriter, r *http.Request) {
+	limit, err := intQuery(r, "limit", operationsListDefaultLimit)
+	if err != nil {
+		writeError(w, s.logger(), err)
+		return
+	}
+	if limit < 1 || limit > operationsListMaxLimit {
+		writeError(w, s.logger(), domain.NewError(v1.CodeInvalidRequest,
+			"query parameter %q must be between 1 and %d", "limit", operationsListMaxLimit))
+		return
+	}
+
+	var status domain.Status
+	if raw := r.URL.Query().Get("status"); raw != "" {
+		status = domain.Status(raw)
+		if !status.Valid() {
+			writeError(w, s.logger(), domain.NewError(v1.CodeInvalidRequest,
+				"query parameter %q must be a valid operation status", "status"))
+			return
+		}
+	}
+
+	ops, err := s.deps.Service.List(r.Context(), limit, status)
+	if err != nil {
+		writeError(w, s.logger(), err)
+		return
+	}
+
+	items := make([]v1.Operation, 0, len(ops))
+	for _, op := range ops {
+		items = append(items, operationDTO(op))
+	}
+	writeJSON(w, http.StatusOK, v1.OperationListResponse{APIVersion: v1.APIVersion, Operations: items})
 }
 
 func (s *Server) handleCancelOperation(w http.ResponseWriter, r *http.Request) {

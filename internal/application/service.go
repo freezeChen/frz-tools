@@ -322,6 +322,13 @@ func (s *Service) Get(ctx context.Context, id string) (*domain.Operation, error)
 	return s.repo.GetOperation(ctx, id)
 }
 
+// List 返回最近的操作列表（按创建时间倒序，status 非空时按单个状态过滤），
+// 供只读列表端点与 `opsctl status` 使用。它是纯读用例：不碰状态机，
+// 也不做任何汇总推断（迭代 6 规格 D3）。
+func (s *Service) List(ctx context.Context, limit int, status domain.Status) ([]*domain.Operation, error) {
+	return s.repo.ListOperations(ctx, limit, status)
+}
+
 func (s *Service) Cancel(ctx context.Context, id string) (*domain.Operation, error) {
 	op, cancelledInline, err := s.repo.CancelPending(ctx, id, s.now())
 	if err != nil {

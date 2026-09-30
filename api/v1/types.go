@@ -97,6 +97,13 @@ type OperationResponse struct {
 	Operation  Operation `json:"operation"`
 }
 
+// OperationListResponse 是 `GET /api/v1/operations` 的响应（迭代 6）。
+// 元素与单条查询的 Operation 完全同构，调用方不必为列表写第二套解析。
+type OperationListResponse struct {
+	APIVersion string      `json:"apiVersion"`
+	Operations []Operation `json:"operations"`
+}
+
 type LogEntry struct {
 	ID      int64             `json:"id"`
 	Level   string            `json:"level"`

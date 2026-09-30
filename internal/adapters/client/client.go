@@ -116,6 +116,23 @@ func (c *Client) GetOperation(ctx context.Context, id string) (*v1.Operation, er
 	return &out.Operation, nil
 }
 
+// ListOperations 拉取最近的操作列表。limit 为 0 时不带 limit 参数（服务端按默认值
+// 10 处理）；status 为空串时不过滤。
+func (c *Client) ListOperations(ctx context.Context, limit int, status string) (*v1.OperationListResponse, error) {
+	query := url.Values{}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if status != "" {
+		query.Set("status", status)
+	}
+	var out v1.OperationListResponse
+	if err := c.do(ctx, http.MethodGet, "/api/v1/operations", query, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) CancelOperation(ctx context.Context, id string) (*v1.Operation, error) {
 	var out v1.OperationResponse
 	if err := c.do(ctx, http.MethodPost, "/api/v1/operations/"+url.PathEscape(id)+"/cancel", nil, nil, &out); err != nil {

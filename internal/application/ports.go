@@ -13,6 +13,9 @@ import (
 type Repository interface {
 	CreateOperation(ctx context.Context, op *domain.Operation) (*domain.CreateResult, error)
 	GetOperation(ctx context.Context, id string) (*domain.Operation, error)
+	// ListOperations 按创建时间倒序返回最多 limit 条操作；status 非空时只返回
+	// 该状态的操作。limit 的默认值与上限由 HTTP 层约束，存储层只管照办。
+	ListOperations(ctx context.Context, limit int, status domain.Status) ([]*domain.Operation, error)
 	ClaimNextPending(ctx context.Context, now time.Time) (*domain.Operation, error)
 	Finish(ctx context.Context, in domain.FinishInput, now time.Time) (*domain.Operation, error)
 	CancelPending(ctx context.Context, id string, now time.Time) (*domain.Operation, bool, error)

@@ -161,6 +161,35 @@ func (s *Store) GetOperation(ctx context.Context, id string) (*domain.Operation,
 	return op, nil
 }
 
+// ListOperations 按创建时间倒序返回最多 limit 条操作，status 非空时只返回该状态。
+// created_at 以定宽格式落盘（见 timeLayout），字符串排序即时间排序；id 作次级
+// 排序键，让同一时刻创建的操作也有稳定顺序——与 ClaimNextPending 的升序取法对称。
+func (s *Store) ListOperations(ctx context.Context, limit int, status domain.Status) ([]*domain.Operation, error) {
+	query := `SELECT ` + operationColumns + ` FROM operations`
+	args := []any{limit}
+	if status != "" {
+		query += ` WHERE status = ?`
+		args = append([]any{string(status)}, args...)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ops []*domain.Operation
+	for rows.Next() {
+		op, err := scanOperation(rows)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
 // ClaimNextPending 在同一事务内获取资源锁，并把最旧的、可运行的 pending 操作
 // 推进为 running。没有可运行的操作时返回 (nil, nil)，例如所有 pending 操作的
 // 资源当前都被占用。
