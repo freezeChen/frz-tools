@@ -34,10 +34,13 @@ Linux 适配（`RuntimeAdapter` + systemd 双档）、任务引擎的重试与�
 **声明的**目标主机，`app deploy/rollback --hosts` 先做全员准备阶段、再按波次推、逐台给结论
 并汇总（`internal/fleet`）。规格与验证记录见 `docs/plans/2026-09-27-iteration-5.md`
 （5c–5e 未开始）。
-**迭代 6（主功能验证与体验打磨）的规格已于 2026-09-30 冻结、插在 5c 之前**：6a CLI 上手
-三件套（`init`/`status`/`version`）、6b 输出与报错打磨、6c socket 属组（从 5c 拉前）、
-6d 批量组合证据的 harness 先行。理由与范围见 `docs/plans/2026-09-30-iteration-6.md`；
-5b 那条「两台都真的换版本」的实跑**停放待第二台主机**，不因 harness 就绪而视为已验证。
+**迭代 6（主功能验证与体验打磨）已部分落地（2026-09-30，多 agent + git worktree 并行实现）**：
+6a（`init`/`status`/`version` 三件套 + 只读端点 `GET /api/v1/operations`）与 6b（错误文本
+带码、config 报错中文化、`operation logs --follow` 落地）已实现并验证——容器 **244/0**、
+CI run `36691810811` 三个 job 全绿；6d 的 test/host 批量段 harness（证书供给 +
+`check_fleet_batch`）已实现但**真机未实跑**；6c（socket 属组）经用户当日二次拍板**停做、
+退回 5c**。记录见 `docs/plans/2026-09-30-iteration-6.md` §12–13 与路线图补记二十；
+5b 那条「两台都真的换版本」的实跑**停放待第二台主机**，harness 就绪**不等于**已验证。
 **5b 有一条必须说清楚的证据缺口**：批量发布「多台主机上**都真的换了版本**」**没有拿到证据**。
 容器里造不出来——systemd 的 unit 名字空间是**机器级**的，同一台机上两个 `opsd` 实例部署同名
 应用写的是同一个 unit 文件，在那种设定下得到的「一台成功、一台失败」是测试装置的产物。
@@ -73,9 +76,9 @@ Rocky Linux 10.2 / systemd 257 / SELinux enforcing（strict 档，含一次真�
   （**5a 与 5b 已实现**：5a 见 §12 实现记录 / §13 验证记录，5b 见 §15 实现记录 /
   §16 验证记录；5c 安全加固、5d 可观测性与通知、5e 备份灾备**未开始**。
   **5b 的「多主机上都真的换了版本」未验证**，理由见 §16.3 与本文开头的状态段）
-- `docs/plans/2026-09-30-iteration-6.md`：主功能验证与体验打磨（**规格已冻结、未开工**：
-  6a CLI 上手三件套 / 6b 输出与报错打磨 / 6c socket 属组 / 6d 批量组合证据 harness 先行；
-  插在 5c 之前，理由见路线图补记十九）
+- `docs/plans/2026-09-30-iteration-6.md`：主功能验证与体验打磨（插在 5c 之前，理由见路线图
+  补记十九：**6a/6b 已实现并验证**，记录见 §12–13；6d 批量段 harness 就绪、真机未实跑；
+  6c socket 属组停做、退回 5c）
 - `docs/plans/2026-09-24-future-iterations.md`：**未来迭代目标（停放区）**——GFS 保留策略，
   以及从迭代 0–2 沉淀下来的其它待定项。**它不是迭代规格**：任何一项开工前都要先升级成
   独立的迭代文档（含验收标准与证据类型）
@@ -197,12 +200,12 @@ CI 的结果由**独立的定时任务或另一个会话**兜底处理（检查 
 `make verify-linux` 依赖 docker，因此不纳入 `make ci`，但在 CI 中作为独立 job 运行
 （`run: bash test/linux/verify.sh`，见 `.github/workflows/ci.yml`）。**断言清单与断言数以
 `test/linux/verify.sh` 为准，权威数字是脚本运行时打印的「`%d` 项通过，`%d` 项失败」——
-当前为 232**（2026-09-27 迭代 4c 落地后实跑：232 通过 / 0 失败，其中 1c 的 `check_runtime`
+当前为 244**（2026-09-30 迭代 6a/6b 落地后实跑：244 通过 / 0 失败，其中 1c 的 `check_runtime`
 49 项、1d 的 `check_retry` 17 项、2a 的 `check_backup` 12 项、2d 的 `check_prune` 13 项、
-3b 的 `check_deploy` 23 项、3c 的 `check_resources` 16 项、4b/4c 的 `check_bluegreen` 62 项
-——4b 时点是 27 项）；
-历史快照：4b 时点 197 项、3c 时点 170 项、3b 时点 151 项、2d 时点 131 项、2a 时点 118 项、1d 时点 106 项、
-1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
+3b 的 `check_deploy` 23 项、3c 的 `check_resources` 16 项、4b/4c 的 `check_bluegreen` 62 项、
+6a/6b 的 `check_init` 12 项）；
+历史快照：4c 时点 232 项、4b 时点 197 项、3c 时点 170 项、3b 时点 151 项、2d 时点 131 项、2a 时点 118 项、
+1d 时点 106 项、1c 时点 89 项、1b 时点 40 项，A7 落地时的静态推导 87 项偏低）。**不要引用静态推导值当结论。**
 
 harness 现在会起**两个 `opsd` 实例**：一个以服务用户 `frz-ops` 运行（迭代 0 的既有断言全打在
 它上面，前缀未动），另一个**以 root 运行**（配置 `test/linux/opsd.root.verify.yaml`，独立

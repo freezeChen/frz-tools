@@ -1139,3 +1139,32 @@
 - **验证要求**：6a/6b 的验收以单元/集成/e2e 证据为准；6c 另加容器与真机各一层（socket
   属组/ACL 是文件系统语义）；6d 的单台可验部分是 Linux 主机证据，两台实跑在拿到之前
   只能写「停放待主机」。断言数仍以脚本运行时打印的数字为准。
+
+### 2026-09-30（补记二十）迭代 6 的 6a/6b 实现并验证，6d harness 就绪未实跑，6c 停做
+
+实现记录与验证记录见 `2026-09-30-iteration-6.md` 第 12–13 节。补记十九冻结的四个里程碑里，
+这一轮实际落地的是 6a、6b 与 6d 的 harness 部分；6c（socket 属组）经用户当日二次拍板**停做、
+退回 5c**。实现方式是**多 agent + git worktree 并行**：6a 与 6d 的文件集不相交（产品代码 +
+`test/linux/` 对 `test/host/`），两个 agent 在各自 worktree 并行实现、线性合并（fast-forward
++ rebase）；6b 与前两者共享 `cmd/opsctl/main.go` 与 `internal/adapters/config`，串行在后。
+规格与路线图记录由主会话统一写，避免多 agent 改同一份文档。
+
+- **6a（已验证）**：`init`/`status`/`version` 三件套 + 只读端点 `GET /api/v1/operations`
+  （`routes()` 同一行登记 `accessRead`）。为满足「`--remote` 骨架的消息逐条指名缺失证书」，
+  `validateRemote` 补了证书文件**存在性检查**——一处 config 校验行为变化（此前私钥问题要到
+  读文件时才暴露），记录在规格文档 §12.1。容器断言新增 `check_init` 段。
+- **6b（已验证）**：CLI 错误出口改为 `opsctl: <CODE>: <消息>`（码英文原样——查退出码表不再
+  需要拿退出码反查）；`internal/adapters/config` 报错中文化（与 remote.go 统一；逐条拼接 +
+  `Details` 结构原样）；`operation logs --follow` 落地（`--cursor` 轮询、终态补拉一轮防漏、
+  退出码随终态映射、SIGINT 干净退出、与 `--json` 互斥）；帮助占位符统一 `<name>`。全仓确认
+  没有任何既有断言依赖旧文本——既有断言零破坏。
+- **6d（harness 就绪、未实跑）**：`test/host` 证书供给（RSA 2048、SAN 走 `-extfile`，迁就
+  真机 openssl 1.0.2 没有 `-addext`）、`check_fleet_batch` 段（单台可跑 9 组断言 + 两台专属
+  4 条显式 skip）、`fleet2` 三阶段编排。**`make verify-host` 未在合并后的树上执行**，§9.4
+  第 1–5 条全部未验证——harness 就绪不等于证据到手；「两台都真的换版本」继续停放待第二台
+  主机。
+- **证据**：本地 `make ci` 全绿（6a/6b 各自收尾 + 最终树）；容器回归本地 **244/0**（232 →
+  243（6a 的 check_init 11 项）→ 244（6b 补 1 条））；CI run `36691810811` 三个 job 全绿，
+  `linux-verify` 在干净 amd64 runner 上打印 **244 项通过，0 项失败**、`db-verify` **13/0**。
+- **遗留**：`internal/adapters/blob/local.go` 与 `internal/adapters/secret/resolver.go` 还有
+  少量英文报错消息（6b 范围外，记录在案未处理）；6d 的真机实跑与两台专属用例待主机。
