@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -211,10 +214,22 @@ func newLogsCommand(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "logs <operation-id>",
 		Short: "打印操作的结构化日志",
-		Args:  cobra.ExactArgs(1),
+		Long: `打印操作的结构化日志。
+
+--follow 持续输出新日志，直到操作到达终态：拉完剩余日志后退出，退出码
+沿用该操作终态的映射（成功为 0，失败与取消按 api/v1 的退出码表）。
+Ctrl-C 随时停止跟随，操作本身不受影响，仍可用 operation get 查看。
+
+--follow 与 --cursor 同时给出时以 follow 为主，--cursor 只决定从哪条
+日志开始跟随。`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if follow {
-				return domain.NewError(v1.CodeInvalidRequest, "--follow 流式日志本迭代未实现，请改用 --cursor 轮询")
+				if opts.json {
+					return domain.NewError(v1.CodeInvalidRequest,
+						"--follow 与 --json 不能同时使用：follow 是持续的增量输出，拼不成一份 JSON")
+				}
+				return followLogs(cmd.Context(), opts, args[0], cursor, limit)
 			}
 			response, err := opts.client().Logs(cmd.Context(), args[0], cursor, limit)
 			if err != nil {
@@ -223,22 +238,109 @@ func newLogsCommand(opts *rootOptions) *cobra.Command {
 			if opts.json {
 				return opts.printJSON(response)
 			}
-			for _, entry := range response.Items {
-				fmt.Printf("%s  %-5s %s", entry.Time.Format(time.RFC3339), entry.Level, entry.Message)
-				for key, value := range entry.Fields {
-					fmt.Printf("  %s=%s", key, value)
-				}
-				fmt.Println()
-			}
+			printLogEntries(response.Items)
 			return nil
 		},
 	}
 
-	cmd.Flags().Int64Var(&cursor, "cursor", 0, "只返回 id 大于该游标的日志条目")
+	cmd.Flags().Int64Var(&cursor, "cursor", 0, "只返回 id 大于该游标的日志条目（--follow 下作为跟随的起点）")
 	cmd.Flags().IntVar(&limit, "limit", 0, "返回条数上限")
-	cmd.Flags().BoolVar(&follow, "follow", false, "流式输出，本迭代保留参数但尚未实现")
+	cmd.Flags().BoolVar(&follow, "follow", false, "持续输出新日志，操作到终态后退出（退出码随终态）")
 
 	return cmd
+}
+
+// followInterval 是 --follow 的轮询间隔（迭代 6 规格 D5：固定 1 秒，不做退避）。
+const followInterval = time.Second
+
+// followLogs 用客户端轮询实现流式跟随（迭代 6 规格 D5）：不改协议也不加依赖——
+// 服务端推送要么改协议要么引依赖，而客户端本来就靠轮询拿操作状态，这只是同一件事的延伸。
+//
+// 每一轮先拉日志、再查操作状态。终态与最后一条日志（operation finished）在服务端是
+// 同一个事务落库的，所以「看到终态之后再补拉一轮」就不会漏日志；反过来的顺序
+// （先查状态再拉日志）在两者之间落下的那批就要靠运气了。
+func followLogs(ctx context.Context, opts *rootOptions, id string, cursor int64, limit int) error {
+	// Ctrl-C 只是「不看了」：操作在 opsd 那边照常跑完。把 SIGINT 变成 ctx 取消，
+	// 循环在下一轮等待处干净退出，而不是带着一堆 gore 被默认行为砸掉。
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
+
+	client := opts.client()
+	for {
+		response, err := client.Logs(ctx, id, cursor, limit)
+		if err != nil {
+			return err
+		}
+		printLogEntries(response.Items)
+		cursor = response.NextCursor
+
+		operation, err := client.GetOperation(ctx, id)
+		if err != nil {
+			return err
+		}
+		if domain.Status(operation.Status).Terminal() {
+			// 退出前补拉一轮：状态翻转前一刻提交的日志也在这一轮里。
+			final, err := client.Logs(ctx, id, cursor, limit)
+			if err != nil {
+				return err
+			}
+			printLogEntries(final.Items)
+			return followExitStatus(operation)
+		}
+
+		// 刚才那一批还有条目，说明可能还没追上实时：立刻再来一轮。
+		// 1 秒间隔是「没有新东西时」的轮询节奏，不该给追赶中的循环也垫上延迟。
+		if len(response.Items) > 0 {
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr,
+				"已停止跟随；操作 %s 仍在后台继续，可用 opsctl operation get %s 查看结果\n", id, id)
+			return nil
+		case <-time.After(followInterval):
+		}
+	}
+}
+
+// followExitStatus 把操作终态映射成本命令的退出结果：成功为 nil（退出码 0）；
+// 失败与取消沿用 api/v1 的退出码表按操作错误码映射——错误以 CodedError 冒泡回
+// main 的统一出口，文本里自然带着码（迭代 6 规格 D4 的同一形状）。
+func followExitStatus(op *v1.Operation) error {
+	switch domain.Status(op.Status) {
+	case domain.StatusSucceeded:
+		return nil
+	case domain.StatusCancelled:
+		code := v1.ErrorCode(op.ErrorCode)
+		if code == "" {
+			code = v1.CodeExecCancelled
+		}
+		return domain.NewError(code, "操作 %s 已取消", op.ID)
+	case domain.StatusFailed, domain.StatusRolledBack:
+		code := v1.ErrorCode(op.ErrorCode)
+		if code == "" {
+			code = v1.CodeInternal
+		}
+		if op.ErrorMessage != "" {
+			return domain.NewError(code, "操作 %s 以 %s 结束：%s", op.ID, op.Status, op.ErrorMessage)
+		}
+		return domain.NewError(code, "操作 %s 以 %s 结束", op.ID, op.Status)
+	default:
+		return domain.NewError(v1.CodeInternal, "操作 %s 的终态 %s 无法映射退出码", op.ID, op.Status)
+	}
+}
+
+// printLogEntries 按人类可读格式打印一批日志条目；字段名与 api/v1 保持一致
+// （AGENTS.md 的语言约定），人类可读与 --json 两种输出可以逐字段对照。
+func printLogEntries(items []v1.LogEntry) {
+	for _, entry := range items {
+		fmt.Printf("%s  %-5s %s", entry.Time.Format(time.RFC3339), entry.Level, entry.Message)
+		for key, value := range entry.Fields {
+			fmt.Printf("  %s=%s", key, value)
+		}
+		fmt.Println()
+	}
 }
 
 // wholeSeconds 把时长转成整秒。API 的重试字段以秒为单位，非整秒的输入会被静默截断，
