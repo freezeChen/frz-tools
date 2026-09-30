@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
 
 	"github.com/freezeChen/frz-tools/internal/domain"
@@ -100,6 +101,23 @@ func (c *Config) validateRemote() []string {
 	} {
 		if err := requireAbsolute(field.name, field.value); err != nil {
 			problems = append(problems, err.Error())
+			continue
+		}
+		// 三个文件必须**真的在**：`opsctl init --remote` 生成的骨架里是占位路径，
+		// 这里不查的话，启动只会报第一个读不到的文件，运维就得改一条重启一次地
+		// 试出全部缺口。一次把缺的都指出来，与 validateRemote「全部问题一次列出」
+		// 的既有风格一致。
+		if _, err := os.Stat(field.value); err != nil {
+			problems = append(problems, fmt.Sprintf("%s %q 无法读取：%v", field.name, field.value, err))
+			continue
+		}
+		// 私钥文件的模式与属主在这里就查，不等到 ListenTLS：启动失败的消息里
+		// 越早指出是哪个文件越好，而这一步的失败原因（权限）与后面那些
+		// （端口占着）完全无关。文件不存在时不必再查——上面那条已经指路了。
+		if field.name == "remote.keyFile" {
+			if err := pki.CheckPrivateKey(field.value); err != nil {
+				problems = append(problems, err.Error())
+			}
 		}
 	}
 	if len(c.Remote.Clients) == 0 {
@@ -132,15 +150,8 @@ func (c *Config) validateRemote() []string {
 		}
 	}
 
-	// 私钥文件的模式与属主在这里就查，不等到 ListenTLS：启动失败的消息里越早指出
-	// 是哪个文件越好，而这一步的失败原因（权限）与后面那些（端口占着）完全无关。
-	//
-	// keyFile 为空时不查——那已经在上面报过「必填」，再报一条「读不到空路径」
+	// 私钥文件的模式与属主已在上面的字段循环里查过（且仅对 keyFile）：
+	// keyFile 为空时 requireAbsolute 已报过「必填」，再报一条「读不到空路径」
 	// 只会让运维在两句话之间猜哪句才是真正要改的。
-	if c.Remote.KeyFile != "" {
-		if err := pki.CheckPrivateKey(c.Remote.KeyFile); err != nil {
-			problems = append(problems, err.Error())
-		}
-	}
 	return problems
 }

@@ -24,6 +24,17 @@ func writeKey(t *testing.T, dir string, mode os.FileMode) string {
 	return path
 }
 
+// writeDummyCert 造一个**存在**的证书/CA 占位文件。配置加载只查存在性，
+// 真正的 PEM 解析发生在 ListenTLS（迭代 6a 起：占位路径在配置校验阶段就要被指出来）。
+func writeDummyCert(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("not-a-real-cert"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	return path
+}
+
 func remoteYAML(t *testing.T, body string) string {
 	t.Helper()
 	return validYAML + "\n" + body
@@ -161,16 +172,52 @@ remote:
 	}
 }
 
+// 缺失的证书文件必须在配置校验阶段被**逐条**指出：`opsctl init --remote` 生成的
+// 骨架里是占位路径，如果只报第一个读不到的文件，运维就得改一条重启一次地试出
+// 全部缺口（迭代 6 规格 D2：这是校验该干的活）。
+func TestRemoteReportsEveryMissingCertificateFile(t *testing.T) {
+	dir := t.TempDir()
+	key := writeKey(t, dir, 0o600)
+	missingCert := filepath.Join(dir, "missing-server.crt")
+	missingCA := filepath.Join(dir, "missing-ca.crt")
+
+	_, err := LoadBytes([]byte(remoteYAML(t, `
+remote:
+  listen: "0.0.0.0:9443"
+  certFile: `+missingCert+`
+  keyFile: `+key+`
+  clientCAFile: `+missingCA+`
+  clients:
+    - cn: opsctl-central
+      scope: write
+`)))
+	if domain.CodeOf(err) != v1.CodeConfigInvalid {
+		t.Fatalf("want CONFIG_INVALID, got %v", err)
+	}
+	message := domain.MessageOf(err)
+	for _, missing := range []string{missingCert, missingCA} {
+		if !strings.Contains(message, missing) {
+			t.Fatalf("报错应当逐条指出缺失的文件 %s：%v", missing, err)
+		}
+	}
+	// 私钥存在且模式正确：它不该被牵连进报错。
+	if strings.Contains(message, key) {
+		t.Fatalf("没有问题的私钥不该出现在报错里：%v", err)
+	}
+}
+
 func TestRemoteAcceptsValidSection(t *testing.T) {
 	dir := t.TempDir()
 	key := writeKey(t, dir, 0o600)
+	cert := writeDummyCert(t, dir, "server.crt")
+	clientCA := writeDummyCert(t, dir, "ca.crt")
 
 	cfg, err := LoadBytes([]byte(remoteYAML(t, `
 remote:
   listen: "0.0.0.0:9443"
-  certFile: /etc/opsd/pki/server.crt
+  certFile: `+cert+`
   keyFile: `+key+`
-  clientCAFile: /etc/opsd/pki/ca.crt
+  clientCAFile: `+clientCA+`
   clients:
     - cn: opsctl-central
       scope: write

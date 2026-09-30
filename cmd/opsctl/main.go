@@ -74,6 +74,9 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(
 		newHealthCommand(opts),
 		newIdentityCommand(opts),
+		newStatusCommand(opts),
+		newVersionCommand(opts),
+		newInitCommand(opts),
 		newOperationCommand(opts),
 		newArtifactCommand(opts),
 		newAppCommand(opts),

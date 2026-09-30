@@ -36,6 +36,19 @@ artifactStore:
   maxUploadBytes: 2147483648
   quotaBytes: 21474836480
 
+# 备份存储（迭代 2a）。root 不配置即禁用备份端点（返回 CONFIG_INVALID 而非启动失败），
+# 与制品存储同样的取舍；省略时下面的模式与配额按内置默认值走。
+# **root 必须与 artifactStore.root 分开**：制品 GC 把「digest 不在 artifacts 表里」的
+# blob 一律当孤儿删除，共用同一个根会让 artifact gc 删掉全部备份。
+backupStore:
+  root: /var/lib/opsd/backups
+  # blob 文件与目录模式，由 opsd 在真实文件系统上强制。
+  fileMode: "0640"
+  dirMode: "0750"
+  # 备份与制品**独立计数**的配额：备份天然比制品大得多，混在一个配额里
+  # 会让「传制品」因为「备份占满」而失败。
+  quotaBytes: 21474836480
+
 # 允许 file 类凭据引用的目录。只有解析符号链接后落在这些目录内、
 # 且不对属组或其他用户开放的文件才会被读取。
 secrets:
@@ -46,6 +59,16 @@ secrets:
 # 这是迭代 0 的遗留项，在真实 Linux 主机上验证 sudoers 之前不得当作已生效的安全控制。
 sudo:
   allowedCommands: []
+
+# Nginx 参数（迭代 4 的蓝绿发布）。只在**声明了 exec.slots 的蓝绿应用**上用得到；
+# 整段省略时按下面的值走（/etc/nginx、二进制走 PATH），因此绝大多数部署不需要写这一段。
+nginx:
+  # 受管文件写在 <confDir>/frz-managed/ 子目录里——工具只写自己的目录，
+  # 主配置要不要 include 由运维决定。
+  confDir: /etc/nginx
+  binary: nginx
+  # 主配置，nginx -t/-T 都用它；省略时取 <confDir>/nginx.conf。
+  mainConfig: /etc/nginx/nginx.conf
 
 # 远程监听（迭代 5a）：不配这一段就**完全不听 TCP**，形态与之前逐字节一致。
 # 配上之后 opsd 会在这个地址上跑 mTLS：双向证书，且只有 clients 名单里的 CN 能进来。
