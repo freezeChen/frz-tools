@@ -1914,6 +1914,42 @@ LOOP
     "$(rq app slot history --app "${app}" --json | grep -q '"kind": "reconciled"' && echo yes || echo no)"
 }
 
+# ==== 迭代 6a：opsctl init 生成的配置骨架 ====
+# 两层证据：默认模板生成即合法（config validate 通过、覆盖保护按契约工作）；
+# --remote 变体在填入真实证书之前让 opsd 拒绝启动，且失败消息**逐条**指向
+# 缺失的证书文件——运维要一次看到全部缺口，而不是改一条重启一次（规格 §9.1 第 3 条）。
+check_init() {
+  log "opsctl init：配置骨架"
+  in_container install -d /opt/frz-ops/init
+
+  require_ok "init 生成默认模板" docker exec -i "$CID" /opt/frz-ops/opsctl init /opt/frz-ops/init/opsd.yaml
+  require_ok "init 的默认模板通过 config validate" docker exec -i "$CID" /opt/frz-ops/opsctl config validate --file /opt/frz-ops/init/opsd.yaml
+
+  # 覆盖保护：已存在且无 --force 时拒绝写入，原文件一字不动。
+  in_container sh -c 'printf "# 原有内容\n" > /opt/frz-ops/init/keep.yaml'
+  require_fail "目标已存在且无 --force 时拒绝写入" docker exec -i "$CID" /opt/frz-ops/opsctl init /opt/frz-ops/init/keep.yaml
+  assert_eq "拒绝写入后原文件未被改动" "# 原有内容" "$(q cat /opt/frz-ops/init/keep.yaml)"
+  require_ok "--force 才允许覆盖" docker exec -i "$CID" /opt/frz-ops/opsctl init --force /opt/frz-ops/init/keep.yaml
+  require_ok "覆盖之后仍是合法模板" docker exec -i "$CID" /opt/frz-ops/opsctl config validate --file /opt/frz-ops/init/keep.yaml
+
+  # --remote 变体：占位证书路径让 opsd 在配置校验阶段就拒绝启动。
+  # 三个占位路径都要出现在失败消息里；opsd 的输出进变量时用 if 接住退出状态，
+  # 避免「命令必然失败」在 set -e 下提前终结脚本。
+  require_ok "init --remote 生成远程变体" docker exec -i "$CID" /opt/frz-ops/opsctl init --remote /opt/frz-ops/init/opsd-remote.yaml
+  local remote_out=""
+  if remote_out=$(in_container /opt/frz-ops/opsd --config /opt/frz-ops/init/opsd-remote.yaml 2>&1); then
+    fail "--remote 模板在填入真实证书之前起不来（居然启动成功）"
+  else
+    pass "--remote 模板在填入真实证书之前起不来"
+  fi
+  assert_eq "失败消息指向缺失的 server.crt" "yes" \
+    "$(printf '%s' "${remote_out}" | grep -q '/etc/opsd/pki/server.crt' && echo yes || echo no)"
+  assert_eq "失败消息指向缺失的 server.key" "yes" \
+    "$(printf '%s' "${remote_out}" | grep -q '/etc/opsd/pki/server.key' && echo yes || echo no)"
+  assert_eq "失败消息指向缺失的 ca.crt" "yes" \
+    "$(printf '%s' "${remote_out}" | grep -q '/etc/opsd/pki/ca.crt' && echo yes || echo no)"
+}
+
 main() {
   command -v docker >/dev/null 2>&1 || {
     printf '需要 docker\n' >&2
@@ -1962,6 +1998,8 @@ main() {
   check_resources
   # 迭代 4：Nginx 蓝绿（真 Nginx、真 curl）。
   check_bluegreen
+  # 迭代 6a：opsctl init 生成的配置骨架（生成即合法；--remote 变体在填真值前起不来）。
+  check_init
   # 放在最后：它会故意让探针 unit 停在 failed 状态（验证缺凭据必须起不来）。
   check_runtime
 
